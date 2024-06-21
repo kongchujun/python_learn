@@ -1,7 +1,9 @@
 # start up node proxy
 npm install -g configurable-http-proxy  
 configurable-http-proxy --default-target http://127.0.0.1:8888 --port 8001 --api-port 8002  
-configurable-http-proxy  --port 8001 --api-port 8002
+configurable-http-proxy  --port 8001 --api-port 8002  
+run Flask or fastapi web server
+run single_proxy.py
 # explain
 ```angular2html
 --default-target 参数在 configurable-http-proxy 中用于指定默认的转发目标地址，这意味着如果代理接收到没有明确匹配任何配置路由的请求，它将会把这些请求转发到这个默认目标。
