@@ -1,6 +1,6 @@
 # simple_http_server.py
 from http.server import SimpleHTTPRequestHandler, HTTPServer
-
+# any request will return the same
 class MyHandler(SimpleHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
