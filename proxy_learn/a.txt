@@ -1,0 +1,10 @@
+callback for output(s):
+ graph-tooltop-5.show
+ graph-tooltop-5.bbox
+ graph-tooltop-5.children
+ graph-tooltop-5.direction
+ Output 0 (graph-tooltop-5.show) is already in use.
+ To resolve this, set allow_duplicate=True on
+ duplicate outputs, or combine the outputs into
+ one callback function, distinguishing the trigger
+ by using dash.callback_context if necessary.
