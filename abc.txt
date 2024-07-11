@@ -13,3 +13,15 @@ def format_dict(input_dict):
         formatted_dict[key] = formatted_value
 
     return formatted_dict
+
+
+# 测试函数
+input_dict = {
+    'a': ['kong', 'chu', 'jun'],
+    'b': ['zhong', 'shu', 'yi'],
+    'c': ['zhang', 'tian'],
+    'd': ['li', 'si']
+}
+
+formatted_dict = format_dict(input_dict)
+print(formatted_dict)
