@@ -34,3 +34,6 @@ echo "* soft nofile 4096" | sudo tee -a /etc/security/limits.conf
 echo "* hard nofile 10000" | sudo tee -a /etc/security/limits.conf
 
 echo "配置已成功追加到 /etc/security/limits.conf。"
+
+filtered_data = [{key: person[key] for key in person if key in ['name', 'age']} for person in data]
+
