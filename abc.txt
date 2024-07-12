@@ -25,3 +25,12 @@ input_dict = {
 
 formatted_dict = format_dict(input_dict)
 print(formatted_dict)
+
+
+#!/bin/bash
+
+# 直接将配置追加到 /etc/security/limits.conf
+echo "* soft nofile 4096" | sudo tee -a /etc/security/limits.conf
+echo "* hard nofile 10000" | sudo tee -a /etc/security/limits.conf
+
+echo "配置已成功追加到 /etc/security/limits.conf。"
