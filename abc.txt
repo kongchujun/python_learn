@@ -1,0 +1,39 @@
+def format_dict(input_dict):
+    # 创建一个新字典来存储格式化后的结果
+    formatted_dict = {}
+
+    # 遍历输入字典中的每一个键值对
+    for key, value_list in input_dict.items():
+        # 初始化一个空字符串来构建该键的新值
+        formatted_value = ""
+        # 遍历列表中的每一个元素，并添加格式化后的字符串
+        for index, value in enumerate(value_list):
+            formatted_value += f"\n P{index}: {value}"
+        # 将格式化后的字符串赋值给新字典的相应键
+        formatted_dict[key] = formatted_value
+
+    return formatted_dict
+
+
+# 测试函数
+input_dict = {
+    'a': ['kong', 'chu', 'jun'],
+    'b': ['zhong', 'shu', 'yi'],
+    'c': ['zhang', 'tian'],
+    'd': ['li', 'si']
+}
+
+formatted_dict = format_dict(input_dict)
+print(formatted_dict)
+
+
+#!/bin/bash
+
+# 直接将配置追加到 /etc/security/limits.conf
+echo "* soft nofile 4096" | sudo tee -a /etc/security/limits.conf
+echo "* hard nofile 10000" | sudo tee -a /etc/security/limits.conf
+
+echo "配置已成功追加到 /etc/security/limits.conf。"
+
+filtered_data = [{key: person[key] for key in person if key in ['name', 'age']} for person in data]
+
