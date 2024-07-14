@@ -161,3 +161,4 @@ cython_debug/
 # docker-compose.override.yml
 
 # End of https://www.toptal.com/developers/gitignore/api
+database_data/

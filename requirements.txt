@@ -2,3 +2,7 @@ Flask==3.0.3
 aiohttp==3.9.5
 uvicorn==0.30.1
 fastapi==0.111.0
+traits==6.4.3
+psycopg2-binary
+sqlalchemy
+psycopg2
