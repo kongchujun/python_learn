@@ -1,40 +1,72 @@
-def format_dict(input_dict):
-    # 创建一个新字典来存储格式化后的结果
-    formatted_dict = {}
+import os
+import asyncio
+from fastapi import FastAPI
+from contextlib import asynccontextmanager
+import asyncpg
+import orjson
+import structlog
 
-    # 遍历输入字典中的每一个键值对
-    for key, value_list in input_dict.items():
-        # 初始化一个空字符串来构建该键的新值
-        formatted_value = ""
-        # 遍历列表中的每一个元素，并添加格式化后的字符串
-        for index, value in enumerate(value_list):
-            formatted_value += f"\n P{index}: {value}"
-        # 将格式化后的字符串赋值给新字典的相应键
-        formatted_dict[key] = formatted_value
+_pg_pool = None
+current_password = None
 
-    return formatted_dict
+async def get_new_password():
+    # 这里是获取密码的代码，具体实现需要根据你的情况修改
+    return "your_new_password"
 
+async def create_pool():
+    global _pg_pool, current_password
+    if _pg_pool:
+        await _pg_pool.close()
+    _pg_pool = await asyncpg.create_pool(
+        database=os.environ["POSTGRES_DB"],
+        user=os.environ["POSTGRES_USER"],
+        password=current_password,
+        host=os.environ["POSTGRES_HOST"],
+        port=os.environ["POSTGRES_PORT"],
+        init=_init_connection,
+    )
 
-# 测试函数
-input_dict = {
-    'a': ['kong', 'chu', 'jun'],
-    'b': ['zhong', 'shu', 'yi'],
-    'c': ['zhang', 'tian'],
-    'd': ['li', 'si']
-}
+async def _init_connection(conn):
+    # 你之前定义的初始化连接的方法
+    await conn.set_type_codec(
+        "json",
+        encoder=lambda v: orjson.dumps(v).decode(),
+        decoder=orjson.loads,
+        schema="pg_catalog",
+    )
+    await conn.set_type_codec(
+        "jsonb",
+        encoder=lambda v: orjson.dumps(v).decode(),
+        decoder=orjson.loads,
+        schema="pg_catalog",
+    )
+    await conn.set_type_codec(
+        "uuid", encoder=lambda v: str(v), decoder=lambda v: v, schema="pg_catalog"
+    )
 
-formatted_dict = format_dict(input_dict)
-print(formatted_dict)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global current_password
+    current_password = await get_new_password()
+    await create_pool()
+    task = asyncio.create_task(schedule_password_update())
 
+    structlog.configure(
+        # 日志配置部分保持不变
+    )
 
-#!/bin/bash
+    yield
+    task.cancel()
+    await _pg_pool.close()
+    _pg_pool = None
 
-# 直接将配置追加到 /etc/security/limits.conf
-echo "* soft nofile 4096" | sudo tee -a /etc/security/limits.conf
-echo "* hard nofile 10000" | sudo tee -a /etc/security/limits.conf
+async def schedule_password_update():
+    while True:
+        await asyncio.sleep(3600)  # 每小时更新一次密码
+        new_password = await get_new_password()
+        if new_password != current_password:
+            current_password = new_password
+            await create_pool()
 
-echo "配置已成功追加到 /etc/security/limits.conf。"
-
-filtered_data = [{key: person[key] for key in person if key in ['name', 'age']} for person in data]
-
-1d1f8883486549c69fe2c152e5bebb1
+def get_pg_pool() -> asyncpg.pool.Pool:
+    return _pg_pool
