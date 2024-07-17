@@ -1,41 +1,50 @@
 import asyncio
+from fastapi import FastAPI, Depends
+import asyncpg
+import httpx
 
-update_lock = asyncio.Lock()
+app = FastAPI()
 
-async def create_pool():
-    global _pg_pool, current_password
-    async with update_lock:
-        if _pg_pool:
-            await _pg_pool.close()
-        _pg_pool = await asyncpg.create_pool(
-            database=os.environ["POSTGRES_DB"],
-            user=os.environ["POSTGRES_USER"],
-            password=current_password,
-            host=os.environ["POSTGRES_HOST"],
-            port=os.environ["POSTGRES_PORT"],
-            init=_init_connection,
-        )
+DATABASE_URL = "postgresql://your_user@your_host/your_db"
 
-async def get_pg_pool():
-    await update_lock.acquire()
-    try:
-        return _pg_pool
-    finally:
-        update_lock.release()
+async def fetch_password():
+    """从指定的URL获取最新的数据库密码"""
+    async with httpx.AsyncClient() as client:
+        response = await client.get("http://your-password-server/password")
+        response.raise_for_status()
+        return response.text
 
+async def create_pool(password):
+    """根据提供的密码创建新的数据库连接池"""
+    return await asyncpg.create_pool(dsn=f"{DATABASE_URL}:{password}@your_host/your_db")
 
+pool = None  # 初始化连接池变量
 
-async def get_connection():
-    pool = await get_pg_pool()
-    conn = await pool.acquire()
-    try:
-        # 假设有一个简单的方式来验证连接
-        await conn.execute('SELECT 1')
-        return conn
-    except:
-        pool.release(conn)
-        raise
+async def refresh_connection_pool():
+    """每2小时刷新数据库连接池"""
+    global pool
+    while True:
+        password = await fetch_password()  # 获取最新密码
+        if pool:
+            await pool.close()  # 如果池已存在，则先关闭
+        pool = await create_pool(password)  # 创建新的连接池
+        await asyncio.sleep(7200)  # 等待7200秒或2小时
 
-async def list_assistants(user_id: str) -> List[Assistant]:
-    async with get_connection() as conn:
-        return await conn.fetch("SELECT * FROM assistant WHERE user_id = $1", user_id)
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(refresh_connection_pool())  # 启动定时任务来更新连接池
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    global pool
+    if pool:
+        await pool.close()  # 确保应用关闭时断开所有连接
+
+@app.get("/items/")
+async def read_items():
+    global pool
+    async with pool.acquire() as connection:
+        # 使用连接执行查询
+        result = await connection.fetch("SELECT * FROM items")
+        return result
+
