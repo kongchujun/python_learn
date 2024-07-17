@@ -1,11 +1,11 @@
+# database.py
 import asyncio
-from fastapi import FastAPI, Depends
 import asyncpg
 import httpx
 
-app = FastAPI()
-
 DATABASE_URL = "postgresql://your_user@your_host/your_db"
+
+pool = None  # 初始化连接池变量
 
 async def fetch_password():
     """从指定的URL获取最新的数据库密码"""
@@ -18,8 +18,6 @@ async def create_pool(password):
     """根据提供的密码创建新的数据库连接池"""
     return await asyncpg.create_pool(dsn=f"{DATABASE_URL}:{password}@your_host/your_db")
 
-pool = None  # 初始化连接池变量
-
 async def refresh_connection_pool():
     """每2小时刷新数据库连接池"""
     global pool
@@ -30,21 +28,10 @@ async def refresh_connection_pool():
         pool = await create_pool(password)  # 创建新的连接池
         await asyncio.sleep(7200)  # 等待7200秒或2小时
 
-@app.on_event("startup")
-async def startup_event():
-    asyncio.create_task(refresh_connection_pool())  # 启动定时任务来更新连接池
-
-@app.on_event("shutdown")
-async def shutdown_event():
+async def get_pool():
+    """返回当前激活的连接池"""
     global pool
-    if pool:
-        await pool.close()  # 确保应用关闭时断开所有连接
-
-@app.get("/items/")
-async def read_items():
-    global pool
-    async with pool.acquire() as connection:
-        # 使用连接执行查询
-        result = await connection.fetch("SELECT * FROM items")
-        return result
-
+    if pool is None:
+        password = await fetch_password()
+        pool = await create_pool(password)
+    return pool
