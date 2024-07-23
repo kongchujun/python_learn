@@ -1,26 +1,9 @@
-import psycopg2
+from sqlalchemy import create_engine, text
 
-# 连接到PostgreSQL数据库
-conn = psycopg2.connect(
-    dbname='your_dbname',
-    user='your_username',
-    password='your_password',
-    host='your_host',
-    port='your_port'
-)
+# 创建数据库连接引擎
+engine = create_engine('postgresql+psycopg2://your_username:your_password@your_host:your_port/your_dbname')
 
-# 创建游标对象
-cur = conn.cursor()
-
-# 执行DELETE语句删除符合条件的行
-cur.execute("""
-DELETE FROM your_table_name
-WHERE source = 'a'
-""")
-
-# 提交事务
-conn.commit()
-
-# 关闭游标和连接
-cur.close()
-conn.close()
+# 删除符合条件的数据
+with engine.connect() as connection:
+    delete_query = text("DELETE FROM your_table_name WHERE source = :source")
+    connection.execute(delete_query, {"source": 'a'})
