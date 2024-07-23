@@ -1,18 +1,26 @@
-import pandas as pd
-from sqlalchemy import create_engine
+import psycopg2
 
-# 创建一个DataFrame作为示例
-data = {
-    'name': ['Alice', 'Bob', 'Charlie'],
-    'age': [25, 30, 35],
-    'city': ['New York', 'Los Angeles', 'Chicago']
-}
-df = pd.DataFrame(data)
+# 连接到PostgreSQL数据库
+conn = psycopg2.connect(
+    dbname='your_dbname',
+    user='your_username',
+    password='your_password',
+    host='your_host',
+    port='your_port'
+)
 
-# 创建数据库连接
-engine = create_engine('postgresql+psycopg2://username:password@host:port/database')
+# 创建游标对象
+cur = conn.cursor()
 
-# 将DataFrame保存到PostgreSQL数据库，自动创建表
-df.to_sql('table_name', engine, index=False, if_exists='replace')
+# 执行DELETE语句删除符合条件的行
+cur.execute("""
+DELETE FROM your_table_name
+WHERE source = 'a'
+""")
 
-print("DataFrame has been saved to the database.")
+# 提交事务
+conn.commit()
+
+# 关闭游标和连接
+cur.close()
+conn.close()
