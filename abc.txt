@@ -1,41 +1,68 @@
-import os
 import psycopg2
 
-# PostgreSQL数据库连接信息
-DB_NAME = "your_database_name"
-DB_USER = "your_username"
-DB_PASSWORD = "your_password"
-DB_HOST = "your_host"
-DB_PORT = "your_port"  # 通常是5432
+# 源数据库连接信息
+SRC_DB_NAME = "source_db_name"
+SRC_DB_USER = "source_username"
+SRC_DB_PASSWORD = "source_password"
+SRC_DB_HOST = "source_host"
+SRC_DB_PORT = "source_port"  # 通常是5432
 
-# SQL文件所在目录
-SQL_DIR = "/path/to/your/sql/files"
+# 目标数据库连接信息
+DST_DB_NAME = "target_db_name"
+DST_DB_USER = "target_username"
+DST_DB_PASSWORD = "target_password"
+DST_DB_HOST = "target_host"
+DST_DB_PORT = "target_port"  # 通常是5432
 
-# 创建数据库连接
-connection = psycopg2.connect(
-    dbname=DB_NAME,
-    user=DB_USER,
-    password=DB_PASSWORD,
-    host=DB_HOST,
-    port=DB_PORT
+# 要迁移的表列表
+TABLES_TO_MIGRATE = ["table1", "table2", "table3"]
+
+# 创建源数据库连接
+src_connection = psycopg2.connect(
+    dbname=SRC_DB_NAME,
+    user=SRC_DB_USER,
+    password=SRC_DB_PASSWORD,
+    host=SRC_DB_HOST,
+    port=SRC_DB_PORT
+)
+
+# 创建目标数据库连接
+dst_connection = psycopg2.connect(
+    dbname=DST_DB_NAME,
+    user=DST_DB_USER,
+    password=DST_DB_PASSWORD,
+    host=DST_DB_HOST,
+    port=DST_DB_PORT
 )
 
 # 创建游标对象
-cursor = connection.cursor()
+src_cursor = src_connection.cursor()
+dst_cursor = dst_connection.cursor()
 
-# 遍历目录中的所有.sql文件
-for sql_file in os.listdir(SQL_DIR):
-    if sql_file.endswith(".sql"):
-        file_path = os.path.join(SQL_DIR, sql_file)
-        print(f"Executing {file_path}...")
+# 迁移每个表
+for table in TABLES_TO_MIGRATE:
+    print(f"Migrating {table}...")
 
-        # 读取并执行SQL文件
-        with open(file_path, 'r') as f:
-            cursor.execute(f.read())
-            connection.commit()  # 提交事务
+    # 从源数据库中获取数据
+    src_cursor.execute(f"SELECT * FROM {table}")
+    rows = src_cursor.fetchall()
+
+    # 获取表的列信息
+    col_names = [desc[0] for desc in src_cursor.description]
+    col_count = len(col_names)
+    placeholders = ", ".join(["%s"] * col_count)
+
+    # 构建插入数据的SQL语句
+    insert_query = f"INSERT INTO {table} ({', '.join(col_names)}) VALUES ({placeholders})"
+
+    # 向目标数据库插入数据
+    dst_cursor.executemany(insert_query, rows)
+    dst_connection.commit()
 
 # 关闭游标和连接
-cursor.close()
-connection.close()
+src_cursor.close()
+dst_cursor.close()
+src_connection.close()
+dst_connection.close()
 
-print("All SQL files have been executed.")
+print("Data migration completed.")
