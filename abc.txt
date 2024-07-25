@@ -1,9 +1,41 @@
-from sqlalchemy import create_engine, text
+import os
+import psycopg2
 
-# 创建数据库连接引擎
-engine = create_engine('postgresql+psycopg2://your_username:your_password@your_host:your_port/your_dbname')
+# PostgreSQL数据库连接信息
+DB_NAME = "your_database_name"
+DB_USER = "your_username"
+DB_PASSWORD = "your_password"
+DB_HOST = "your_host"
+DB_PORT = "your_port"  # 通常是5432
 
-# 删除符合条件的数据
-with engine.connect() as connection:
-    delete_query = text("DELETE FROM your_table_name WHERE source = :source")
-    connection.execute(delete_query, {"source": 'a'})
+# SQL文件所在目录
+SQL_DIR = "/path/to/your/sql/files"
+
+# 创建数据库连接
+connection = psycopg2.connect(
+    dbname=DB_NAME,
+    user=DB_USER,
+    password=DB_PASSWORD,
+    host=DB_HOST,
+    port=DB_PORT
+)
+
+# 创建游标对象
+cursor = connection.cursor()
+
+# 遍历目录中的所有.sql文件
+for sql_file in os.listdir(SQL_DIR):
+    if sql_file.endswith(".sql"):
+        file_path = os.path.join(SQL_DIR, sql_file)
+        print(f"Executing {file_path}...")
+
+        # 读取并执行SQL文件
+        with open(file_path, 'r') as f:
+            cursor.execute(f.read())
+            connection.commit()  # 提交事务
+
+# 关闭游标和连接
+cursor.close()
+connection.close()
+
+print("All SQL files have been executed.")
