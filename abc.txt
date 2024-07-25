@@ -2,8 +2,8 @@ import psycopg2
 from psycopg2 import sql
 
 # 数据库连接参数
-source_conn_params = "dbname='source_db' user='user1' host='source_host' password='password'"
-target_conn_params = "dbname='target_db' user='user2' host='target_host' password='password'"
+source_conn_params = "dbname='source_db' user='user1' host='source_host' port='5432' password='password'"
+target_conn_params = "dbname='target_db' user='user2' host='target_host' port='5433' password='password'"
 
 # 要迁移的表名
 tables = ['table1', 'table2', 'table3']
@@ -19,12 +19,12 @@ def fetch_data(conn, table_name):
 def create_table(target_conn, source_conn, table_name):
     """在目标数据库中创建表结构"""
     source_cursor = source_conn.cursor()
-    source_cursor.execute(f"SELECT column_name, data_type FROM information_schema.columns WHERE table_name = '{table_name}'")
+    source_cursor.execute(sql.SQL("SELECT column_name, data_type FROM information_schema.columns WHERE table_name = {}").format(sql.Literal(table_name)))
     columns = source_cursor.fetchall()
     
     target_cursor = target_conn.cursor()
     column_defs = ', '.join([f"{col[0]} {col[1]}" for col in columns])
-    target_cursor.execute(f"CREATE TABLE IF NOT EXISTS {table_name} ({column_defs})")
+    target_cursor.execute(sql.SQL("CREATE TABLE IF NOT EXISTS {} ({})").format(sql.Identifier(table_name), sql.SQL(column_defs)))
     target_conn.commit()
     target_cursor.close()
     source_cursor.close()
@@ -32,10 +32,18 @@ def create_table(target_conn, source_conn, table_name):
 def copy_data(source_conn, target_conn, table_name):
     """将数据复制到目标数据库中"""
     data = fetch_data(source_conn, table_name)
+    if not data:
+        return  # 如果没有数据则直接返回
+
     target_cursor = target_conn.cursor()
     placeholders = ', '.join(['%s'] * len(data[0]))
-    insert_query = f"INSERT INTO {table_name} VALUES ({placeholders})"
-    target_cursor.executemany(insert_query, data)
+    insert_query = sql.SQL("INSERT INTO {} VALUES ({})").format(
+        sql.Identifier(table_name),
+        sql.SQL(placeholders)
+    )
+    # 转换数据行为元组，确保不会传递字典
+    data = [tuple(row) for row in data]
+    target_cursor.executemany(insert_query.as_string(target_conn), data)
     target_conn.commit()
     target_cursor.close()
 
