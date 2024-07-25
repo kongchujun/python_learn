@@ -55,8 +55,11 @@ for table in TABLES_TO_MIGRATE:
     # 构建插入数据的SQL语句
     insert_query = f"INSERT INTO {table} ({', '.join(col_names)}) VALUES ({placeholders})"
 
+    # 确保 rows 是一个包含元组的列表，而不是字典
+    rows_as_tuples = [tuple(row) for row in rows]
+
     # 向目标数据库插入数据
-    dst_cursor.executemany(insert_query, rows)
+    dst_cursor.executemany(insert_query, rows_as_tuples)
     dst_connection.commit()
 
 # 关闭游标和连接
