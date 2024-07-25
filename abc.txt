@@ -1,12 +1,4 @@
-CREATE TABLE company_info (
-    company VARCHAR(255), -- 公司名字，字符串类型
-    summary TEXT,         -- 总结，文本类型，可以储存较多的字数
-    record TIMESTAMP      -- 记录时间，时间戳类型
-);
-
-
 import psycopg2
-from datetime import datetime
 
 # 数据库连接参数
 conn_params = {
@@ -21,39 +13,19 @@ conn_params = {
 conn = psycopg2.connect(**conn_params)
 cursor = conn.cursor()
 
-# 获取今天的日期，只包括年月日
-today = datetime.now().date()
+# 查询语句，获取唯一的公司名称
+query_sql = "SELECT DISTINCT company FROM company_info;"
 
-# 删除今天已有的数据的 SQL 语句
-delete_sql = """
-DELETE FROM company_info WHERE record::date = %s;
-"""
+# 执行查询操作
+cursor.execute(query_sql)
 
-# 执行删除操作
-cursor.execute(delete_sql, (today,))
-conn.commit()  # 提交事务以确保删除操作生效
+# 获取所有唯一的公司名称
+unique_companies = cursor.fetchall()
 
-# 插入数据的 SQL 语句
-insert_sql = """
-INSERT INTO company_info (company, summary, record)
-VALUES (%s, %s, %s);
-"""
-
-# 假设这是从某个外部源生成的数据列表
-data_list = [
-    {'company': 'a', 'summary': 'abcdesfsdf', 'record': datetime.now()},
-    {'company': 'b', 'summary': 'another summary', 'record': datetime.now()}
-]
-
-# 准备数据以符合 executemany 的要求
-formatted_data = [(d['company'], d['summary'], d['record']) for d in data_list]
-
-# 执行批量插入操作
-cursor.executemany(insert_sql, formatted_data)
-conn.commit()  # 提交事务
+# 输出结果
+for company in unique_companies:
+    print(company[0])
 
 # 关闭游标和连接
 cursor.close()
 conn.close()
-
-print("Data inserted successfully.")
