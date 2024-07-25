@@ -1,71 +1,56 @@
 import psycopg2
+from psycopg2 import sql
 
-# 源数据库连接信息
-SRC_DB_NAME = "source_db_name"
-SRC_DB_USER = "source_username"
-SRC_DB_PASSWORD = "source_password"
-SRC_DB_HOST = "source_host"
-SRC_DB_PORT = "source_port"  # 通常是5432
+# 数据库连接参数
+source_conn_params = "dbname='source_db' user='user1' host='source_host' password='password'"
+target_conn_params = "dbname='target_db' user='user2' host='target_host' password='password'"
 
-# 目标数据库连接信息
-DST_DB_NAME = "target_db_name"
-DST_DB_USER = "target_username"
-DST_DB_PASSWORD = "target_password"
-DST_DB_HOST = "target_host"
-DST_DB_PORT = "target_port"  # 通常是5432
+# 要迁移的表名
+tables = ['table1', 'table2', 'table3']
 
-# 要迁移的表列表
-TABLES_TO_MIGRATE = ["table1", "table2", "table3"]
+def fetch_data(conn, table_name):
+    """从源数据库中提取表数据"""
+    cursor = conn.cursor()
+    cursor.execute(sql.SQL("SELECT * FROM {}").format(sql.Identifier(table_name)))
+    data = cursor.fetchall()
+    cursor.close()
+    return data
 
-# 创建源数据库连接
-src_connection = psycopg2.connect(
-    dbname=SRC_DB_NAME,
-    user=SRC_DB_USER,
-    password=SRC_DB_PASSWORD,
-    host=SRC_DB_HOST,
-    port=SRC_DB_PORT
-)
+def create_table(target_conn, source_conn, table_name):
+    """在目标数据库中创建表结构"""
+    source_cursor = source_conn.cursor()
+    source_cursor.execute(f"SELECT column_name, data_type FROM information_schema.columns WHERE table_name = '{table_name}'")
+    columns = source_cursor.fetchall()
+    
+    target_cursor = target_conn.cursor()
+    column_defs = ', '.join([f"{col[0]} {col[1]}" for col in columns])
+    target_cursor.execute(f"CREATE TABLE IF NOT EXISTS {table_name} ({column_defs})")
+    target_conn.commit()
+    target_cursor.close()
+    source_cursor.close()
 
-# 创建目标数据库连接
-dst_connection = psycopg2.connect(
-    dbname=DST_DB_NAME,
-    user=DST_DB_USER,
-    password=DST_DB_PASSWORD,
-    host=DST_DB_HOST,
-    port=DST_DB_PORT
-)
+def copy_data(source_conn, target_conn, table_name):
+    """将数据复制到目标数据库中"""
+    data = fetch_data(source_conn, table_name)
+    target_cursor = target_conn.cursor()
+    placeholders = ', '.join(['%s'] * len(data[0]))
+    insert_query = f"INSERT INTO {table_name} VALUES ({placeholders})"
+    target_cursor.executemany(insert_query, data)
+    target_conn.commit()
+    target_cursor.close()
 
-# 创建游标对象
-src_cursor = src_connection.cursor()
-dst_cursor = dst_connection.cursor()
+# 主函数
+def main():
+    source_conn = psycopg2.connect(source_conn_params)
+    target_conn = psycopg2.connect(target_conn_params)
+    
+    for table in tables:
+        print(f"Processing {table}")
+        create_table(target_conn, source_conn, table)
+        copy_data(source_conn, target_conn, table)
+    
+    source_conn.close()
+    target_conn.close()
 
-# 迁移每个表
-for table in TABLES_TO_MIGRATE:
-    print(f"Migrating {table}...")
-
-    # 从源数据库中获取数据
-    src_cursor.execute(f"SELECT * FROM {table}")
-    rows = src_cursor.fetchall()
-
-    # 获取表的列信息
-    col_names = [desc[0] for desc in src_cursor.description]
-    col_count = len(col_names)
-    placeholders = ", ".join(["%s"] * col_count)
-
-    # 构建插入数据的SQL语句
-    insert_query = f"INSERT INTO {table} ({', '.join(col_names)}) VALUES ({placeholders})"
-
-    # 确保 rows 是一个包含元组的列表，而不是字典
-    rows_as_tuples = [tuple(row) for row in rows]
-
-    # 向目标数据库插入数据
-    dst_cursor.executemany(insert_query, rows_as_tuples)
-    dst_connection.commit()
-
-# 关闭游标和连接
-src_cursor.close()
-dst_cursor.close()
-src_connection.close()
-dst_connection.close()
-
-print("Data migration completed.")
+if __name__ == "__main__":
+    main()
