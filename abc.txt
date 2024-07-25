@@ -1,31 +1,49 @@
 import psycopg2
+from datetime import datetime
 
-# 数据库连接参数
-conn_params = {
-    "dbname": "your_database_name",
-    "user": "your_username",
-    "password": "your_password",
-    "host": "localhost",  # 或者其他数据库服务器地址
-    "port": "5432"         # 根据实际情况调整端口
-}
+def get_latest_summary(company_name):
+    # 连接到数据库
+    conn = psycopg2.connect(
+        dbname="your_database_name",
+        user="your_username",
+        password="your_password",
+        host="your_host",
+        port="your_port"
+    )
+    
+    try:
+        # 创建游标
+        cur = conn.cursor()
+        
+        # 执行SQL查询
+        cur.execute("""
+            SELECT summary
+            FROM company_info
+            WHERE company = %s
+            ORDER BY record DESC
+            LIMIT 1
+        """, (company_name,))
+        
+        # 获取结果
+        result = cur.fetchone()
+        
+        if result:
+            return result[0]
+        else:
+            return "没有找到该公司的信息"
+    
+    except Exception as e:
+        print(f"发生错误: {e}")
+        return None
+    
+    finally:
+        # 关闭游标和连接
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
 
-# 创建连接
-conn = psycopg2.connect(**conn_params)
-cursor = conn.cursor()
-
-# 查询语句，获取唯一的公司名称
-query_sql = "SELECT DISTINCT company FROM company_info;"
-
-# 执行查询操作
-cursor.execute(query_sql)
-
-# 获取所有唯一的公司名称
-unique_companies = cursor.fetchall()
-
-# 输出结果
-for company in unique_companies:
-    print(company[0])
-
-# 关闭游标和连接
-cursor.close()
-conn.close()
+# 使用函数
+company_name = "您要查询的公司名"
+latest_summary = get_latest_summary(company_name)
+print(f"{company_name}的最新总结: {latest_summary}")
