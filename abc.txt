@@ -1,44 +1,4 @@
-import psycopg2
-from psycopg2 import sql
+pg_dump -U source_user -h source_host -p source_port -d source_db | psql -U destination_user -h destination_host -p destination_port -d destination_db
 
-# 数据库连接参数
-db_params = {
-    'dbname': 'your_database_name',
-    'user': 'your_username',
-    'password': 'your_password',
-    'host': 'localhost',
-    'port': 5432
-}
 
-# 创建表的SQL语句
-create_table_query = """
-CREATE TABLE your_table_name (
-    id SERIAL PRIMARY KEY,
-    column1 VARCHAR(50),
-    column2 INT,
-    column3 DATE
-);
-"""
-
-# 连接到数据库并执行创建表的语句
-try:
-    # 建立数据库连接
-    connection = psycopg2.connect(**db_params)
-    cursor = connection.cursor()
-    
-    # 执行创建表的SQL语句
-    cursor.execute(create_table_query)
-    
-    # 提交更改
-    connection.commit()
-    print("Table created successfully")
-    
-except Exception as error:
-    print(f"Error: {error}")
-    
-finally:
-    # 关闭游标和连接
-    if cursor:
-        cursor.close()
-    if connection:
-        connection.close()
+pg_dump -U source_user -h source_host -p 5433 -d source_db | psql -U destination_user -h destination_host -p 5434 -d destination_db
