@@ -1,49 +1,44 @@
 import psycopg2
-from datetime import datetime
+from psycopg2 import sql
 
-def get_latest_summary(company_name):
-    # 连接到数据库
-    conn = psycopg2.connect(
-        dbname="your_database_name",
-        user="your_username",
-        password="your_password",
-        host="your_host",
-        port="your_port"
-    )
-    
-    try:
-        # 创建游标
-        cur = conn.cursor()
-        
-        # 执行SQL查询
-        cur.execute("""
-            SELECT summary
-            FROM company_info
-            WHERE company = %s
-            ORDER BY record DESC
-            LIMIT 1
-        """, (company_name,))
-        
-        # 获取结果
-        result = cur.fetchone()
-        
-        if result:
-            return result[0]
-        else:
-            return "没有找到该公司的信息"
-    
-    except Exception as e:
-        print(f"发生错误: {e}")
-        return None
-    
-    finally:
-        # 关闭游标和连接
-        if cur:
-            cur.close()
-        if conn:
-            conn.close()
+# 数据库连接参数
+db_params = {
+    'dbname': 'your_database_name',
+    'user': 'your_username',
+    'password': 'your_password',
+    'host': 'localhost',
+    'port': 5432
+}
 
-# 使用函数
-company_name = "您要查询的公司名"
-latest_summary = get_latest_summary(company_name)
-print(f"{company_name}的最新总结: {latest_summary}")
+# 创建表的SQL语句
+create_table_query = """
+CREATE TABLE your_table_name (
+    id SERIAL PRIMARY KEY,
+    column1 VARCHAR(50),
+    column2 INT,
+    column3 DATE
+);
+"""
+
+# 连接到数据库并执行创建表的语句
+try:
+    # 建立数据库连接
+    connection = psycopg2.connect(**db_params)
+    cursor = connection.cursor()
+    
+    # 执行创建表的SQL语句
+    cursor.execute(create_table_query)
+    
+    # 提交更改
+    connection.commit()
+    print("Table created successfully")
+    
+except Exception as error:
+    print(f"Error: {error}")
+    
+finally:
+    # 关闭游标和连接
+    if cursor:
+        cursor.close()
+    if connection:
+        connection.close()
