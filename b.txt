@@ -1,0 +1,2 @@
+openssl enc -aes-256-cbc -salt -in matrix.txt -out matrix.txt.enc -pass pass:yourpassword
+openssl enc -aes-256-cbc -d -in matrix.txt.enc -out matrix_decoded.txt -pass pass:yourpassword
