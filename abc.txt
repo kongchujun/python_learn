@@ -2,3 +2,15 @@ pg_dump -U source_user -h source_host -p source_port -d source_db | psql -U dest
 
 
 pg_dump -U source_user -h source_host -p 5433 -d source_db | psql -U destination_user -h destination_host -p 5434 -d destination_db
+
+
+#!/bin/bash
+
+# 定义要查找和替换的内容
+old_pattern="export REQUESTS_CA_BUNDLE=/home/kong/certs/certs.pem"
+new_pattern="export XXXX=/home/kong/certs/certs.pem"
+
+# 使用sed命令进行替换
+sed -i "s|$old_pattern|$new_pattern|g" ~/.bashrc
+
+echo "替换完成。"
