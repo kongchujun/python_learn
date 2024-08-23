@@ -1,2 +1,15 @@
 openssl enc -aes-256-cbc -salt -in matrix.txt -out matrix.txt.enc -pass pass:yourpassword
 openssl enc -aes-256-cbc -d -in matrix.txt.enc -out matrix_decoded.txt -pass pass:yourpassword
+
+
+gcloud compute instances create my-instance \
+    --machine-type=e2-standard-2 \
+    --image-project=debian-cloud \
+    --image-family=debian-11 \
+    --boot-disk-size=20GB \
+    --create-disk=mode=rw,size=100,type=pd-standard,device-name=home-disk \
+    --metadata=startup-script='#!/bin/bash
+        mkfs.ext4 -F /dev/disk/by-id/google-home-disk
+        mkdir -p /home
+        mount -o discard,defaults /dev/disk/by-id/google-home-disk /home
+        echo "/dev/disk/by-id/google-home-disk /home ext4 defaults 0 2" >> /etc/fstab'
