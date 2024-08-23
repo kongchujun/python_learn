@@ -13,3 +13,25 @@ gcloud compute instances create my-instance \
         mkdir -p /home
         mount -o discard,defaults /dev/disk/by-id/google-home-disk /home
         echo "/dev/disk/by-id/google-home-disk /home ext4 defaults 0 2" >> /etc/fstab'
+
+
+#!/bin/bash
+
+# 1. 创建临时目录并移动现有的/home内容
+mkdir -p /mnt/tmp_home
+cp -a /home/* /mnt/tmp_home/
+
+# 2. 格式化新磁盘
+mkfs.ext4 -F /dev/disk/by-id/google-home-disk
+
+# 3. 挂载新磁盘到/home
+mount -o discard,defaults /dev/disk/by-id/google-home-disk /home
+
+# 4. 移动旧的/home内容到新的/home目录
+cp -a /mnt/tmp_home/* /home/
+
+# 5. 清理临时目录
+rm -rf /mnt/tmp_home
+
+# 6. 更新/etc/fstab确保新磁盘在启动时挂载
+echo "/dev/disk/by-id/google-home-disk /home ext4 defaults 0 2" >> /etc/fstab
