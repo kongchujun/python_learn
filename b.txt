@@ -35,3 +35,9 @@ rm -rf /mnt/tmp_home
 
 # 6. 更新/etc/fstab确保新磁盘在启动时挂载
 echo "/dev/disk/by-id/google-home-disk /home ext4 defaults 0 2" >> /etc/fstab
+
+
+====================================================
+lsblk
+sudo resize2fs /dev/disk/by-id/google-home-disk
+df -h /home
