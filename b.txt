@@ -1,43 +1,39 @@
-openssl enc -aes-256-cbc -salt -in matrix.txt -out matrix.txt.enc -pass pass:yourpassword
-openssl enc -aes-256-cbc -d -in matrix.txt.enc -out matrix_decoded.txt -pass pass:yourpassword
+from fastapi import FastAPI, Request
+import pandas as pd
+
+app = FastAPI()
+
+@app.put("/your-endpoint")
+async def update_data(request: Request):
+    data = await request.json()
+    df = pd.DataFrame(data)
+    return len(df)
 
 
-gcloud compute instances create my-instance \
-    --machine-type=e2-standard-2 \
-    --image-project=debian-cloud \
-    --image-family=debian-11 \
-    --boot-disk-size=20GB \
-    --create-disk=mode=rw,size=100,type=pd-standard,device-name=home-disk \
-    --metadata=startup-script='#!/bin/bash
-        mkfs.ext4 -F /dev/disk/by-id/google-home-disk
-        mkdir -p /home
-        mount -o discard,defaults /dev/disk/by-id/google-home-disk /home
-        echo "/dev/disk/by-id/google-home-disk /home ext4 defaults 0 2" >> /etc/fstab'
 
+====import pandas as pd
+import requests
+import json
 
-#!/bin/bash
+# 创建一个示例DataFrame
+df = pd.DataFrame({
+    'A': [1, 2, 3],
+    'B': ['a', 'b', 'c']
+})
 
-# 1. 创建临时目录并移动现有的/home内容
-mkdir -p /mnt/tmp_home
-cp -a /home/* /mnt/tmp_home/
+# 将DataFrame转换为JSON
+data = df.to_json(orient='records')
 
-# 2. 格式化新磁盘
-mkfs.ext4 -F /dev/disk/by-id/google-home-disk
+# API的URL
+url = 'http://localhost:8000/your-endpoint'
 
-# 3. 挂载新磁盘到/home
-mount -o discard,defaults /dev/disk/by-id/google-home-disk /home
+# 发送PUT请求
+response = requests.put(url, data=data, headers={'Content-Type': 'application/json'})
 
-# 4. 移动旧的/home内容到新的/home目录
-cp -a /mnt/tmp_home/* /home/
-
-# 5. 清理临时目录
-rm -rf /mnt/tmp_home
-
-# 6. 更新/etc/fstab确保新磁盘在启动时挂载
-echo "/dev/disk/by-id/google-home-disk /home ext4 defaults 0 2" >> /etc/fstab
-
-
-====================================================
-lsblk
-sudo resize2fs /dev/disk/by-id/google-home-disk
-df -h /home
+# 检查响应
+if response.status_code == 200:
+    row_count = response.json()
+    print(f"DataFrame的行数: {row_count}")
+else:
+    print(f"请求失败,状态码: {response.status_code}")
+    print(f"错误信息: {response.text}")
