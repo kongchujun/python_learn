@@ -37,3 +37,8 @@ if response.status_code == 200:
 else:
     print(f"请求失败,状态码: {response.status_code}")
     print(f"错误信息: {response.text}")
+
+你是一位经验丰富的代码审查员。我将提供一个 Bitbucket Pull Request 的 diff JSON 内容。请你分析其中的代码变更，并提供以下信息：
+- 变更的文件列表。
+- 每个文件的具体修改内容。
+- 可能存在的问题或需要注意的地方。
