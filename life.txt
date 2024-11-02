@@ -1,84 +1,74 @@
-import pandas as pd
-import json
-from anytree import Node, RenderTree
-from anytree.exporter import DictExporter
-from flask import Flask, render_template_string
+.treeview, .treeview ul {
+	padding: 0;
+	margin: 0;
+	list-style: none;
+}
 
-# Read the CSV file
-df = pd.read_csv('tree_structure.csv')
+.treeview ul {
+	background-color: white;
+	margin-top: 4px;
+}
 
-# Create a dictionary to store nodes
-nodes = {}
+.treeview .hitarea {
+	background: url(images/treeview-default.gif) -64px -25px no-repeat;
+	height: 16px;
+	width: 16px;
+	margin-left: -16px;
+	float: left;
+	cursor: pointer;
+}
+/* fix for IE6 */
+* html .hitarea {
+	display: inline;
+	float:none;
+}
 
-# Create nodes for each row in the CSV file
-for index, row in df.iterrows():
-    name = row['name']
-    parent_name = row['parent']
-    level = row['level']
+.treeview li {
+	margin: 0;
+	padding: 3px 0pt 3px 16px;
+}
 
-    if pd.isna(parent_name) or parent_name.strip() == "":
-        nodes[name] = Node(name)
-    else:
-        nodes[name] = Node(name, parent=nodes[parent_name])
+.treeview a.selected {
+	background-color: #eee;
+}
 
-# Convert tree structure to dictionary format for JSON
-root_nodes = [node for node in nodes.values() if node.is_root]
-exporter = DictExporter()
-tree_data = [exporter.export(root) for root in root_nodes]
+#treecontrol { margin: 1em 0; display: none; }
 
-# Create Flask app
-app = Flask(__name__)
+.treeview .hover { color: red; cursor: pointer; }
 
-# HTML template to render the tree structure on a webpage
-html_template = '''
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Tree Structure</title>
-    <link rel="stylesheet" href="jquery.treeview.css" />
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/jquery/3.6.0/jquery.min.js"></script>
-    <script src="jquery.treeview.js"></script>
-    <script>
-        $(document).ready(function() {
-            $("#tree").treeview({
-                collapsed: true,
-                animated: "fast",
-                unique: true
-            });
-        });
+.treeview li { background: url(images/treeview-default-line.gif) 0 0 no-repeat; }
+.treeview li.collapsable, .treeview li.expandable { background-position: 0 -176px; }
 
-        function buildTree(data) {
-            let html = '';
-            for (const node of data) {
-                html += '<li>' + node.name;
-                if (node.children && node.children.length > 0) {
-                    html += '<ul>' + buildTree(node.children) + '</ul>';
-                }
-                html += '</li>';
-            }
-            return html;
-        }
-    </script>
-</head>
-<body>
-    <h1>Tree Structure</h1>
-    <ul id="tree">
-        <script>
-            document.write(buildTree({{ tree_data|safe }}));
-        </script>
-    </ul>
-</body>
-</html>
-'''
+.treeview .expandable-hitarea { background-position: -80px -3px; }
 
+.treeview li.last { background-position: 0 -1766px }
+.treeview li.lastCollapsable, .treeview li.lastExpandable { background-image: url(images/treeview-default.gif); }
+.treeview li.lastCollapsable { background-position: 0 -111px }
+.treeview li.lastExpandable { background-position: -32px -67px }
 
-# Flask route to display the tree
-@app.route('/')
-def show_tree():
-    return render_template_string(html_template, tree_data=json.dumps(tree_data))
+.treeview div.lastCollapsable-hitarea, .treeview div.lastExpandable-hitarea { background-position: 0; }
 
+.treeview-red li { background-image: url(images/treeview-red-line.gif); }
+.treeview-red .hitarea, .treeview-red li.lastCollapsable, .treeview-red li.lastExpandable { background-image: url(images/treeview-red.gif); }
 
-if __name__ == "__main__":
-    app.run(debug=True)
+.treeview-black li { background-image: url(images/treeview-black-line.gif); }
+.treeview-black .hitarea, .treeview-black li.lastCollapsable, .treeview-black li.lastExpandable { background-image: url(images/treeview-black.gif); }
+
+.treeview-gray li { background-image: url(images/treeview-gray-line.gif); }
+.treeview-gray .hitarea, .treeview-gray li.lastCollapsable, .treeview-gray li.lastExpandable { background-image: url(images/treeview-gray.gif); }
+
+.treeview-famfamfam li { background-image: url(images/treeview-famfamfam-line.gif); }
+.treeview-famfamfam .hitarea, .treeview-famfamfam li.lastCollapsable, .treeview-famfamfam li.lastExpandable { background-image: url(images/treeview-famfamfam.gif); }
+
+.treeview .placeholder {
+	background: url(images/ajax-loader.gif) 0 0 no-repeat;
+	height: 16px;
+	width: 16px;
+	display: block;
+}
+
+.filetree li { padding: 3px 0 2px 16px; }
+.filetree span.folder, .filetree span.file { padding: 1px 0 1px 16px; display: block; }
+.filetree span.folder { background: url(images/folder.gif) 0 0 no-repeat; }
+.filetree li.expandable span.folder { background: url(images/folder-closed.gif) 0 0 no-repeat; }
+.filetree span.file { background: url(images/file.gif) 0 0 no-repeat; }
