@@ -1,72 +1,84 @@
-import os
-from contextlib import asynccontextmanager
-import asyncio
-import asyncpg
-import orjson
-import structlog
-from fastapi import FastAPI
-import requests
+import pandas as pd
+import json
+from anytree import Node, RenderTree
+from anytree.exporter import DictExporter
+from flask import Flask, render_template_string
 
-_pg_pool = None
+# Read the CSV file
+df = pd.read_csv('tree_structure.csv')
 
-def get_db_password():
-    # 替换为实际获取密码的URL
-    response = requests.get("http://example.com/get-db-password")
-    if response.status_code == 200:
-        return response.json().get("password")
+# Create a dictionary to store nodes
+nodes = {}
+
+# Create nodes for each row in the CSV file
+for index, row in df.iterrows():
+    name = row['name']
+    parent_name = row['parent']
+    level = row['level']
+
+    if pd.isna(parent_name) or parent_name.strip() == "":
+        nodes[name] = Node(name)
     else:
-        raise Exception("Failed to fetch database password")
+        nodes[name] = Node(name, parent=nodes[parent_name])
 
-async def _init_connection(conn) -> None:
-    await conn.set_type_codec(
-        "json",
-        encoder=lambda v: orjson.dumps(v).decode(),
-        decoder=orjson.loads,
-        schema="pg_catalog",
-    )
-    await conn.set_type_codec(
-        "jsonb",
-        encoder=lambda v: orjson.dumps(v).decode(),
-        decoder=orjson.loads,
-        schema="pg_catalog",
-    )
-    await conn.set_type_codec(
-        "uuid", encoder=lambda v: str(v), decoder=lambda v: v, schema="pg_catalog"
-    )
+# Convert tree structure to dictionary format for JSON
+root_nodes = [node for node in nodes.values() if node.is_root]
+exporter = DictExporter()
+tree_data = [exporter.export(root) for root in root_nodes]
 
-async def establish_db_pool():
-    global _pg_pool
-    password = get_db_password()
-    _pg_pool = await asyncpg.create_pool(
-        database=os.environ["POSTGRES_DB"],
-        user=os.environ["POSTGRES_USER"],
-        password=password,
-        host=os.environ["POSTGRES_HOST"],
-        port=os.environ["POSTGRES_PORT"],
-        init=_init_connection,
-    )
+# Create Flask app
+app = Flask(__name__)
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    structlog.configure(
-        processors=[
-            structlog.stdlib.filter_by_level,
-            structlog.stdlib.PositionalArgumentsFormatter(),
-            structlog.processors.StackInfoRenderer(),
-            structlog.processors.UnicodeDecoder(),
-            structlog.stdlib.render_to_log_kwargs,
-        ],
-        logger_factory=structlog.stdlib.LoggerFactory(),
-        wrapper_class=structlog.stdlib.BoundLogger,
-        cache_logger_on_first_use=True,
-    )
+# HTML template to render the tree structure on a webpage
+html_template = '''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tree Structure</title>
+    <link rel="stylesheet" href="jquery.treeview.css" />
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jquery/3.6.0/jquery.min.js"></script>
+    <script src="jquery.treeview.js"></script>
+    <script>
+        $(document).ready(function() {
+            $("#tree").treeview({
+                collapsed: true,
+                animated: "fast",
+                unique: true
+            });
+        });
 
-    await establish_db_pool()
-    yield
-    await _pg_pool.close()
-    _pg_pool = None
+        function buildTree(data) {
+            let html = '';
+            for (const node of data) {
+                html += '<li>' + node.name;
+                if (node.children && node.children.length > 0) {
+                    html += '<ul>' + buildTree(node.children) + '</ul>';
+                }
+                html += '</li>';
+            }
+            return html;
+        }
+    </script>
+</head>
+<body>
+    <h1>Tree Structure</h1>
+    <ul id="tree">
+        <script>
+            document.write(buildTree({{ tree_data|safe }}));
+        </script>
+    </ul>
+</body>
+</html>
+'''
 
-async def refresh_connection_periodically():
-    while True:
-        await establish_db_pool()
-        await asyncio.sleep(3600)  # 每小时刷新一次
+
+# Flask route to display the tree
+@app.route('/')
+def show_tree():
+    return render_template_string(html_template, tree_data=json.dumps(tree_data))
+
+
+if __name__ == "__main__":
+    app.run(debug=True)
