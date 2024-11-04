@@ -1,74 +1,27 @@
-.treeview, .treeview ul {
-	padding: 0;
-	margin: 0;
-	list-style: none;
-}
+import os
 
-.treeview ul {
-	background-color: white;
-	margin-top: 4px;
-}
+from py_clob_client.client import ClobClient
+from py_clob_client.clob_types import ApiCreds
+from dotenv import load_dotenv
+from py_clob_client.constants import AMOY
+private_key = '0xda90b76a0a60474231294183c6c24ba75df3e431ee07e397e25f86ba7cac7637a'
+load_dotenv()
 
-.treeview .hitarea {
-	background: url(images/treeview-default.gif) -64px -25px no-repeat;
-	height: 16px;
-	width: 16px;
-	margin-left: -16px;
-	float: left;
-	cursor: pointer;
-}
-/* fix for IE6 */
-* html .hitarea {
-	display: inline;
-	float:none;
-}
 
-.treeview li {
-	margin: 0;
-	padding: 3px 0pt 3px 16px;
-}
+def main():
+    host = "https://clob.polymarket.com"
+    key = private_key
+    creds = ApiCreds(
+        api_key='18653e8f-25c8-b853-9961-9ce0d00fff16a',
+        api_secret='3QL7yz2EuUVYxT_LvFQVrNXCJIEGSS1ro2Ewdlf2lKk=a',
+        api_passphrase='73472e8c1696bcb657920bb4714ad00b55987e52356b5a7ee817c0cbcbeb37e4a',
+    )
+    chain_id = AMOY
+    client = ClobClient(host, key=key, chain_id=chain_id, creds=creds)
 
-.treeview a.selected {
-	background-color: #eee;
-}
+    markets = client.get_market('0x41190eb9336ae73949c04f4900f9865092e69a57cf9c942a6157abf6ae8d16c6')
+    print(markets)
+    print("Done!")
 
-#treecontrol { margin: 1em 0; display: none; }
 
-.treeview .hover { color: red; cursor: pointer; }
-
-.treeview li { background: url(images/treeview-default-line.gif) 0 0 no-repeat; }
-.treeview li.collapsable, .treeview li.expandable { background-position: 0 -176px; }
-
-.treeview .expandable-hitarea { background-position: -80px -3px; }
-
-.treeview li.last { background-position: 0 -1766px }
-.treeview li.lastCollapsable, .treeview li.lastExpandable { background-image: url(images/treeview-default.gif); }
-.treeview li.lastCollapsable { background-position: 0 -111px }
-.treeview li.lastExpandable { background-position: -32px -67px }
-
-.treeview div.lastCollapsable-hitarea, .treeview div.lastExpandable-hitarea { background-position: 0; }
-
-.treeview-red li { background-image: url(images/treeview-red-line.gif); }
-.treeview-red .hitarea, .treeview-red li.lastCollapsable, .treeview-red li.lastExpandable { background-image: url(images/treeview-red.gif); }
-
-.treeview-black li { background-image: url(images/treeview-black-line.gif); }
-.treeview-black .hitarea, .treeview-black li.lastCollapsable, .treeview-black li.lastExpandable { background-image: url(images/treeview-black.gif); }
-
-.treeview-gray li { background-image: url(images/treeview-gray-line.gif); }
-.treeview-gray .hitarea, .treeview-gray li.lastCollapsable, .treeview-gray li.lastExpandable { background-image: url(images/treeview-gray.gif); }
-
-.treeview-famfamfam li { background-image: url(images/treeview-famfamfam-line.gif); }
-.treeview-famfamfam .hitarea, .treeview-famfamfam li.lastCollapsable, .treeview-famfamfam li.lastExpandable { background-image: url(images/treeview-famfamfam.gif); }
-
-.treeview .placeholder {
-	background: url(images/ajax-loader.gif) 0 0 no-repeat;
-	height: 16px;
-	width: 16px;
-	display: block;
-}
-
-.filetree li { padding: 3px 0 2px 16px; }
-.filetree span.folder, .filetree span.file { padding: 1px 0 1px 16px; display: block; }
-.filetree span.folder { background: url(images/folder.gif) 0 0 no-repeat; }
-.filetree li.expandable span.folder { background: url(images/folder-closed.gif) 0 0 no-repeat; }
-.filetree span.file { background: url(images/file.gif) 0 0 no-repeat; }
+main()
