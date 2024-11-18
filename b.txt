@@ -1,44 +1,36 @@
-from fastapi import FastAPI, Request
-import pandas as pd
-
-app = FastAPI()
-
-@app.put("/your-endpoint")
-async def update_data(request: Request):
-    data = await request.json()
-    df = pd.DataFrame(data)
-    return len(df)
-
-
-
-====import pandas as pd
-import requests
+import asyncio
 import json
+import datetime
+import websocket
 
-# 创建一个示例DataFrame
-df = pd.DataFrame({
-    'A': [1, 2, 3],
-    'B': ['a', 'b', 'c']
-})
+async def main():
+    url = 'wss://ws-subscriptions-clob.polymarket.com/ws/market'
+    last_time_pong = datetime.datetime.now()
+    msgs = []
 
-# 将DataFrame转换为JSON
-data = df.to_json(orient='records')
+    kamala_trump_yes_token = "112691550711713354714525509796202337193505769808087674259394206524293080902258"
+    kamala_trump_no_token = "40934908860656143479579576067633881276941830984503767038689094076378988206631"
 
-# API的URL
-url = 'http://localhost:8000/your-endpoint'
+    trump_win_election_yes = "21742633143463906290569050155826241533067272736897614950488156847949938836455"
+    trump_win_election_no = "48331043336612883890938759509493159234755048973500640148014422747788308965732"
 
-# 发送PUT请求
-response = requests.put(url, data=data, headers={'Content-Type': 'application/json'})
+    async with websocket.AWebSocketApp(
+        url,
+        http_proxy_host="代理服务器地址",
+        http_proxy_port=代理服务器端口,
+        proxy_type="http"
+    ) as ws:
+        await ws.send(json.dumps({"assets_ids":[trump_win_election_yes, trump_win_election_no],"type":"market"}))
 
-# 检查响应
-if response.status_code == 200:
-    row_count = response.json()
-    print(f"DataFrame的行数: {row_count}")
-else:
-    print(f"请求失败,状态码: {response.status_code}")
-    print(f"错误信息: {response.text}")
+        while True:
+            m = await ws.recv()
+            if m != "PONG":
+                last_time_pong = datetime.datetime.now()
+                d = json.loads(m)
+                print(d)
+                msgs.append(d)
+            if last_time_pong + datetime.timedelta(seconds=10) < datetime.datetime.now():
+                await ws.send("PING")
 
-你是一位经验丰富的代码审查员。我将提供一个 Bitbucket Pull Request 的 diff JSON 内容。请你分析其中的代码变更，并提供以下信息：
-- 变更的文件列表。
-- 每个文件的具体修改内容。
-- 可能存在的问题或需要注意的地方。
+# 运行异步主函数
+asyncio.get_event_loop().run_until_complete(main())
