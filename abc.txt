@@ -1,21 +1,152 @@
-pg_dump -U source_user -h source_host -p source_port -d source_db | psql -U destination_user -h destination_host -p destination_port -d destination_db
+# Step 1: Initialize the project with npm and Vue
+npm init vue@latest query-app
+cd query-app
+npm install
+```
 
+```javascript
+// Step 2: Edit src/components/QueryForm.vue
+<template>
+  <div class="query-form">
+    <div class="inputs">
+      <input type="date" v-model="startTime" placeholder="Start Time" class="input-field" />
+      <input type="date" v-model="endTime" placeholder="End Time" class="input-field" />
+      <input type="text" v-model="companyName" placeholder="Company Name" class="input-field" />
+      <input type="text" v-model="companyType" placeholder="Company Type" class="input-field" />
+      <button @click="submitQuery" class="submit-button">Submit</button>
+    </div>
+    <table v-if="results.length > 0" class="results-table">
+      <thead>
+        <tr>
+          <th>Company Name</th>
+          <th>Date</th>
+          <th>Title</th>
+          <th>Link</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr v-for="(result, index) in results" :key="index">
+          <td>{{ result.companyName }}</td>
+          <td>{{ result.date }}</td>
+          <td>{{ result.title }}</td>
+          <td><a :href="result.link" target="_blank" class="link">{{ result.link }}</a></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</template>
 
-pg_dump -U source_user -h source_host -p 5433 -d source_db | psql -U destination_user -h destination_host -p 5434 -d destination_db
+<script setup>
+import { ref } from 'vue';
+import axios from 'axios';
 
+const startTime = ref('');
+const endTime = ref('');
+const companyName = ref('');
+const companyType = ref('');
+const results = ref([]);
 
-#!/bin/bash
+const submitQuery = () => {
+  const params = {
+    startTime: startTime.value,
+    endTime: endTime.value,
+    companyName: companyName.value,
+    companyType: companyType.value
+  };
 
-# 定义要查找和替换的内容
-old_pattern="export REQUESTS_CA_BUNDLE=/home/kong/certs/certs.pem"
-new_pattern="export XXXX=/home/kong/certs/certs.pem"
+  axios.get('http://localhost:8123/query', { params })
+    .then(response => {
+      results.value = response.data;
+    })
+    .catch(error => {
+      console.error('There was an error fetching the data:', error);
+    });
+};
+</script>
 
-# 检查旧模式是否存在
-if grep -q "$old_pattern" ~/.bashrc 2>/dev/null; then
-    # 如果存在，进行替换
-    sed -i "s|$old_pattern|$new_pattern|g" ~/.bashrc
-    echo "内容已替换。"
-else
-    # 如果不存在，静默添加新内容
-    echo "$new_pattern" >> ~/.bashrc
-fi
+<style scoped>
+.query-form {
+  width: 100%;
+  padding: 20px;
+  background-color: #f9f9f9;
+  box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+  border-radius: 8px;
+}
+.inputs {
+  display: flex;
+  gap: 20px;
+  padding: 20px;
+  background-color: #ffffff;
+  box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+  align-items: center;
+  justify-content: center;
+}
+.input-field {
+  padding: 10px;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  width: 200px;
+}
+.submit-button {
+  padding: 10px 20px;
+  background-color: #007bff;
+  color: #fff;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background-color 0.3s;
+}
+.submit-button:hover {
+  background-color: #0056b3;
+}
+.results-table {
+  width: 100%;
+  margin-top: 20px;
+  border-collapse: collapse;
+  background-color: #ffffff;
+  box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+}
+th, td {
+  border: 1px solid #ddd;
+  padding: 12px;
+  text-align: center;
+}
+th {
+  background-color: #007bff;
+  color: #fff;
+}
+td {
+  background-color: #f9f9f9;
+}
+.link {
+  color: #007bff;
+  text-decoration: none;
+  transition: color 0.3s;
+}
+.link:hover {
+  color: #0056b3;
+}
+</style>
+```
+
+```javascript
+// Step 3: Import the QueryForm component and use it in src/App.vue
+<template>
+  <div id="app">
+    <QueryForm />
+  </div>
+</template>
+
+<script setup>
+import QueryForm from './components/QueryForm.vue';
+</script>
+
+<style>
+#app {
+  font-family: Avenir, Helvetica, Arial, sans-serif;
+  text-align: left;
+  color: #2c3e50;
+  margin: 0;
+  padding: 0;
+}
+</style>
