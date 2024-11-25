@@ -1,26 +1,70 @@
-npm init vue@latest query-app
-cd query-app
-npm install
+from fastapi import (
+    FastAPI,
+    Request,
+    Depends,
+    Response,
+    HTTPException,
+    status,
+)
+from datetime import timedelta, datetime
+from jose import jwt, JWTError
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 
+SECRET_KEY = "abcdefg"
+ALGORITHM = "HS256"
 
----------
-{
-  "name": "query-app",
-  "version": "0.0.0",
-  "private": true,
-  "type": "module",
-  "scripts": {
-    "dev": "vite",
-    "build": "vite build",
-    "preview": "vite preview"
-  },
-  "dependencies": {
-    "axios": "^1.7.7",
-    "vue": "^3.5.12"
-  },
-  "devDependencies": {
-    "@vitejs/plugin-vue": "^5.1.4",
-    "vite": "^5.4.10",
-    "vite-plugin-vue-devtools": "^7.5.4"
-  }
-}
+app = FastAPI(title="OpenGPTs API")
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/login")
+
+def authenticate_user(username: str, password: str):
+    # 在这里替换为您的实际身份验证逻辑
+    if username == "kong" and password == "your_password":
+        return username
+    return None
+
+def create_access_token(data: dict, expires_delta: timedelta = None):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=15))
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+@app.post("/login")
+def login_for_access_token(
+    response: Response, form_data: OAuth2PasswordRequestForm = Depends()
+):
+    username = authenticate_user(form_data.username, form_data.password)
+    if not username:
+        raise HTTPException(status_code=400, detail="用户名或密码错误")
+    access_token_expires = timedelta(minutes=30)
+    access_token = create_access_token(
+        data={"sub": username}, expires_delta=access_token_expires
+    )
+    response.set_cookie(
+        key="ai-matrix-session",
+        value=access_token,
+        max_age=30 * 60,
+        expires=30 * 60,
+        path="/",
+    )
+    return {"access_token": access_token, "token_type": "bearer"}
+
+async def get_current_user(request: Request, token: str = Depends(oauth2_scheme)):
+    token_in_cookie = request.cookies.get("ai-matrix-session")
+    token = token_in_cookie or token
+    if not token:
+        raise HTTPException(status_code=401, detail="未认证")
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            raise HTTPException(status_code=401, detail="无效的令牌")
+        # 可在此处从数据库获取用户信息
+        return username
+    except JWTError:
+        raise HTTPException(status_code=401, detail="无效的令牌")
+
+@app.get("/users/me")
+async def read_users_me(current_user: str = Depends(get_current_user)):
+    return {"username": current_user}
