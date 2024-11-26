@@ -1,70 +1,107 @@
-from fastapi import (
-    FastAPI,
-    Request,
-    Depends,
-    Response,
-    HTTPException,
-    status,
-)
-from datetime import timedelta, datetime
-from jose import jwt, JWTError
+from fastapi import FastAPI, Depends, Request, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from datetime import datetime, timedelta
+from typing import Optional
 
-SECRET_KEY = "abcdefg"
+app = FastAPI()
+
+# 常量和密码上下文
+SECRET_KEY = "your-secret-key"  # 请使用强随机生成的密钥
 ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
-app = FastAPI(title="OpenGPTs API")
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/login")
+# 模拟的用户数据库
+fake_users_db = {
+    "johndoe": {
+        "username": "johndoe",
+        "full_name": "John Doe",
+        "hashed_password": pwd_context.hash("secret"),
+        "disabled": False,
+    }
+}
+
+# 允许的 IP 地址列表
+allowed_ips = ["10.21.22.34", "10.21.22.35"]
+
+# OAuth2PasswordBearer 实例
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login", auto_error=False)
+
+# 异常
+credentials_exception = HTTPException(
+    status_code=status.HTTP_401_UNAUTHORIZED,
+    detail="无法验证凭据",
+    headers={"WWW-Authenticate": "Bearer"},
+)
+
+# 工具函数
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_user(username: str):
+    user = fake_users_db.get(username)
+    return user
 
 def authenticate_user(username: str, password: str):
-    # 在这里替换为您的实际身份验证逻辑
-    if username == "kong" and password == "your_password":
-        return username
-    return None
+    user = get_user(username)
+    if not user or not verify_password(password, user["hashed_password"]):
+        return False
+    return user
 
-def create_access_token(data: dict, expires_delta: timedelta = None):
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode = data.copy()
     expire = datetime.utcnow() + (expires_delta or timedelta(minutes=15))
     to_encode.update({"exp": expire})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
-@app.post("/login")
-def login_for_access_token(
-    response: Response, form_data: OAuth2PasswordRequestForm = Depends()
-):
-    username = authenticate_user(form_data.username, form_data.password)
-    if not username:
-        raise HTTPException(status_code=400, detail="用户名或密码错误")
-    access_token_expires = timedelta(minutes=30)
-    access_token = create_access_token(
-        data={"sub": username}, expires_delta=access_token_expires
-    )
-    response.set_cookie(
-        key="ai-matrix-session",
-        value=access_token,
-        max_age=30 * 60,
-        expires=30 * 60,
-        path="/",
-    )
-    return {"access_token": access_token, "token_type": "bearer"}
-
-async def get_current_user(request: Request, token: str = Depends(oauth2_scheme)):
-    token_in_cookie = request.cookies.get("ai-matrix-session")
-    token = token_in_cookie or token
-    if not token:
-        raise HTTPException(status_code=401, detail="未认证")
+async def verify_token(token: str):
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         username: str = payload.get("sub")
         if username is None:
-            raise HTTPException(status_code=401, detail="无效的令牌")
-        # 可在此处从数据库获取用户信息
-        return username
+            raise credentials_exception
+        user = get_user(username)
+        if user is None:
+            raise credentials_exception
+        return user
     except JWTError:
-        raise HTTPException(status_code=401, detail="无效的令牌")
+        raise credentials_exception
 
+# 自定义依赖项
+async def get_current_user(request: Request, token: str = Depends(oauth2_scheme)):
+    client_ip = request.client.host
+    if client_ip in allowed_ips:
+        # 跳过验证
+        return {"username": "anonymous", "ip": client_ip}
+    elif token:
+        # 验证令牌并获取用户信息
+        user = await verify_token(token)
+        return user
+    else:
+        # 没有提供令牌且 IP 不在允许列表中
+        raise credentials_exception
+
+# 登录路由
+@app.post("/login")
+async def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    user = authenticate_user(form_data.username, form_data.password)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="用户名或密码不正确",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user["username"]}, expires_delta=access_token_expires
+    )
+    return {"access_token": access_token, "token_type": "bearer"}
+
+# 受保护的路由
 @app.get("/users/me")
-async def read_users_me(current_user: str = Depends(get_current_user)):
-    return {"username": current_user}
+async def read_users_me(user: dict = Depends(get_current_user)):
+    return user
