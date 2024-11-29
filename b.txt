@@ -1,1 +1,1 @@
-git rev-list --objects <branch_name> | git cat-file --batch-check='%(objectsize:disk)' | awk '{sum += $1} END {print sum/1024/1024 " MB"}'
+https://www.bloomberg.com/news/articles/2024-11-14/ubs-fills-leadership-roles-after-departures-by-senior-executives?sref=y3YMCJ4e
