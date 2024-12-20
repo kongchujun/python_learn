@@ -1,152 +1,50 @@
-# Step 1: Initialize the project with npm and Vue
-npm init vue@latest query-app
-cd query-app
-npm install
-```
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
+import json
 
-```javascript
-// Step 2: Edit src/components/QueryForm.vue
-<template>
-  <div class="query-form">
-    <div class="inputs">
-      <input type="date" v-model="startTime" placeholder="Start Time" class="input-field" />
-      <input type="date" v-model="endTime" placeholder="End Time" class="input-field" />
-      <input type="text" v-model="companyName" placeholder="Company Name" class="input-field" />
-      <input type="text" v-model="companyType" placeholder="Company Type" class="input-field" />
-      <button @click="submitQuery" class="submit-button">Submit</button>
-    </div>
-    <table v-if="results.length > 0" class="results-table">
-      <thead>
-        <tr>
-          <th>Company Name</th>
-          <th>Date</th>
-          <th>Title</th>
-          <th>Link</th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr v-for="(result, index) in results" :key="index">
-          <td>{{ result.companyName }}</td>
-          <td>{{ result.date }}</td>
-          <td>{{ result.title }}</td>
-          <td><a :href="result.link" target="_blank" class="link">{{ result.link }}</a></td>
-        </tr>
-      </tbody>
-    </table>
-  </div>
-</template>
+app = FastAPI()
 
-<script setup>
-import { ref } from 'vue';
-import axios from 'axios';
+class ModifyRequestBodyMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        # 检查路径和方法是否匹配
+        if request.url.path == "/userinput" and request.method == "POST":
+            try:
+                # 读取原始请求体
+                body_bytes = await request.body()
+                # 解析 JSON 内容
+                body = json.loads(body_bytes)
+                
+                # 添加 "input" 字段
+                body["input"] = body.copy()
+                
+                # 将修改后的内容重新编码为 JSON 字节
+                new_body = json.dumps(body).encode('utf-8')
+                
+                # 定义一个新的接收函数，返回修改后的请求体
+                async def receive():
+                    return {"type": "http.request", "body": new_body, "more_body": False}
+                
+                # 创建一个新的请求对象，替换原有的 body
+                modified_request = Request(request.scope, receive)
+                
+                # 调用下一个处理器（即路由处理函数）并传递修改后的请求
+                response = await call_next(modified_request)
+                return response
+            except json.JSONDecodeError:
+                # 如果请求体不是有效的 JSON，返回 400 错误
+                return JSONResponse(status_code=400, content={"detail": "Invalid JSON"})
+        else:
+            # 对于其他路径或方法，不进行修改
+            response = await call_next(request)
+            return response
 
-const startTime = ref('');
-const endTime = ref('');
-const companyName = ref('');
-const companyType = ref('');
-const results = ref([]);
+# 将中间件添加到 FastAPI 应用中
+app.add_middleware(ModifyRequestBodyMiddleware)
 
-const submitQuery = () => {
-  const params = {
-    startTime: startTime.value,
-    endTime: endTime.value,
-    companyName: companyName.value,
-    companyType: companyType.value
-  };
-
-  axios.get('http://localhost:8123/query', { params })
-    .then(response => {
-      results.value = response.data;
-    })
-    .catch(error => {
-      console.error('There was an error fetching the data:', error);
-    });
-};
-</script>
-
-<style scoped>
-.query-form {
-  width: 100%;
-  padding: 20px;
-  background-color: #f9f9f9;
-  box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
-  border-radius: 8px;
-}
-.inputs {
-  display: flex;
-  gap: 20px;
-  padding: 20px;
-  background-color: #ffffff;
-  box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
-  align-items: center;
-  justify-content: center;
-}
-.input-field {
-  padding: 10px;
-  border: 1px solid #ccc;
-  border-radius: 4px;
-  width: 200px;
-}
-.submit-button {
-  padding: 10px 20px;
-  background-color: #007bff;
-  color: #fff;
-  border: none;
-  border-radius: 4px;
-  cursor: pointer;
-  transition: background-color 0.3s;
-}
-.submit-button:hover {
-  background-color: #0056b3;
-}
-.results-table {
-  width: 100%;
-  margin-top: 20px;
-  border-collapse: collapse;
-  background-color: #ffffff;
-  box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
-}
-th, td {
-  border: 1px solid #ddd;
-  padding: 12px;
-  text-align: center;
-}
-th {
-  background-color: #007bff;
-  color: #fff;
-}
-td {
-  background-color: #f9f9f9;
-}
-.link {
-  color: #007bff;
-  text-decoration: none;
-  transition: color 0.3s;
-}
-.link:hover {
-  color: #0056b3;
-}
-</style>
-```
-
-```javascript
-// Step 3: Import the QueryForm component and use it in src/App.vue
-<template>
-  <div id="app">
-    <QueryForm />
-  </div>
-</template>
-
-<script setup>
-import QueryForm from './components/QueryForm.vue';
-</script>
-
-<style>
-#app {
-  font-family: Avenir, Helvetica, Arial, sans-serif;
-  text-align: left;
-  color: #2c3e50;
-  margin: 0;
-  padding: 0;
-}
-</style>
+@app.post("/userinput")
+async def user_input(data: dict):
+    """
+    接收经过中间件修改后的请求体，并返回给客户端。
+    """
+    return data
