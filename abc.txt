@@ -1,50 +1,40 @@
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
+from fastapi.responses import JSONResponse
 import json
 
 app = FastAPI()
 
-class ModifyRequestBodyMiddleware(BaseHTTPMiddleware):
+class AddInputMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        # 检查路径和方法是否匹配
-        if request.url.path == "/userinput" and request.method == "POST":
+        if request.url.path == "/userinput" and request.method == "POST":  # 只针对 /userinput 接口的 POST 请求
             try:
-                # 读取原始请求体
-                body_bytes = await request.body()
-                # 解析 JSON 内容
-                body = json.loads(body_bytes)
-                
-                # 添加 "input" 字段
-                body["input"] = body.copy()
-                
-                # 将修改后的内容重新编码为 JSON 字节
-                new_body = json.dumps(body).encode('utf-8')
-                
-                # 定义一个新的接收函数，返回修改后的请求体
-                async def receive():
-                    return {"type": "http.request", "body": new_body, "more_body": False}
-                
-                # 创建一个新的请求对象，替换原有的 body
-                modified_request = Request(request.scope, receive)
-                
-                # 调用下一个处理器（即路由处理函数）并传递修改后的请求
-                response = await call_next(modified_request)
+                body = await request.body()
+                data = json.loads(body.decode())  # 解码请求体
+                new_data = {"input": data}
+                request._body = json.dumps(new_data).encode() # 将修改后的数据重新编码并赋值给request._body
+
+                response = await call_next(request)
+
                 return response
             except json.JSONDecodeError:
-                # 如果请求体不是有效的 JSON，返回 400 错误
-                return JSONResponse(status_code=400, content={"detail": "Invalid JSON"})
+                return JSONResponse(status_code=400, content={"message": "Invalid JSON"}) # 处理JSON解码错误
         else:
-            # 对于其他路径或方法，不进行修改
             response = await call_next(request)
             return response
 
-# 将中间件添加到 FastAPI 应用中
-app.add_middleware(ModifyRequestBodyMiddleware)
+app.add_middleware(AddInputMiddleware)
 
 @app.post("/userinput")
-async def user_input(data: dict):
-    """
-    接收经过中间件修改后的请求体，并返回给客户端。
-    """
+async def userinput(request: Request):
+    body = await request.body()
+    data = json.loads(body.decode())
     return data
+
+
+# 运行：uvicorn main:app --reload
+
+
+if __name__ == '__main__':
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8051)
