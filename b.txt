@@ -1,1 +1,79 @@
-apt update && sudo apt upgrade libssl1.1 libssl-dev libc6 busybox openssl
+from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from jose import JWTError, jwt
+from datetime import datetime, timedelta
+
+SECRET_KEY = "your_secret_key"  # 实际应用中需要更强的密钥
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+app = FastAPI()
+
+# 模拟用户数据库
+users = {"testuser": {"password": "password"}}
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+
+def create_access_token(data: dict, expires_delta: timedelta | None = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=15)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+@app.post("/token")
+async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
+    user = users.get(form_data.username)
+    if not user or user["password"] != form_data.password:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": form_data.username}, expires_delta=access_token_expires
+    )
+    return {"access_token": access_token, "token_type": "bearer"}
+
+def get_current_user(token: str = Depends(oauth2_scheme)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+    return username
+----------------------
+
+
+from fastapi import FastAPI, Depends, HTTPException, status
+import httpx
+
+app = FastAPI()
+
+SSO_SERVER_URL = "http://127.0.0.1:8000"  # SSO 服务器地址
+
+async def verify_token(token: str):
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(f"{SSO_SERVER_URL}/verify", headers={"Authorization": f"Bearer {token}"}) # 假设SSO服务器有/verify接口，实际应用中可以复用/token接口
+            if response.status_code == 200:
+                return response.json().get("username")
+            else:
+                raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+        except httpx.ConnectError:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="SSO server unavailable")
+
+@app.get("/protected")
+async def protected_route(username: str = Depends(verify_token)):
+    return {"message": f"Hello, {username}! This is a protected resource in App 1."}
