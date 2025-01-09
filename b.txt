@@ -2,13 +2,7 @@ from locust import HttpUser, TaskSet, task, between
 
 class UserBehavior(TaskSet):
     def on_start(self):
-        # 方法1：如果已经有token，可以直接设置cookie
         self.client.cookies.set('token', 'my_token_value')
-
-        # 方法2：如果需要通过登录接口获取token
-        # login_response = self.client.post("/login", json={"username": "user", "password": "pass"})
-        # token = login_response.json()["token"]
-        # self.client.cookies.set('token', token)
 
     @task
     def request_api(self):
@@ -18,3 +12,4 @@ class WebsiteUser(HttpUser):
     tasks = [UserBehavior]
     wait_time = between(1, 2)
     host = "https://kong.chujun.com"
+    verify = False  # 添加这一行
