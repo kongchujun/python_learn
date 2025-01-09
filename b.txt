@@ -1,19 +1,20 @@
-#!/bin/bash
+from locust import HttpUser, TaskSet, task, between
 
-# 解密文件
-openssl enc -aes-256-cbc -d -in encode.env -out .env -pass pass:xxxy123567
+class UserBehavior(TaskSet):
+    def on_start(self):
+        # 方法1：如果已经有token，可以直接设置cookie
+        self.client.cookies.set('token', 'my_token_value')
 
-# 读取解密后的文件并提取键值对
-while IFS= read -r line; do
-  # 使用 ':' 作为分隔符，提取键和值
-  key=$(echo "$line" | cut -d ':' -f 1)
-  value=$(echo "$line" | cut -d ':' -f 2- | sed 's/^ *//')  # 去除值前的空格
+        # 方法2：如果需要通过登录接口获取token
+        # login_response = self.client.post("/login", json={"username": "user", "password": "pass"})
+        # token = login_response.json()["token"]
+        # self.client.cookies.set('token', token)
 
-  # 将键值对导出为环境变量
-  export "$key"="$value"
-done < .env
+    @task
+    def request_api(self):
+        self.client.get("/reqeust")
 
-# 现在可以在脚本中使用这些变量
-echo "Token: ${token}"
-echo "Data URL: ${data_url}"
-echo "Key ID: ${key_id}"
+class WebsiteUser(HttpUser):
+    tasks = [UserBehavior]
+    wait_time = between(1, 2)
+    host = "https://kong.chujun.com"
