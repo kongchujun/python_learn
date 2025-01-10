@@ -1,15 +1,22 @@
-from locust import HttpUser, TaskSet, task, between
+import json
 
-class UserBehavior(TaskSet):
-    def on_start(self):
-        self.client.cookies.set('token', 'my_token_value')
+# Parameters to pass to the job
+params = {
+    "parameter1": "value1",
+    "parameter2": "value2"
+}
 
-    @task
-    def request_api(self):
-        self.client.get("/reqeust")
+# Send a POST request with parameters
+response = requests.post(
+    job_url,
+    auth=HTTPBasicAuth(username, api_token),
+    data=json.dumps(params),
+    headers={"Content-Type": "application/json"}
+)
 
-class WebsiteUser(HttpUser):
-    tasks = [UserBehavior]
-    wait_time = between(1, 2)
-    host = "https://kong.chujun.com"
-    verify = False  # 添加这一行
+# Check the response status
+if response.status_code == 201:
+    print("Job triggered successfully with parameters!")
+else:
+    print(f"Failed to trigger job. Status code: {response.status_code}")
+    print(f"Response: {response.text}")
