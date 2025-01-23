@@ -1,40 +1,118 @@
-from fastapi import FastAPI, Request
-from starlette.middleware.base import BaseHTTPMiddleware
-from fastapi.responses import JSONResponse
-import json
+from fastapi import FastAPI, Depends, HTTPException, Request, Response
+from fastapi.responses import RedirectResponse, HTMLResponse
+from fastapi.templating import Jinja2Templates
+import requests
+import os
 
 app = FastAPI()
 
-class AddInputMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
-        if request.url.path == "/userinput" and request.method == "POST":  # 只针对 /userinput 接口的 POST 请求
-            try:
-                body = await request.body()
-                data = json.loads(body.decode())  # 解码请求体
-                new_data = {"input": data}
-                request._body = json.dumps(new_data).encode() # 将修改后的数据重新编码并赋值给request._body
+# 配置
+SSO_SERVER = "http://127.0.0.1:8001"  # SSO授权服务器的地址
+CLIENT_ID = "client_123"
+CLIENT_SECRET = "secret_abc"
+REDIRECT_URI = "http://127.0.0.1:9000/callback"  # 客户端的回调地址
+TEMPLATES = Jinja2Templates(directory="templates")
 
-                response = await call_next(request)
-
-                return response
-            except json.JSONDecodeError:
-                return JSONResponse(status_code=400, content={"message": "Invalid JSON"}) # 处理JSON解码错误
-        else:
-            response = await call_next(request)
-            return response
-
-app.add_middleware(AddInputMiddleware)
-
-@app.post("/userinput")
-async def userinput(request: Request):
-    body = await request.body()
-    data = json.loads(body.decode())
-    return data
+# 存储access_token（通常在生产环境中使用session或数据库）
+ACCESS_TOKEN = None
 
 
-# 运行：uvicorn main:app --reload
+@app.get("/", response_class=HTMLResponse)
+async def home(request: Request):
+    """首页显示，判断是否已经登录"""
+    if ACCESS_TOKEN:
+        return RedirectResponse(url="/profile")
+    return TEMPLATES.TemplateResponse("index.html", {"request": request})
 
 
-if __name__ == '__main__':
+@app.get("/login")
+async def login():
+    """重定向到SSO授权服务器的授权端点"""
+    state = os.urandom(16).hex()  # 生成一个随机的state参数
+    authorization_url = f"{SSO_SERVER}/authorize?client_id={CLIENT_ID}&redirect_uri={REDIRECT_URI}&response_type=code&state={state}"
+    return RedirectResponse(url=authorization_url)
+
+
+@app.get("/callback")
+async def callback(code: str, state: str):
+    """处理SSO服务器返回的授权码，并获取access_token"""
+    # 使用授权码请求令牌
+    token_url = f"{SSO_SERVER}/token"
+    response = requests.post(
+        token_url,
+        data={
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": REDIRECT_URI,
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+        },
+    )
+    if response.status_code == 200:
+        global ACCESS_TOKEN
+        data = response.json()
+        ACCESS_TOKEN = data["access_token"]
+        return RedirectResponse(url="/profile")
+    else:
+        raise HTTPException(status_code=400, detail="Failed to get access token")
+
+
+@app.get("/profile")
+async def profile(request: Request):
+    """使用access_token获取用户信息"""
+    if not ACCESS_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    # 获取用户信息
+    user_info_url = f"{SSO_SERVER}/userinfo?token={ACCESS_TOKEN}"
+    response = requests.get(user_info_url)
+
+    if response.status_code == 200:
+        user_info = response.json()
+        return TEMPLATES.TemplateResponse("profile.html", {"request": request, "user_info": user_info})
+    else:
+        raise HTTPException(status_code=400, detail="Failed to fetch user information")
+
+
+if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8051)
+
+    uvicorn.run(app, host="0.0.0.0", port=9000)
+
+
+-------------
+templates/index.html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OAuth2 Client</title>
+</head>
+<body>
+    <h1>Welcome to the OAuth2 Client</h1>
+    {% if ACCESS_TOKEN %}
+        <p>You are logged in!</p>
+        <a href="/profile">Go to Profile</a>
+    {% else %}
+        <p><a href="/login">Login with SSO</a></p>
+    {% endif %}
+</body>
+</html>
+-----------
+templates/profile.html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>User Profile</title>
+</head>
+<body>
+    <h1>User Profile</h1>
+    <p><strong>Username:</strong> {{ user_info.sub }}</p>
+    <p><strong>Email:</strong> {{ user_info.email }}</p>
+    <a href="/">Go to Home</a>
+</body>
+</html>
+
