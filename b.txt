@@ -1,235 +1,190 @@
-from fastapi import FastAPI, Request, Response, Depends, Form, HTTPException, status
-from fastapi.responses import HTMLResponse, RedirectResponse
-from fastapi.security import OAuth2PasswordBearer
-from typing import Optional, Dict
-import secrets
-import uvicorn
+import objgraph
+import gc
+import time
+import os
+from typing import Optional
+from fastapi import FastAPI, Query
+from pydantic import BaseModel
 
 app = FastAPI()
 
-# =========================
-# 1. 数据模拟（用户、客户端）
-# =========================
+# 用于存储多次快照的结果（类型统计信息）
+# 例如 {"before_test": {...}, "after_test": {...}}
+snapshots = {}
 
-# 模拟的用户数据库：username -> password
-FAKE_USERS_DB = {
-    "alice": "alice123",
-    "bob":   "bob123"
-}
+# ========== 数据模型 ==========
+class SnapshotResult(BaseModel):
+    snapshot_name: str
+    types_count: dict
 
-# 模拟的客户端注册信息：client_id -> client_secret/redirect_uri
-FAKE_CLIENTS_DB = {
-    "client_123": {
-        "client_secret": "secret_abc",
-        "redirect_uri": "http://localhost:9000/callback"
-        # 假设客户端会在本地9000端口启动一个服务, 并把回调地址指到 /callback
-    }
-}
+# ========== 工具函数 ==========
 
-# 用于存储“已登录用户”的 session，真实场景可用数据库/Redis + Cookie
-# key: session_id, value: username
-SESSION_STORE: Dict[str, str] = {}
-
-# 用于存储授权码 code 与 用户/客户端的绑定信息
-# key: code, value: { "username": x, "client_id": y }
-AUTH_CODE_STORE: Dict[str, Dict] = {}
-
-# 用于存储access_token与用户/客户端信息
-# key: access_token, value: { "username": x, "client_id": y }
-ACCESS_TOKEN_STORE: Dict[str, Dict] = {}
-
-# =========================
-# 2. 工具方法
-# =========================
-
-def create_session(username: str) -> str:
-    """创建一个session_id并存储在SESSION_STORE中"""
-    session_id = secrets.token_urlsafe(32)
-    SESSION_STORE[session_id] = username
-    return session_id
-
-def get_username_by_session_id(session_id: str) -> Optional[str]:
-    """根据session_id获取用户名"""
-    return SESSION_STORE.get(session_id)
-
-def create_authorization_code(username: str, client_id: str) -> str:
-    """生成一个authorization code"""
-    code = secrets.token_urlsafe(16)
-    AUTH_CODE_STORE[code] = {
-        "username": username,
-        "client_id": client_id
-    }
-    return code
-
-def verify_client(client_id: str, client_secret: str) -> bool:
-    """验证客户端的id和secret"""
-    client = FAKE_CLIENTS_DB.get(client_id)
-    if not client:
-        return False
-    return client["client_secret"] == client_secret
-
-def create_access_token(username: str, client_id: str) -> str:
-    """生成access token"""
-    access_token = secrets.token_urlsafe(32)
-    ACCESS_TOKEN_STORE[access_token] = {
-        "username": username,
-        "client_id": client_id
-    }
-    return access_token
-
-def get_user_by_access_token(token: str) -> Optional[str]:
-    """根据access_token获取用户名"""
-    info = ACCESS_TOKEN_STORE.get(token)
-    if info:
-        return info["username"]
-    return None
-
-# =========================
-# 3. SSO相关路由
-# =========================
-
-@app.get("/login", response_class=HTMLResponse)
-def show_login_form():
-    """显示一个简单的登录页面"""
-    html_content = """
-    <html>
-      <body>
-        <h1>SSO Login</h1>
-        <form action="/login" method="post">
-          <label>Username: <input type="text" name="username" /></label><br/>
-          <label>Password: <input type="password" name="password" /></label><br/>
-          <button type="submit">Login</button>
-        </form>
-      </body>
-    </html>
+def take_snapshot(name: str) -> dict:
     """
-    return HTMLResponse(content=html_content)
+    拍摄当前 Python 进程的对象类型统计快照。
+    并保存在 snapshots 全局字典中。
+    返回拍照的结果（类型统计信息）。
+    """
+    gc.collect()  # 手动GC，尽量减少干扰
+    stats = objgraph.typestats()
+    snapshots[name] = stats
+    return stats
 
-@app.post("/login")
-def do_login(response: Response, username: str = Form(...), password: str = Form(...)):
-    """处理登录逻辑，并在浏览器设置Cookie"""
-    # 验证用户名密码
-    if username not in FAKE_USERS_DB or FAKE_USERS_DB[username] != password:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+def diff_snapshots(snapshot_a: dict, snapshot_b: dict) -> dict:
+    """
+    对比两次快照的对象数量差异，返回一个 {类型: 增加数量} 的字典。
+    """
+    all_types = set(snapshot_a.keys()) | set(snapshot_b.keys())
+    diff_result = {}
+    for t in all_types:
+        diff_count = snapshot_b.get(t, 0) - snapshot_a.get(t, 0)
+        if diff_count != 0:
+            diff_result[t] = diff_count
+    return diff_result
 
-    # 创建session并放到cookie里
-    session_id = create_session(username)
-    # 注意：真实环境需要设置 HttpOnly / Secure / SameSite 等属性
-    response.set_cookie(key="sso_session_id", value=session_id, httponly=True)
+# ========== FastAPI 路由 ==========
 
-    return {"message": f"User {username} logged in successfully."}
+@app.post("/snapshot", response_model=SnapshotResult)
+def create_snapshot(name: str = Query(..., description="为该快照指定一个名称")):
+    """
+    拍摄一次快照，并保存到全局 snapshots 中。
+    返回本次快照中的对象类型统计。
+    """
+    stats = take_snapshot(name)
+    return SnapshotResult(snapshot_name=name, types_count=stats)
 
-@app.get("/authorize")
-def authorize(
-    request: Request,
-    client_id: str,
-    redirect_uri: str,
-    response_type: str,
-    state: Optional[str] = None
+@app.get("/snapshot/{name}", response_model=SnapshotResult)
+def get_snapshot(name: str):
+    """
+    获取已保存的某次快照（如 "before_test"）的对象统计信息。
+    """
+    if name not in snapshots:
+        return SnapshotResult(snapshot_name=name, types_count={})
+    return SnapshotResult(snapshot_name=name, types_count=snapshots[name])
+
+@app.get("/snapshot/diff")
+def compare_snapshots(name1: str, name2: str):
+    """
+    对比两次命名快照的对象分布差异。
+    """
+    if name1 not in snapshots or name2 not in snapshots:
+        return {"error": f"One of snapshot '{name1}' or '{name2}' not found."}
+    diff_result = diff_snapshots(snapshots[name1], snapshots[name2])
+    return {
+        "snapshot1": name1,
+        "snapshot2": name2,
+        "diff_result": diff_result
+    }
+
+@app.get("/objgraph/common_types")
+def show_most_common_types(limit: int = 10):
+    """
+    直接查看当前进程中数量最多的前N种对象类型。
+    """
+    gc.collect()
+    objgraph.show_most_common_types(limit=limit)
+    # objgraph.show_most_common_types() 会把结果打印到控制台；
+    # 如果想直接返回给接口，可以手动封装:
+    stats = objgraph.typestats()
+    sorted_stats = sorted(stats.items(), key=lambda x: x[1], reverse=True)
+    return {
+        "top_types": sorted_stats[:limit]
+    }
+
+@app.get("/objgraph/growth")
+def show_growth(limit: int = 10):
+    """
+    objgraph.growth() 会比较当前对象分布与上一次调用之间的差异。
+    """
+    gc.collect()
+    # 为了能够在HTTP接口查看结果，需要先捕获print输出或者手动处理
+    # 这里示例性的调用一次
+    growth_list = objgraph.growth(limit=limit)
+    # growth_list 是一个列表，如: [('dict', 10), ('list', 5), ...]
+    return {"growth": growth_list}
+
+@app.get("/objgraph/backrefs")
+def show_backrefs(
+    type_name: str,
+    index: int = 0,
+    max_depth: int = 5,
+    output_dir: str = "objgraph_outputs"
 ):
     """
-    授权端点：
-    1. 验证客户端是否合法、redirect_uri是否匹配
-    2. 如果用户已在SSO登录态，则生成code并重定向
-    3. 如果未登录，则跳转到/login页面
+    生成某种类型对象的引用关系图 (show_backrefs) 并存储为PNG文件。
+    - type_name: 对象的类型名称，例如 'MyLeakyClass', 'dict' 等
+    - index: 如果该类型对象很多，选取第 index 个对象来可视化
+    - max_depth: 向上追踪的引用深度
+    - output_dir: 存放输出文件的文件夹
+    返回生成的文件名，以便外部访问。
     """
-    # 验证客户端
-    client_config = FAKE_CLIENTS_DB.get(client_id)
-    if not client_config:
-        raise HTTPException(status_code=400, detail="Invalid client_id")
-    if client_config["redirect_uri"] != redirect_uri:
-        raise HTTPException(status_code=400, detail="redirect_uri mismatch")
-    if response_type != "code":
-        raise HTTPException(status_code=400, detail="Only 'code' supported")
+    gc.collect()
+    os.makedirs(output_dir, exist_ok=True)
 
-    # 检查用户是否已登录
-    sso_session_id = request.cookies.get("sso_session_id")
-    username = get_username_by_session_id(sso_session_id) if sso_session_id else None
+    # 1. 找到该类型的所有对象
+    objects = objgraph.by_type(type_name)
+    if not objects:
+        return {"error": f"No objects of type '{type_name}' found."}
+    if index >= len(objects):
+        return {"error": f"Index out of range. There are only {len(objects)} objects of type {type_name}."}
+    
+    # 2. 生成引用图
+    obj_to_analyze = objects[index]
+    timestamp = int(time.time())
+    filename = f"{type_name}_index{index}_{timestamp}_backrefs.png"
+    filepath = os.path.join(output_dir, filename)
 
-    if not username:
-        # 未登录，重定向到 /login
-        # 在真实场景，应记录当前请求参数，登录完成后再自动跳回这里。
-        return RedirectResponse(url="/login")
+    objgraph.show_backrefs(
+        [obj_to_analyze],
+        max_depth=max_depth,
+        filename=filepath
+    )
 
-    # 用户已登录，生成code并重定向回客户端
-    code = create_authorization_code(username, client_id)
+    # 3. 返回结果
+    return {
+        "type": type_name,
+        "index": index,
+        "max_depth": max_depth,
+        "image_file": filepath,
+        "message": "Generated backrefs image successfully."
+    }
 
-    # 携带code和state跳转
-    redirect_url = f"{redirect_uri}?code={code}"
-    if state:
-        redirect_url += f"&state={state}"
-
-    return RedirectResponse(url=redirect_url)
-
-
-@app.post("/token")
-def token(
-    grant_type: str = Form(...),
-    code: str = Form(None),
-    redirect_uri: str = Form(None),
-    client_id: str = Form(...),
-    client_secret: str = Form(...),
+@app.get("/objgraph/refs")
+def show_refs(
+    type_name: str,
+    index: int = 0,
+    max_depth: int = 5,
+    output_dir: str = "objgraph_outputs"
 ):
     """
-    令牌端点：
-    1. 验证客户端id/secret
-    2. 校验code的有效性
-    3. 生成access_token并返回
+    生成某种类型对象的“向下”引用关系图 (show_refs) 并存储为PNG文件。
+    与 backrefs 相反，用于查看该对象引用了哪些其他对象。
     """
-    if grant_type != "authorization_code":
-        raise HTTPException(status_code=400, detail="Unsupported grant_type")
+    gc.collect()
+    os.makedirs(output_dir, exist_ok=True)
 
-    if not verify_client(client_id, client_secret):
-        raise HTTPException(status_code=401, detail="Invalid client credentials")
+    objects = objgraph.by_type(type_name)
+    if not objects:
+        return {"error": f"No objects of type '{type_name}' found."}
+    if index >= len(objects):
+        return {"error": f"Index out of range. There are only {len(objects)} objects of type {type_name}."}
+    
+    obj_to_analyze = objects[index]
+    timestamp = int(time.time())
+    filename = f"{type_name}_index{index}_{timestamp}_refs.png"
+    filepath = os.path.join(output_dir, filename)
 
-    # 检查code
-    code_info = AUTH_CODE_STORE.get(code)
-    if not code_info:
-        raise HTTPException(status_code=400, detail="Invalid or expired code")
-
-    # 校验client_id匹配
-    if code_info["client_id"] != client_id:
-        raise HTTPException(status_code=400, detail="client_id mismatch in code")
-
-    # 此处可检查redirect_uri是否一致(更严格的安全要求)
-    registered_redirect_uri = FAKE_CLIENTS_DB[client_id]["redirect_uri"]
-    if redirect_uri != registered_redirect_uri:
-        raise HTTPException(status_code=400, detail="redirect_uri mismatch")
-
-    # 生成access_token
-    username = code_info["username"]
-    access_token = create_access_token(username, client_id)
-
-    # 用完即废code
-    del AUTH_CODE_STORE[code]
+    objgraph.show_refs(
+        [obj_to_analyze],
+        max_depth=max_depth,
+        filename=filepath
+    )
 
     return {
-        "access_token": access_token,
-        "token_type": "bearer",
-        "expires_in": 3600,
-        "scope": "basic",
+        "type": type_name,
+        "index": index,
+        "max_depth": max_depth,
+        "image_file": filepath,
+        "message": "Generated refs image successfully."
     }
 
-@app.get("/userinfo")
-def userinfo(token: str):
-    """
-    (可选) 用户信息端点：
-    客户端可带着 access_token 来请求用户信息
-    """
-    username = get_user_by_access_token(token)
-    if not username:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-    # 返回一些基础信息
-    return {
-        "sub": username,
-        "preferred_username": username,
-        "email": f"{username}@example.com"
-    }
-
-# =========================
-# 4. 运行
-# =========================
-
-if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8001, reload=True)
