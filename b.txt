@@ -1,190 +1,106 @@
-import objgraph
-import gc
-import time
-import os
-from typing import Optional
-from fastapi import FastAPI, Query
-from pydantic import BaseModel
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8" />
+    <!-- Load MathJax (example: version 3) for LaTeX rendering -->
+    <script src="https://polyfill.io/v3/polyfill.min.js?features=es6" ></script>
+    <script id="MathJax-script" async
+            src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js">
+    </script>
+    <title>Evaluation Dimensions</title>
+</head>
+<body>
 
-app = FastAPI()
+<h1>Evaluation Dimensions</h1>
 
-# 用于存储多次快照的结果（类型统计信息）
-# 例如 {"before_test": {...}, "after_test": {...}}
-snapshots = {}
+<!-- 1. FLUENCY -->
+<h2>1. Fluency</h2>
+<p>
+Fluency measures whether the generated text is grammatically correct, naturally phrased, and follows the typical conventions of the target language.
+</p>
 
-# ========== 数据模型 ==========
-class SnapshotResult(BaseModel):
-    snapshot_name: str
-    types_count: dict
+<!-- Example: Perplexity (PPL) formula -->
+<p>
+Using a language model, we often compute Perplexity (PPL) to approximate fluency. A lower perplexity implies higher fluency:
+</p>
+<p>
+$$
+\text{PPL}(T) = \exp\Biggl(-\frac{1}{N} \sum_{i=1}^{N} \log_2 \, p(w_i \mid w_{1}, \ldots, w_{i-1})\Biggr)
+$$
+</p>
+<p>
+where \( T \) is the text of length \( N \). \( w_i \) is the \( i \)-th token, and \( p(w_i \mid w_{1}, \ldots, w_{i-1}) \) is the probability of that token given the preceding context.
+</p>
 
-# ========== 工具函数 ==========
+<hr />
 
-def take_snapshot(name: str) -> dict:
-    """
-    拍摄当前 Python 进程的对象类型统计快照。
-    并保存在 snapshots 全局字典中。
-    返回拍照的结果（类型统计信息）。
-    """
-    gc.collect()  # 手动GC，尽量减少干扰
-    stats = objgraph.typestats()
-    snapshots[name] = stats
-    return stats
+<!-- 2. CONSISTENCY -->
+<h2>2. Consistency</h2>
+<p>
+Consistency (also referred to as "accuracy") assesses whether the generated text aligns with the known facts, context, or source information. Inconsistency can manifest as factual errors or contradictions.
+</p>
 
-def diff_snapshots(snapshot_a: dict, snapshot_b: dict) -> dict:
-    """
-    对比两次快照的对象数量差异，返回一个 {类型: 增加数量} 的字典。
-    """
-    all_types = set(snapshot_a.keys()) | set(snapshot_b.keys())
-    diff_result = {}
-    for t in all_types:
-        diff_count = snapshot_b.get(t, 0) - snapshot_a.get(t, 0)
-        if diff_count != 0:
-            diff_result[t] = diff_count
-    return diff_result
+<!-- Example formula: Contradiction-based Consistency -->
+<p>
+One approach is to count contradictions against a reference set of facts or a knowledge base. A simple metric could be:
+</p>
+<p>
+$$
+\text{Consistency}(T, C)
+= 1 \;-\; \frac{\text{ContradictionCount}(T, C)}{\text{AllFactCount}(T)}
+$$
+</p>
+<p>
+where \( T \) is the generated text, \( C \) is the set of known facts/context,
+<em>ContradictionCount</em> is the number of factual conflicts, and
+<em>AllFactCount</em> is the number of verifiable facts mentioned in \( T \). The closer this value is to 1, the better the consistency.
+</p>
 
-# ========== FastAPI 路由 ==========
+<hr />
 
-@app.post("/snapshot", response_model=SnapshotResult)
-def create_snapshot(name: str = Query(..., description="为该快照指定一个名称")):
-    """
-    拍摄一次快照，并保存到全局 snapshots 中。
-    返回本次快照中的对象类型统计。
-    """
-    stats = take_snapshot(name)
-    return SnapshotResult(snapshot_name=name, types_count=stats)
+<!-- 3. COHERENCE -->
+<h2>3. Coherence</h2>
+<p>
+Coherence evaluates how well the text is structured logically and how smoothly ideas flow from one sentence to the next.
+</p>
 
-@app.get("/snapshot/{name}", response_model=SnapshotResult)
-def get_snapshot(name: str):
-    """
-    获取已保存的某次快照（如 "before_test"）的对象统计信息。
-    """
-    if name not in snapshots:
-        return SnapshotResult(snapshot_name=name, types_count={})
-    return SnapshotResult(snapshot_name=name, types_count=snapshots[name])
+<!-- Example formula: Average pairwise sentence similarity -->
+<p>
+A simple automatic measure uses sentence embeddings and calculates the average similarity between consecutive sentences:
+</p>
+<p>
+$$
+\text{Coherence}(T) =
+\frac{1}{m-1} \sum_{i=1}^{m-1}
+\text{Sim}\bigl(\mathbf{v}(S_i), \mathbf{v}(S_{i+1})\bigr)
+$$
+</p>
+<p>
+where \( S_1, S_2, \ldots, S_m \) are the sentences in \( T \),
+\( \mathbf{v}(S_i) \) is the embedding of the \( i \)-th sentence (e.g., using BERT or similar),
+and \( \text{Sim} \) is a similarity function such as cosine similarity. A higher value indicates more coherent text.
+</p>
 
-@app.get("/snapshot/diff")
-def compare_snapshots(name1: str, name2: str):
-    """
-    对比两次命名快照的对象分布差异。
-    """
-    if name1 not in snapshots or name2 not in snapshots:
-        return {"error": f"One of snapshot '{name1}' or '{name2}' not found."}
-    diff_result = diff_snapshots(snapshots[name1], snapshots[name2])
-    return {
-        "snapshot1": name1,
-        "snapshot2": name2,
-        "diff_result": diff_result
-    }
+<hr />
 
-@app.get("/objgraph/common_types")
-def show_most_common_types(limit: int = 10):
-    """
-    直接查看当前进程中数量最多的前N种对象类型。
-    """
-    gc.collect()
-    objgraph.show_most_common_types(limit=limit)
-    # objgraph.show_most_common_types() 会把结果打印到控制台；
-    # 如果想直接返回给接口，可以手动封装:
-    stats = objgraph.typestats()
-    sorted_stats = sorted(stats.items(), key=lambda x: x[1], reverse=True)
-    return {
-        "top_types": sorted_stats[:limit]
-    }
+<!-- 4. RELEVANCE -->
+<h2>4. Relevance</h2>
+<p>
+Relevance indicates how well the generated text addresses a given query, topic, or reference text.
+</p>
 
-@app.get("/objgraph/growth")
-def show_growth(limit: int = 10):
-    """
-    objgraph.growth() 会比较当前对象分布与上一次调用之间的差异。
-    """
-    gc.collect()
-    # 为了能够在HTTP接口查看结果，需要先捕获print输出或者手动处理
-    # 这里示例性的调用一次
-    growth_list = objgraph.growth(limit=limit)
-    # growth_list 是一个列表，如: [('dict', 10), ('list', 5), ...]
-    return {"growth": growth_list}
+<!-- Example formula: Similarity-based Relevance -->
+<p>
+When you have a reference text \( R \) (or a query), you can measure relevance by comparing vector embeddings:
+</p>
+<p>
+$$
+\text{Relevance}(T, R) = \text{Sim}\bigl(\mathbf{v}(T), \mathbf{v}(R)\bigr)
+$$
+</p>
+<p>
+where \( \text{Sim}(\cdot,\cdot) \) could be the cosine similarity. Higher values imply better alignment with the topic or query.
+</p>
 
-@app.get("/objgraph/backrefs")
-def show_backrefs(
-    type_name: str,
-    index: int = 0,
-    max_depth: int = 5,
-    output_dir: str = "objgraph_outputs"
-):
-    """
-    生成某种类型对象的引用关系图 (show_backrefs) 并存储为PNG文件。
-    - type_name: 对象的类型名称，例如 'MyLeakyClass', 'dict' 等
-    - index: 如果该类型对象很多，选取第 index 个对象来可视化
-    - max_depth: 向上追踪的引用深度
-    - output_dir: 存放输出文件的文件夹
-    返回生成的文件名，以便外部访问。
-    """
-    gc.collect()
-    os.makedirs(output_dir, exist_ok=True)
-
-    # 1. 找到该类型的所有对象
-    objects = objgraph.by_type(type_name)
-    if not objects:
-        return {"error": f"No objects of type '{type_name}' found."}
-    if index >= len(objects):
-        return {"error": f"Index out of range. There are only {len(objects)} objects of type {type_name}."}
-    
-    # 2. 生成引用图
-    obj_to_analyze = objects[index]
-    timestamp = int(time.time())
-    filename = f"{type_name}_index{index}_{timestamp}_backrefs.png"
-    filepath = os.path.join(output_dir, filename)
-
-    objgraph.show_backrefs(
-        [obj_to_analyze],
-        max_depth=max_depth,
-        filename=filepath
-    )
-
-    # 3. 返回结果
-    return {
-        "type": type_name,
-        "index": index,
-        "max_depth": max_depth,
-        "image_file": filepath,
-        "message": "Generated backrefs image successfully."
-    }
-
-@app.get("/objgraph/refs")
-def show_refs(
-    type_name: str,
-    index: int = 0,
-    max_depth: int = 5,
-    output_dir: str = "objgraph_outputs"
-):
-    """
-    生成某种类型对象的“向下”引用关系图 (show_refs) 并存储为PNG文件。
-    与 backrefs 相反，用于查看该对象引用了哪些其他对象。
-    """
-    gc.collect()
-    os.makedirs(output_dir, exist_ok=True)
-
-    objects = objgraph.by_type(type_name)
-    if not objects:
-        return {"error": f"No objects of type '{type_name}' found."}
-    if index >= len(objects):
-        return {"error": f"Index out of range. There are only {len(objects)} objects of type {type_name}."}
-    
-    obj_to_analyze = objects[index]
-    timestamp = int(time.time())
-    filename = f"{type_name}_index{index}_{timestamp}_refs.png"
-    filepath = os.path.join(output_dir, filename)
-
-    objgraph.show_refs(
-        [obj_to_analyze],
-        max_depth=max_depth,
-        filename=filepath
-    )
-
-    return {
-        "type": type_name,
-        "index": index,
-        "max_depth": max_depth,
-        "image_file": filepath,
-        "message": "Generated refs image successfully."
-    }
-
+</body>
+</html>
