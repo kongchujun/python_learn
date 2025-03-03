@@ -1,106 +1,41 @@
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8" />
-    <!-- Load MathJax (example: version 3) for LaTeX rendering -->
-    <script src="https://polyfill.io/v3/polyfill.min.js?features=es6" ></script>
-    <script id="MathJax-script" async
-            src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js">
-    </script>
-    <title>Evaluation Dimensions</title>
-</head>
-<body>
+下面详细介绍一下每个容器以及 S3 接口的作用，并通过具体示例说明它们在 langfuse 系统中的角色：
 
-<h1>Evaluation Dimensions</h1>
-
-<!-- 1. FLUENCY -->
-<h2>1. Fluency</h2>
-<p>
-Fluency measures whether the generated text is grammatically correct, naturally phrased, and follows the typical conventions of the target language.
-</p>
-
-<!-- Example: Perplexity (PPL) formula -->
-<p>
-Using a language model, we often compute Perplexity (PPL) to approximate fluency. A lower perplexity implies higher fluency:
-</p>
-<p>
-$$
-\text{PPL}(T) = \exp\Biggl(-\frac{1}{N} \sum_{i=1}^{N} \log_2 \, p(w_i \mid w_{1}, \ldots, w_{i-1})\Biggr)
-$$
-</p>
-<p>
-where \( T \) is the text of length \( N \). \( w_i \) is the \( i \)-th token, and \( p(w_i \mid w_{1}, \ldots, w_{i-1}) \) is the probability of that token given the preceding context.
-</p>
-
-<hr />
-
-<!-- 2. CONSISTENCY -->
-<h2>2. Consistency</h2>
-<p>
-Consistency (also referred to as "accuracy") assesses whether the generated text aligns with the known facts, context, or source information. Inconsistency can manifest as factual errors or contradictions.
-</p>
-
-<!-- Example formula: Contradiction-based Consistency -->
-<p>
-One approach is to count contradictions against a reference set of facts or a knowledge base. A simple metric could be:
-</p>
-<p>
-$$
-\text{Consistency}(T, C)
-= 1 \;-\; \frac{\text{ContradictionCount}(T, C)}{\text{AllFactCount}(T)}
-$$
-</p>
-<p>
-where \( T \) is the generated text, \( C \) is the set of known facts/context,
-<em>ContradictionCount</em> is the number of factual conflicts, and
-<em>AllFactCount</em> is the number of verifiable facts mentioned in \( T \). The closer this value is to 1, the better the consistency.
-</p>
-
-<hr />
-
-<!-- 3. COHERENCE -->
-<h2>3. Coherence</h2>
-<p>
-Coherence evaluates how well the text is structured logically and how smoothly ideas flow from one sentence to the next.
-</p>
-
-<!-- Example formula: Average pairwise sentence similarity -->
-<p>
-A simple automatic measure uses sentence embeddings and calculates the average similarity between consecutive sentences:
-</p>
-<p>
-$$
-\text{Coherence}(T) =
-\frac{1}{m-1} \sum_{i=1}^{m-1}
-\text{Sim}\bigl(\mathbf{v}(S_i), \mathbf{v}(S_{i+1})\bigr)
-$$
-</p>
-<p>
-where \( S_1, S_2, \ldots, S_m \) are the sentences in \( T \),
-\( \mathbf{v}(S_i) \) is the embedding of the \( i \)-th sentence (e.g., using BERT or similar),
-and \( \text{Sim} \) is a similarity function such as cosine similarity. A higher value indicates more coherent text.
-</p>
-
-<hr />
-
-<!-- 4. RELEVANCE -->
-<h2>4. Relevance</h2>
-<p>
-Relevance indicates how well the generated text addresses a given query, topic, or reference text.
-</p>
-
-<!-- Example formula: Similarity-based Relevance -->
-<p>
-When you have a reference text \( R \) (or a query), you can measure relevance by comparing vector embeddings:
-</p>
-<p>
-$$
-\text{Relevance}(T, R) = \text{Sim}\bigl(\mathbf{v}(T), \mathbf{v}(R)\bigr)
-$$
-</p>
-<p>
-where \( \text{Sim}(\cdot,\cdot) \) could be the cosine similarity. Higher values imply better alignment with the topic or query.
-</p>
-
-</body>
-</html>
+1. Langfuse 容器
+作用：
+这是主应用容器，负责处理用户请求、接口交互以及整体业务逻辑的执行。所有对外的 API 调用、前端请求都会由这个容器处理。
+举例：
+当你在 Web 页面上查询某个日志事件时，实际上请求是发送到 langfuse 容器，由它调用后端服务返回结果。
+2. Langfuse-worker 容器
+作用：
+这个容器主要负责异步任务处理。比如，处理耗时的任务、队列消息或者数据处理任务，而不是在主请求中同步完成，保证系统响应速度。
+举例：
+当用户上传大量日志数据时，langfuse-worker 会在后台异步地解析、格式化这些数据，并将其分发到其他数据库存储，确保主服务不被阻塞。
+3. Redis 容器
+作用：
+Redis 是一个内存数据库，常用于缓存、会话存储和快速数据读写。它在系统中可以减轻主数据库的压力，提高响应速度。
+举例：
+当用户频繁访问某些配置或者会话信息时，Redis 会缓存这些数据，减少数据库的访问次数，使得系统响应更快。
+4. Clickhouse 容器
+作用：
+Clickhouse 是一个高性能的列式数据库，专门用于实时数据分析和大数据量查询。它适合存储和查询大量日志、事件数据。
+举例：
+在 langfuse 中，大量的事件数据（例如 API 请求日志）会被写入 Clickhouse，方便后续进行统计、聚合分析，如查询某个时间段内错误日志的数量。
+5. Postgres 容器
+作用：
+PostgreSQL 是一个关系型数据库，用于存储结构化数据，比如用户信息、配置、权限等。与 Clickhouse 不同，它更适合存储结构化和关系性较强的数据。
+举例：
+当你管理用户账号、团队配置等信息时，这些数据通常会保存在 Postgres 中，保证数据的一致性和事务处理。
+6. Azure S3 接口
+作用：
+Azure S3 接口提供了对象存储功能，与 AWS S3 类似。它主要用于存储大文件、备份、日志文件或其他不适合存储在数据库中的数据。
+举例：
+如果 langfuse 需要保存原始日志文件或者定期备份数据，使用 Azure S3 接口可以将这些文件上传到云端存储，既安全又方便日后的数据恢复和扩展。
+总结
+整体架构：
+Langfuse 容器 处理前端请求和业务逻辑；
+Langfuse-worker 负责异步处理任务；
+Redis 加速缓存和会话管理；
+Clickhouse 存储大量日志和事件数据，便于高效分析；
+Postgres 维护用户和系统的结构化信息；
+Azure S3 接口 用于文件和备份的云存储。
+这种架构保证了系统既能高效响应用户请求，又能在后台处理大数据量的日志和分析任务，同时通过云存储确保数据的安全和扩展性。
