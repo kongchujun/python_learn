@@ -1,118 +1,21 @@
-from fastapi import FastAPI, Depends, HTTPException, Request, Response
-from fastapi.responses import RedirectResponse, HTMLResponse
-from fastapi.templating import Jinja2Templates
-import requests
-import os
+#!/bin/bash
+WORK_DIR="/home/jupyterhub/work"
+OUTPUT_DIR="$WORK_DIR/code_repo"
 
-app = FastAPI()
+# 创建存放代码的目录
+mkdir -p "$OUTPUT_DIR"
 
-# 配置
-SSO_SERVER = "http://127.0.0.1:8001"  # SSO授权服务器的地址
-CLIENT_ID = "client_123"
-CLIENT_SECRET = "secret_abc"
-REDIRECT_URI = "http://127.0.0.1:9000/callback"  # 客户端的回调地址
-TEMPLATES = Jinja2Templates(directory="templates")
+# 提取所有 notebook 的代码
+find "$WORK_DIR" -type f -name "*.ipynb" | while read -r nb_file; do
+    base_name=$(basename "$nb_file" .ipynb)
+    rel_path=$(dirname "$nb_file" | sed "s|$WORK_DIR/||")
+    target_dir="$OUTPUT_DIR/$rel_path"
+    mkdir -p "$target_dir"
+    jupyter nbconvert --to script "$nb_file" --output "$target_dir/$base_name"
+done
 
-# 存储access_token（通常在生产环境中使用session或数据库）
-ACCESS_TOKEN = None
-
-
-@app.get("/", response_class=HTMLResponse)
-async def home(request: Request):
-    """首页显示，判断是否已经登录"""
-    if ACCESS_TOKEN:
-        return RedirectResponse(url="/profile")
-    return TEMPLATES.TemplateResponse("index.html", {"request": request})
-
-
-@app.get("/login")
-async def login():
-    """重定向到SSO授权服务器的授权端点"""
-    state = os.urandom(16).hex()  # 生成一个随机的state参数
-    authorization_url = f"{SSO_SERVER}/authorize?client_id={CLIENT_ID}&redirect_uri={REDIRECT_URI}&response_type=code&state={state}"
-    return RedirectResponse(url=authorization_url)
-
-
-@app.get("/callback")
-async def callback(code: str, state: str):
-    """处理SSO服务器返回的授权码，并获取access_token"""
-    # 使用授权码请求令牌
-    token_url = f"{SSO_SERVER}/token"
-    response = requests.post(
-        token_url,
-        data={
-            "grant_type": "authorization_code",
-            "code": code,
-            "redirect_uri": REDIRECT_URI,
-            "client_id": CLIENT_ID,
-            "client_secret": CLIENT_SECRET,
-        },
-    )
-    if response.status_code == 200:
-        global ACCESS_TOKEN
-        data = response.json()
-        ACCESS_TOKEN = data["access_token"]
-        return RedirectResponse(url="/profile")
-    else:
-        raise HTTPException(status_code=400, detail="Failed to get access token")
-
-
-@app.get("/profile")
-async def profile(request: Request):
-    """使用access_token获取用户信息"""
-    if not ACCESS_TOKEN:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    # 获取用户信息
-    user_info_url = f"{SSO_SERVER}/userinfo?token={ACCESS_TOKEN}"
-    response = requests.get(user_info_url)
-
-    if response.status_code == 200:
-        user_info = response.json()
-        return TEMPLATES.TemplateResponse("profile.html", {"request": request, "user_info": user_info})
-    else:
-        raise HTTPException(status_code=400, detail="Failed to fetch user information")
-
-
-if __name__ == "__main__":
-    import uvicorn
-
-    uvicorn.run(app, host="0.0.0.0", port=9000)
-
-
--------------
-templates/index.html
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>OAuth2 Client</title>
-</head>
-<body>
-    <h1>Welcome to the OAuth2 Client</h1>
-    {% if ACCESS_TOKEN %}
-        <p>You are logged in!</p>
-        <a href="/profile">Go to Profile</a>
-    {% else %}
-        <p><a href="/login">Login with SSO</a></p>
-    {% endif %}
-</body>
-</html>
------------
-templates/profile.html
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>User Profile</title>
-</head>
-<body>
-    <h1>User Profile</h1>
-    <p><strong>Username:</strong> {{ user_info.sub }}</p>
-    <p><strong>Email:</strong> {{ user_info.email }}</p>
-    <a href="/">Go to Home</a>
-</body>
-</html>
-
+# 提交到 Git
+cd "$OUTPUT_DIR"
+git add .
+git commit -m "自动提交所有 notebook 代码 - $(date)"
+git push origin master
