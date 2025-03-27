@@ -1,47 +1,22 @@
 #!/bin/bash
-
-# 定义目标文件
+# 定义文件路径、匹配的模式和要插入的内容
 FILE="/lib/systemd/system/docker.service"
-# 要查找的行
-SEARCH="ExecStart=/usr/bin/dockerd"
-# 要插入的行
-INSERT="ExecStartPost=/bin/chmod 777 /home/gb-fxo-sympricot/docker.sock"
+PATTERN="ExecStart=/usr/bin/dockerd"
+NEWLINE="ExecStartPpost=/bin/chmod 777 /home/gb-fxo-sympricot/docker.sock"
 
 # 检查文件是否存在
 if [ ! -f "$FILE" ]; then
-    echo "错误：文件 $FILE 不存在"
+    echo "文件 $FILE 不存在！"
     exit 1
 fi
 
-# 检查是否需要root权限
-if [ "$(id -u)" != "0" ]; then
-    echo "错误：需要root权限执行此脚本，请使用sudo运行"
-    exit 1
-fi
-
-# 检查SEARCH行是否存在
-if ! grep -q "$SEARCH" "$FILE"; then
-    echo "错误：文件中未找到 $SEARCH"
-    exit 1
-fi
-
-# 检查INSERT行是否已经存在
-if grep -q "$INSERT" "$FILE"; then
-    echo "目标行 $INSERT 已存在，无需修改"
+# 检查新行是否已存在
+if grep -qF "$NEWLINE" "$FILE"; then
+    echo "新行已存在，无需更改。"
     exit 0
 fi
 
-# 创建临时文件
-TEMP_FILE=$(mktemp)
+# 使用 sed 在匹配行之后插入新行
+sed -i "/${PATTERN}/a ${NEWLINE}" "$FILE"
 
-# 使用sed在指定行后插入新行
-sed "/$SEARCH/a $INSERT" "$FILE" > "$TEMP_FILE"
-
-# 替换原文件
-mv "$TEMP_FILE" "$FILE"
-
-# 重新加载systemd配置
-systemctl daemon-reload
-
-echo "修改完成，已在 $SEARCH 后添加 $INSERT"
-echo "请检查文件 $FILE 确认修改是否正确"
+echo "已在匹配行下方插入新行。"
