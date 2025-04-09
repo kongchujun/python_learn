@@ -1,143 +1,106 @@
-package main
+import asyncio
+import os
+from dataclasses import dataclass
+from typing import List, Optional
 
-import (
-    "encoding/json"
-    "fmt"
-    "io"
-    "log"
-    "net"
-    "net/http"
-    "sync"
-    "time"
-)
+# Third-party imports
+import gradio as gr
+from dotenv import load_dotenv
+from langchain_openai import ChatOpenAI
+from rich.console import Console
+from rich.panel import Panel
+from rich.text import Text
 
-// Backend 存储当前数据库的目标地址
-type Backend struct {
-    Host     string
-    Port     string
-    Username string // 可选：存储用户名
-    Password string // 可选：存储密码
-}
+# Local module imports
+from browser_use import Agent
 
-// SecretRequest API 请求体结构
-type SecretRequest struct {
-    Host     string `json:"host"`
-    Username string `json:"username"`
-    Password string `json:"password"`
-    Port     string `json:"port"`
-}
+load_dotenv()
 
-var (
-    backend     Backend
-    backendLock sync.RWMutex
-    listenPort  = "5466"     // 代理监听的端口
-    apiPort     = "8080"     // API 监听的端口
-)
 
-func main() {
-    // 初始化默认 backend
-    backend = Backend{
-        Host: "12.23.34.21",
-        Port: "19211",
-    }
+@dataclass
+class ActionResult:
+	is_done: bool
+	extracted_content: Optional[str]
+	error: Optional[str]
+	include_in_memory: bool
 
-    // 启动 API 服务
-    go startAPIServer()
 
-    // 启动 TCP 代理
-    listener, err := net.Listen("tcp", ":"+listenPort)
-    if err != nil {
-        log.Fatalf("Failed to listen on port %s: %v", listenPort, err)
-    }
-    defer listener.Close()
+@dataclass
+class AgentHistoryList:
+	all_results: List[ActionResult]
+	all_model_outputs: List[dict]
 
-    log.Printf("Dynamic proxy listening on :%s", listenPort)
 
-    for {
-        conn, err := listener.Accept()
-        if err != nil {
-            log.Printf("Failed to accept connection: %v", err)
-            continue
-        }
-        go handleConnection(conn)
-    }
-}
+def parse_agent_history(history_str: str) -> None:
+	console = Console()
 
-// startAPIServer 启动 HTTP API 服务
-func startAPIServer() {
-    http.HandleFunc("/get_secret", handleGetSecret)
-    log.Printf("API server listening on :%s", apiPort)
-    if err := http.ListenAndServe(":"+apiPort, nil); err != nil {
-        log.Fatalf("Failed to start API server: %v", err)
-    }
-}
+	# Split the content into sections based on ActionResult entries
+	sections = history_str.split('ActionResult(')
 
-// handleGetSecret 处理 /get_secret API 请求
-func handleGetSecret(w http.ResponseWriter, r *http.Request) {
-    if r.Method != http.MethodPost {
-        http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-        return
-    }
+	for i, section in enumerate(sections[1:], 1):  # Skip first empty section
+		# Extract relevant information
+		content = ''
+		if 'extracted_content=' in section:
+			content = section.split('extracted_content=')[1].split(',')[0].strip("'")
 
-    var req SecretRequest
-    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-        http.Error(w, "Invalid request body", http.StatusBadRequest)
-        return
-    }
+		if content:
+			header = Text(f'Step {i}', style='bold blue')
+			panel = Panel(content, title=header, border_style='blue')
+			console.print(panel)
+			console.print()
 
-    // 验证请求参数
-    if req.Host == "" || req.Port == "" {
-        http.Error(w, "Host and port are required", http.StatusBadRequest)
-        return
-    }
 
-    // 更新 backend
-    backendLock.Lock()
-    backend.Host = req.Host
-    backend.Port = req.Port
-    backend.Username = req.Username // 可选
-    backend.Password = req.Password // 可选
-    log.Printf("Backend updated: %s:%s", backend.Host, backend.Port)
-    backendLock.Unlock()
+async def run_browser_task(
+	task: str,
+	api_key: str,
+	model: str = 'gpt-4o',
+	headless: bool = True,
+) -> str:
+	if not api_key.strip():
+		return 'Please provide an API key'
 
-    // 返回成功响应
-    w.WriteHeader(http.StatusOK)
-    fmt.Fprintf(w, "Backend updated to %s:%s", req.Host, req.Port)
-}
+	os.environ['OPENAI_API_KEY'] = api_key
 
-// handleConnection 处理客户端连接并转发到 backend
-func handleConnection(clientConn net.Conn) {
-    defer clientConn.Close()
+	try:
+		agent = Agent(
+			task=task,
+			llm=ChatOpenAI(model='gpt-4o'),
+		)
+		result = await agent.run()
+		#  TODO: The result cloud be parsed better
+		return result
+	except Exception as e:
+		return f'Error: {str(e)}'
 
-    // 获取当前 backend
-    backendLock.RLock()
-    targetAddr := fmt.Sprintf("%s:%s", backend.Host, backend.Port)
-    backendLock.RUnlock()
 
-    // 连接到 backend
-    backendConn, err := net.DialTimeout("tcp", targetAddr, 5*time.Second)
-    if err != nil {
-        log.Printf("Failed to connect to backend %s: %v", targetAddr, err)
-        return
-    }
-    defer backendConn.Close()
+def create_ui():
+	with gr.Blocks(title='Browser Use GUI') as interface:
+		gr.Markdown('# Browser Use Task Automation')
 
-    // 双向数据转发
-    errChan := make(chan error, 2)
-    go func() {
-        _, err := io.Copy(backendConn, clientConn)
-        errChan <- err
-    }()
-    go func() {
-        _, err := io.Copy(clientConn, backendConn)
-        errChan <- err
-    }()
+		with gr.Row():
+			with gr.Column():
+				api_key = gr.Textbox(label='OpenAI API Key', placeholder='sk-...', type='password')
+				task = gr.Textbox(
+					label='Task Description',
+					placeholder='E.g., Find flights from New York to London for next week',
+					lines=3,
+				)
+				model = gr.Dropdown(choices=['gpt-4', 'gpt-3.5-turbo'], label='Model', value='gpt-4')
+				headless = gr.Checkbox(label='Run Headless', value=True)
+				submit_btn = gr.Button('Run Task')
 
-    // 等待任一方向出错或完成
-    select {
-    case err := <-errChan:
-        if err != nil {
-            log.Printf("Connection error: %v", err)
-        }
-    }
-}
+			with gr.Column():
+				output = gr.Textbox(label='Output', lines=10, interactive=False)
+
+		submit_btn.click(
+			fn=lambda *args: asyncio.run(run_browser_task(*args)),
+			inputs=[task, api_key, model, headless],
+			outputs=output,
+		)
+
+	return interface
+
+
+if __name__ == '__main__':
+	demo = create_ui()
+	demo.launch()
