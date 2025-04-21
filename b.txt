@@ -1,127 +1,52 @@
-步骤 1: 提取 Notebook 中的代码
-Jupyter 提供了一些工具可以将 .ipynb 文件转换为 Python 脚本。最常用的是 nbconvert 工具。以下是如何操作：
-安装 nbconvert
-如果你的环境中还没有安装 nbconvert，可以用以下命令安装：
-bash
+#!/usr/bin/env pwsh
+# Copyright 2018-2022 the Deno authors. All rights reserved. MIT license.
+# TODO(everyone): Keep this script simple and easily auditable.
 
-pip install nbconvert
+$ErrorActionPreference = 'Stop'
 
-提取单个 Notebook 的代码
-假设你有一个 notebook 文件 example.ipynb，可以用以下命令将其转换为 .py 文件：
-bash
+if ($v) {
+  $Version = "v${v}"
+}
+if ($Args.Length -eq 1) {
+  $Version = $Args.Get(0)
+}
 
-jupyter nbconvert --to script example.ipynb
+$DenoInstall = $env:DENO_INSTALL
+$BinDir = if ($DenoInstall) {
+  "${DenoInstall}\bin"
+} else {
+  "${Home}\.deno\bin"
+}
 
-这会生成一个 example.py 文件，只包含 notebook 中的代码（去除了 Markdown 和输出）。
-批量提取所有 Notebook 的代码
-假设你的工作目录是 /home/jupyterhub/work，用户的 notebook 分布在各个子目录中，可以用一个脚本批量处理：
-bash
+$DenoZip = "$BinDir\deno.zip"
+$DenoExe = "$BinDir\deno.exe"
+$Target = 'x86_64-pc-windows-msvc'
 
-#!/bin/bash
-WORK_DIR="/home/jupyterhub/work"
-OUTPUT_DIR="$WORK_DIR/code_repo"
+$Version = if (!$Version) {
+  curl.exe --ssl-revoke-best-effort -s "https://dl.deno.land/release-latest.txt"  
+} else {
+  $Version
+}
 
-# 创建存放代码的目录
-mkdir -p "$OUTPUT_DIR"
+$DownloadUrl = "https://dl.deno.land/release/${Version}/deno-${Target}.zip"
 
-# 查找所有 .ipynb 文件并转换为 .py 文件
-find "$WORK_DIR" -name "*.ipynb" | while read -r nb_file; do
-    # 获取文件名（不含路径和扩展名）
-    base_name=$(basename "$nb_file" .ipynb)
-    # 获取相对路径（保留用户目录结构）
-    rel_path=$(dirname "$nb_file" | sed "s|$WORK_DIR/||")
-    # 目标目录
-    target_dir="$OUTPUT_DIR/$rel_path"
-    mkdir -p "$target_dir"
-    # 转换为 .py 文件
-    jupyter nbconvert --to script "$nb_file" --output "$target_dir/$base_name"
-done
+if (!(Test-Path $BinDir)) {
+  New-Item $BinDir -ItemType Directory | Out-Null
+}
 
-这个脚本会：
-在 code_repo 目录下保留用户的目录结构。
+curl.exe --ssl-revoke-best-effort -Lo $DenoZip $DownloadUrl
 
-将所有 .ipynb 文件转换为 .py 文件，存放在对应的子目录中。
+tar.exe xf $DenoZip -C $BinDir
 
-运行脚本后，检查 code_repo 目录，确保生成的 .py 文件符合预期。
-步骤 2: 初始化 Git 仓库并提交代码
-进入 code_repo 目录并初始化 Git 仓库：
-bash
+Remove-Item $DenoZip
 
-cd /home/jupyterhub/work/code_repo
-git init
+$User = [System.EnvironmentVariableTarget]::User
+$Path = [System.Environment]::GetEnvironmentVariable('Path', $User)
+if (!(";${Path};".ToLower() -like "*;${BinDir};*".ToLower())) {
+  [System.Environment]::SetEnvironmentVariable('Path', "${Path};${BinDir}", $User)
+  $Env:Path += ";${BinDir}"
+}
 
-添加所有 .py 文件并提交：
-bash
-
-git add *.py */*.py
-git commit -m "提交所有 notebook 中的代码"
-
-如果需要推送到远程仓库：
-bash
-
-git remote add origin <远程仓库 URL>
-git push origin master
-
-步骤 3: 配置 .gitignore
-为了避免提交其他无关文件，可以在 code_repo 目录下创建 .gitignore：
-
-# 忽略所有文件
-*
-
-# 只允许 .py 文件和 .gitignore
-!*.py
-!.gitignore
-
-自动化脚本（可选）
-如果用户的 notebook 会不断更新，你可以创建一个脚本定期提取代码并提交：
-bash
-
-#!/bin/bash
-WORK_DIR="/home/jupyterhub/work"
-OUTPUT_DIR="$WORK_DIR/code_repo"
-
-# 创建存放代码的目录
-mkdir -p "$OUTPUT_DIR"
-
-# 提取所有 notebook 的代码
-find "$WORK_DIR" -name "*.ipynb" | while read -r nb_file; do
-    base_name=$(basename "$nb_file" .ipynb)
-    rel_path=$(dirname "$nb_file" | sed "s|$WORK_DIR/||")
-    target_dir="$OUTPUT_DIR/$rel_path"
-    mkdir -p "$target_dir"
-    jupyter nbconvert --to script "$nb_file" --output "$target_dir/$base_name"
-done
-
-# 提交到 Git
-cd "$OUTPUT_DIR"
-git add *.py */*.py
-git commit -m "自动提交 notebook 代码 - $(date)"
-git push origin master
-
-保存为 sync_code.sh，赋予执行权限：
-bash
-
-chmod +x sync_code.sh
-
-然后用 cron 定时运行，例如每天凌晨 2 点：
-bash
-
-crontab -e
-
-添加：
-
-0 2 * * * /path/to/sync_code.sh
-
-注意事项
-代码完整性：nbconvert --to script 只提取代码单元格，Markdown 和输出会被忽略。如果 notebook 中有依赖外部文件的代码（如读取数据文件），.py 文件可能无法独立运行。
-
-命名冲突：如果不同用户目录中有同名 notebook（如 example.ipynb），生成的 .py 文件可能会覆盖彼此。脚本中保留了目录结构（rel_path），可以避免这个问题。
-
-权限：确保运行脚本的用户有权限访问所有 .ipynb 文件。
-
-性能：如果 notebook 数量很多，find 和 nbconvert 的执行可能会较慢，可以考虑并行处理（例如用 xargs）。
-
-验证
-运行脚本后，检查 code_repo 目录，确保所有 .py 文件只包含代码，并且目录结构符合预期。然后用 git status 查看是否只跟踪了 .py 文件。
-如果有其他需求（比如只提取特定用户的代码，或处理命名冲突），告诉我，我可以进一步优化方案！
-
+Write-Output "Deno was installed successfully to ${DenoExe}"
+Write-Output "Run 'deno --help' to get started"
+Write-Output "Stuck? Join our Discord https://discord.gg/deno"
