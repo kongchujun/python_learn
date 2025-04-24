@@ -1,14 +1,10 @@
-version: '3'
-services:
-  app:
-    image: python:3.10  # 或你的自定义镜像
-    volumes:
-      - .:/app  # 挂载项目目录
-    deploy:
-      resources:
-        limits:
-          cpus: '2.0'  # 分配 2 个 CPU
-          memory: 4g   # 分配 4GB 内存
-    ulimits:
-      nproc: 65535  # 最大线程数
-      nofile: 65535 # 文件描述符
+docker run --rm -it \
+  --cpus="2.0" \
+  --memory="4g" \
+  --ulimit nproc=65535 \
+  --ulimit nofile=65535:65535 \
+  -v $(pwd):/app \
+  python:3.10 \
+  sh -c "pip install --no-cache-dir hatchling && \
+         pip install --no-cache-dir /app/packages/markitdown[all] --no-parallel && \
+         your-start-command"
