@@ -27,6 +27,11 @@ type ConnectionConfig struct {
 }
 
 // SetConfig 更新连接参数
+type ConnParams struct {
+    Hostname, Username, Password, Database string
+    Port                                    int
+}
+
 func (cc *ConnectionConfig) SetConfig(hostname string, port int, username, password, databaseName string) {
     cc.mu.Lock()
     defer cc.mu.Unlock()
@@ -38,12 +43,6 @@ func (cc *ConnectionConfig) SetConfig(hostname string, port int, username, passw
     log.Printf("Connection config updated: %s:%d user=%s db=%s", hostname, port, username, databaseName)
 }
 
-// ConnParams 用于传递连接参数
-type ConnParams struct {
-    Hostname, Username, Password, Database string
-    Port                                    int
-}
-
 // GetConfig 返回当前连接配置
 func (cc *ConnectionConfig) GetConfig() ConnParams {
     cc.mu.RLock()
@@ -53,9 +52,9 @@ func (cc *ConnectionConfig) GetConfig() ConnParams {
 
 // Config 定义代理与 API 服务地址及连接池大小
 type Config struct {
-    ProxyListenAddr   string // 代理监听地址，例如 ":5433"
-    APIListenAddr     string // API 监听地址，例如 ":8080"
-    APIPasswordUpdate string // 更新参数 API 路径，例如 "/update-password"
+    ProxyListenAddr   string // 代理监听地址
+    APIListenAddr     string // API 监听地址
+    APIPasswordUpdate string // 更新参数 API 路径
     PoolSize          int    // 连接池大小
 }
 
@@ -66,11 +65,13 @@ type StartupMessage struct {
     Raw             []byte
 }
 
-// ConnPool 封装后端连接池，基于 channel 实现
+// ConnPool 封装后端连接池，基于 channel 实现，支持主动 reset
 type ConnPool struct {
-    cc   *ConnectionConfig
-    pool chan net.Conn
-    size int
+    cc       *ConnectionConfig
+    pool     chan net.Conn
+    size     int
+    draining bool
+    mu       sync.Mutex
 }
 
 // newPool 创建指定大小的连接池
@@ -85,18 +86,36 @@ func (p *ConnPool) Get() (net.Conn, error) {
         return conn, nil
     default:
         params := p.cc.GetConfig()
-        conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", params.Hostname, params.Port))
-        return conn, err
+        return net.Dial("tcp", fmt.Sprintf("%s:%d", params.Hostname, params.Port))
     }
 }
 
-// Put 将连接归还池中，多余则关闭
+// Put 将连接归还池中，如在 draining 状态则关闭，多余则关闭
 func (p *ConnPool) Put(conn net.Conn) {
+    p.mu.Lock()
+    defer p.mu.Unlock()
+    if p.draining {
+        conn.Close()
+        return
+    }
     select {
     case p.pool <- conn:
     default:
         conn.Close()
     }
+}
+
+// Reset 主动关闭并清空池中所有空闲连接，标记 draining
+func (p *ConnPool) Reset() {
+    p.mu.Lock()
+    p.draining = true
+    close(p.pool)
+    for conn := range p.pool {
+        conn.Close()
+    }
+    p.pool = make(chan net.Conn, p.size)
+    p.draining = false
+    p.mu.Unlock()
 }
 
 // 全局变量：双池策略
@@ -108,12 +127,15 @@ var (
     connConfig = &ConnectionConfig{}
 )
 
-// rotatePools 切换到新池，旧池自然耗尽
+// rotatePools 切换到新池，并 reset 旧池，避免连接泄漏
 func rotatePools() {
     poolMu.Lock()
     defer poolMu.Unlock()
     newPool := newPool(connConfig, cfg.PoolSize)
-    oldPool = activePool
+    if activePool != nil {
+        oldPool = activePool
+        oldPool.Reset()
+    }
     activePool = newPool
 }
 
@@ -150,7 +172,7 @@ func startAPIServer() {
             http.Error(w, "All fields required", http.StatusBadRequest)
             return
         }
-        // 更新配置并旋转连接池
+        // 更新配置并 rotate
         connConfig.SetConfig(req.Hostname, req.Port, req.Username, req.Password, req.DatabaseName)
         rotatePools()
         w.WriteHeader(http.StatusOK)
@@ -214,13 +236,10 @@ func proxySSL(clientConn net.Conn, buf *bufio.Reader, head []byte) {
     }
     defer p.Put(serverConn)
 
-    // 转发 SSLRequest
     serverConn.Write(head)
-    // 读取并回写单字节回复
     reply := make([]byte, 1)
     io.ReadFull(serverConn, reply)
     clientConn.Write(reply)
-
     if reply[0] == 'S' {
         tlsCfg := &tls.Config{InsecureSkipVerify: true}
         clientConn = tls.Server(clientConn, tlsCfg)
@@ -245,7 +264,6 @@ func proxyStartupAuth(buf *bufio.Reader, clientConn, serverConn net.Conn) {
     data, _ := serializeStartup(msg)
     serverConn.Write(data)
     handleAuth(serverConn, clientConn, params.Username, params.Password)
-    // 双向转发剩余数据
     go io.Copy(serverConn, buf)
     io.Copy(clientConn, serverConn)
 }
@@ -283,18 +301,12 @@ func parseParameters(data []byte) (map[string]string, error) {
     i := 0
     for i < len(data) {
         j := bytes.IndexByte(data[i:], 0)
-        if j < 0 {
-            break
-        }
+        if j < 0 { break }
         key := string(data[i : i+j])
         i += j + 1
-        if key == "" {
-            break
-        }
+        if key == "" { break }
         k := bytes.IndexByte(data[i:], 0)
-        if k < 0 {
-            break
-        }
+        if k < 0 { break }
         val := string(data[i : i+k])
         i += k + 1
         m[key] = val
@@ -343,27 +355,21 @@ func handleAuth(serverConn, clientConn net.Conn, user, password string) error {
             }
         }
         if t[0] != 'R' {
-            clientConn.Write(t[:])
-            clientConn.Write(lenb[:])
-            clientConn.Write(payload)
+            clientConn.Write(t[:]); clientConn.Write(lenb[:]); clientConn.Write(payload)
             continue
         }
         authType := binary.BigEndian.Uint32(payload[:4])
         switch authType {
-        case 0: // AuthenticationOk
-            clientConn.Write(t[:])
-            clientConn.Write(lenb[:])
-            clientConn.Write(payload)
+        case 0:
+            clientConn.Write(t[:]); clientConn.Write(lenb[:]); clientConn.Write(payload)
             return nil
-        case 3: // Cleartext
+        case 3:
             sendPasswordMsg(serverConn, password)
-        case 5: // MD5
+        case 5:
             salt := payload[4:8]
             sendPasswordMsg(serverConn, md5Password(password, user, salt))
-        case 10: // SCRAM-SHA-256
-            clientConn.Write(t[:])
-            clientConn.Write(lenb[:])
-            clientConn.Write(payload)
+        case 10:
+            clientConn.Write(t[:]); clientConn.Write(lenb[:]); clientConn.Write(payload)
             return nil
         default:
             return fmt.Errorf("unsupported auth type %d", authType)
