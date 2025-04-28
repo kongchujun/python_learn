@@ -39,7 +39,7 @@ func (cc *ConnectionConfig) SetConfig(hostname string, port int, username, passw
 }
 
 // GetConfig 返回当前连接配置
-func (cc *ConnectionConfig) GetConfig() (hostname string, port int, username, password, databaseName string) {
+func (cc *ConnectionConfig) GetConfig() (string, int, string, string, string) {
     cc.mu.RLock()
     defer cc.mu.RUnlock()
     return cc.hostname, cc.port, cc.username, cc.password, cc.databaseName
@@ -53,12 +53,12 @@ func (cc *ConnectionConfig) GetPostgresAddr() string {
 
 // Config 定义代理和 API 服务地址
 type Config struct {
-    ProxyListenAddr   string // e.g. ":5433"
-    APIListenAddr     string // e.g. ":8080"
-    APIPasswordUpdate string // e.g. "/update-password"
+    ProxyListenAddr   string // 代理监听地址，例如 ":5433"
+    APIListenAddr     string // API 监听地址，例如 ":8080"
+    APIPasswordUpdate string // 连接参数更新 API 路径，例如 "/update-password"
 }
 
-// StartupMessage 解析后的启动消息
+// StartupMessage 表示解析后的启动消息
 type StartupMessage struct {
     ProtocolVersion int32
     Parameters      map[string]string
@@ -66,14 +66,22 @@ type StartupMessage struct {
 }
 
 func main() {
-    config := Config{
+    cfg := Config{
         ProxyListenAddr:   ":5433",
         APIListenAddr:     ":8080",
         APIPasswordUpdate: "/update-password",
     }
-    cc := &ConnectionConfig{hostname: "postgres", port: 5432, username: "postgres", password: "initial_password", databaseName: "mydb"}
-    go startAPIServer(config, cc)
-    startProxyServer(config, cc)
+    cc := &ConnectionConfig{
+        hostname:     "postgres",
+        port:         5432,
+        username:     "postgres",
+        password:     "initial_password",
+        databaseName: "mydb",
+    }
+
+    // 启动 API 服务和代理服务
+    go startAPIServer(cfg, cc)
+    startProxyServer(cfg, cc)
 }
 
 // startAPIServer 启动 HTTP API 服务
@@ -130,7 +138,7 @@ func handleClientConnection(clientConn net.Conn, cc *ConnectionConfig) {
     defer clientConn.Close()
     clientBuf := bufio.NewReader(clientConn)
 
-    // SSLRequest 检测
+    // 检测并代理 SSLRequest
     head, err := clientBuf.Peek(8)
     if err == nil && binary.BigEndian.Uint32(head[0:4]) == 8 && binary.BigEndian.Uint32(head[4:8]) == 80877103 {
         clientBuf.Discard(8)
@@ -138,7 +146,7 @@ func handleClientConnection(clientConn net.Conn, cc *ConnectionConfig) {
         return
     }
 
-    // 普通连接
+    // 普通启动和认证代理
     postgresAddr := cc.GetPostgresAddr()
     serverConn, err := net.Dial("tcp", postgresAddr)
     if err != nil {
@@ -149,7 +157,7 @@ func handleClientConnection(clientConn net.Conn, cc *ConnectionConfig) {
     proxyStartupAndAuth(clientBuf, clientConn, serverConn, cc)
 }
 
-// proxySSL 处理 SSLRequest 中继
+// proxySSL 中继 SSLRequest 并做 TLS 握手
 func proxySSL(clientConn net.Conn, clientBuf *bufio.Reader, cc *ConnectionConfig, head []byte) {
     postgresAddr := cc.GetPostgresAddr()
     serverConn, err := net.Dial("tcp", postgresAddr)
@@ -158,12 +166,14 @@ func proxySSL(clientConn net.Conn, clientBuf *bufio.Reader, cc *ConnectionConfig
         return
     }
     defer serverConn.Close()
-    // 转发 SSLRequest
+
+    // 转发 SSLRequest 包
     if _, err := serverConn.Write(head); err != nil {
         log.Printf("forward SSLRequest failed: %v", err)
         return
     }
-    // 读取并原样回写
+
+    // 读取后端回复并回写给客户端
     reply := make([]byte, 1)
     if _, err := io.ReadFull(serverConn, reply); err != nil {
         log.Printf("read SSL reply failed: %v", err)
@@ -173,6 +183,8 @@ func proxySSL(clientConn net.Conn, clientBuf *bufio.Reader, cc *ConnectionConfig
         log.Printf("write SSL reply to client failed: %v", err)
         return
     }
+
+    // 如果支持 SSL，则升级至 TLS
     if reply[0] == 'S' {
         tlsCfg := &tls.Config{InsecureSkipVerify: true}
         clientConn = tls.Server(clientConn, tlsCfg)
@@ -187,18 +199,17 @@ func proxySSL(clientConn net.Conn, clientBuf *bufio.Reader, cc *ConnectionConfig
         }
         clientBuf = bufio.NewReader(clientConn)
     }
+
     proxyStartupAndAuth(clientBuf, clientConn, serverConn, cc)
 }
 
 // proxyStartupAndAuth 代理 StartupMessage 并处理认证
 func proxyStartupAndAuth(clientBuf *bufio.Reader, clientConn, serverConn net.Conn, cc *ConnectionConfig) {
-    // 1. 读取客户端 StartupMessage
     startupMsg, err := readStartupMessage(clientBuf)
     if err != nil {
         log.Printf("readStartupMessage error: %v", err)
         return
     }
-    // 2. 修改 StartupMessage（不包含 password）
     _, _, user, pass, db := cc.GetConfig()
     startupMsg.Parameters["user"] = user
     startupMsg.Parameters["database"] = db
@@ -207,25 +218,22 @@ func proxyStartupAndAuth(clientBuf *bufio.Reader, clientConn, serverConn net.Con
         log.Printf("serializeStartup error: %v", err)
         return
     }
-    // 3. 发送给后端
     if _, err := serverConn.Write(modified); err != nil {
         log.Printf("write startup to postgres failed: %v", err)
         return
     }
-    // 4. 处理后端认证阶段
     if err := handleAuth(serverConn, clientConn, user, pass); err != nil {
         log.Printf("authentication proxy error: %v", err)
         return
     }
-    // 5. 双向转发剩余数据
     go io.Copy(serverConn, clientBuf)
     io.Copy(clientConn, serverConn)
 }
 
-// handleAuth 中继认证：清除所有 Auth 请求/响应，自己向后端发送密码，并将最终 AuthOk 转发给客户端
+// handleAuth 中继认证，支持 Cleartext, MD5, SCRAM-SHA-256
 func handleAuth(serverConn, clientConn net.Conn, user, password string) error {
     for {
-        // 从后端读一条消息
+        // 读取后端认证请求或其他消息
         var t [1]byte
         if _, err := io.ReadFull(serverConn, t[:]); err != nil {
             return err
@@ -242,7 +250,6 @@ func handleAuth(serverConn, clientConn net.Conn, user, password string) error {
             }
         }
         if t[0] != 'R' {
-            // 非认证消息，直接转发给客户端
             clientConn.Write(t[:]); clientConn.Write(lenb[:]); clientConn.Write(payload)
             continue
         }
@@ -255,49 +262,10 @@ func handleAuth(serverConn, clientConn net.Conn, user, password string) error {
             sendPasswordMsg(serverConn, password)
         case 5: // MD5
             salt := payload[4:8]
-            hash := md5Password(password, user, salt)
-            sendPasswordMsg(serverConn, hash)
-        case 10: // SCRAM-SHA-256，直接切换到透明转发，让客户端与后端完成握手
+            sendPasswordMsg(serverConn, md5Password(password, user, salt))
+        case 10: // SCRAM-SHA-256，交由客户端处理
             clientConn.Write(t[:]); clientConn.Write(lenb[:]); clientConn.Write(payload)
             return nil
-        default:
-            return fmt.Errorf("unsupported auth type %d", authType)
-        }
-    }
-}(serverConn, clientConn net.Conn, user, password string) error {
-    for {
-        // 从后端读一条消息
-        var t [1]byte
-        if _, err := io.ReadFull(serverConn, t[:]); err != nil {
-            return err
-        }
-        var lenb [4]byte
-        if _, err := io.ReadFull(serverConn, lenb[:]); err != nil {
-            return err
-        }
-        length := binary.BigEndian.Uint32(lenb[:])
-        payload := make([]byte, length-4)
-        if length > 4 {
-            if _, err := io.ReadFull(serverConn, payload); err != nil {
-                return err
-            }
-        }
-        if t[0] != 'R' {
-            // 非认证消息，直接转发给客户端
-            clientConn.Write(t[:]); clientConn.Write(lenb[:]); clientConn.Write(payload)
-            continue
-        }
-        authType := binary.BigEndian.Uint32(payload[:4])
-        switch authType {
-        case 0: // AuthenticationOk
-            clientConn.Write(t[:]); clientConn.Write(lenb[:]); clientConn.Write(payload)
-            return nil
-        case 3: // Cleartext
-            sendPasswordMsg(serverConn, password)
-        case 5: // MD5
-            salt := payload[4:8]
-            hash := md5Password(password, user, salt)
-            sendPasswordMsg(serverConn, hash)
         default:
             return fmt.Errorf("unsupported auth type %d", authType)
         }
@@ -306,12 +274,12 @@ func handleAuth(serverConn, clientConn net.Conn, user, password string) error {
 
 // sendPasswordMsg 构造并发送 PasswordMessage
 func sendPasswordMsg(conn net.Conn, pwd string) error {
-    pbytes := []byte(pwd)
-    length := int32(len(pbytes) + 5)
+    data := []byte(pwd)
+    length := int32(len(data) + 5)
     buf := new(bytes.Buffer)
     buf.WriteByte('p')
     binary.Write(buf, binary.BigEndian, length)
-    buf.Write(pbytes)
+    buf.Write(data)
     buf.WriteByte(0)
     _, err := conn.Write(buf.Bytes())
     return err
@@ -325,71 +293,61 @@ func md5Password(password, user string, salt []byte) string {
     h2 := md5.New()
     h2.Write(sum1)
     h2.Write(salt)
-    sum2 := h2.Sum(nil)
-    return "md5" + hex.EncodeToString(sum2)
+    return "md5" + hex.EncodeToString(h2.Sum(nil))
 }
 
-// serializeStartup 序列化 StartupMessage（不含 password）
+// serializeStartup 序列化 StartupMessage
 func serializeStartup(msg *StartupMessage) ([]byte, error) {
     var buf bytes.Buffer
     buf.Write([]byte{0, 0, 0, 0})
-    var pv [4]byte
-    binary.BigEndian.PutUint32(pv[:], uint32(msg.ProtocolVersion))
-    buf.Write(pv[:])
+    binary.Write(&buf, binary.BigEndian, uint32(msg.ProtocolVersion))
     for k, v := range msg.Parameters {
         buf.WriteString(k); buf.WriteByte(0)
         buf.WriteString(v); buf.WriteByte(0)
     }
     buf.WriteByte(0)
-    length := int32(buf.Len())
-    binary.BigEndian.PutUint32(buf.Bytes()[0:4], uint32(length))
+    total := int32(buf.Len())
+    binary.BigEndian.PutUint32(buf.Bytes()[0:4], uint32(total))
     return buf.Bytes(), nil
 }
 
 // readStartupMessage 读取并解析 StartupMessage
-func readStartupMessage(reader *bufio.Reader) (*StartupMessage, error) {
+func readStartupMessage(r *bufio.Reader) (*StartupMessage, error) {
     header := make([]byte, 8)
-    if _, err := io.ReadFull(reader, header); err != nil {
-        return nil, fmt.Errorf("header read: %w", err)
+    if _, err := io.ReadFull(r, header); err != nil {
+        return nil, err
     }
     length := int32(binary.BigEndian.Uint32(header[0:4]))
     if length < 8 {
         return nil, fmt.Errorf("invalid length: %d", length)
     }
     body := make([]byte, length-8)
-    if _, err := io.ReadFull(reader, body); err != nil {
-        return nil, fmt.Errorf("body read: %w", err)
+    if _, err := io.ReadFull(r, body); err != nil {
+        return nil, err
     }
-    raw := append(header, body...)
-    version := int32(binary.BigEndian.Uint32(header[4:8]))
     params, err := parseParameters(body[4:])
     if err != nil {
         return nil, err
     }
-    return &StartupMessage{ProtocolVersion: version, Parameters: params, Raw: raw}, nil
+    version := int32(binary.BigEndian.Uint32(header[4:8]))
+    return &StartupMessage{ProtocolVersion: version, Parameters: params, Raw: append(header, body...)}, nil
 }
 
-// parseParameters 逐项解析 key=value 参数列表，遇到空 key 时结束
+// parseParameters 解析参数列表
 func parseParameters(data []byte) (map[string]string, error) {
-    params := make(map[string]string)
-    offset := 0
-    for offset < len(data) {
-        endKey := bytes.IndexByte(data[offset:], 0)
-        if endKey < 0 {
-            break
-        }
-        key := string(data[offset : offset+endKey])
-        offset += endKey + 1
-        if key == "" {
-            break
-        }
-        endVal := bytes.IndexByte(data[offset:], 0)
-        if endVal < 0 {
-            break
-        }
-        val := string(data[offset : offset+endVal])
-        offset += endVal + 1
-        params[key] = val
+    m := make(map[string]string)
+    i := 0
+    for i < len(data) {
+        j := bytes.IndexByte(data[i:], 0)
+        if j < 0 { break }
+        key := string(data[i : i+j])
+        i += j+1
+        if key == "" { break }
+        k := bytes.IndexByte(data[i:], 0)
+        if k < 0 { break }
+        val := string(data[i : i+k])
+        i += k+1
+        m[key] = val
     }
-    return params, nil
+    return m, nil
 }
