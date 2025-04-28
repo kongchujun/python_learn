@@ -134,7 +134,7 @@ func handleClientConnection(clientConn net.Conn, cc *ConnectionConfig) {
     head, err := clientBuf.Peek(8)
     if err == nil && binary.BigEndian.Uint32(head[0:4]) == 8 && binary.BigEndian.Uint32(head[4:8]) == 80877103 {
         clientBuf.Discard(8)
-        proxySSL(clientConn, clientBuf, cc)
+        proxySSL(clientConn, clientBuf, cc, head)
         return
     }
 
@@ -150,7 +150,7 @@ func handleClientConnection(clientConn net.Conn, cc *ConnectionConfig) {
 }
 
 // proxySSL 处理 SSLRequest 中继
-func proxySSL(clientConn net.Conn, clientBuf *bufio.Reader, cc *ConnectionConfig) {
+func proxySSL(clientConn net.Conn, clientBuf *bufio.Reader, cc *ConnectionConfig, head []byte) {
     postgresAddr := cc.GetPostgresAddr()
     serverConn, err := net.Dial("tcp", postgresAddr)
     if err != nil {
@@ -159,15 +159,20 @@ func proxySSL(clientConn net.Conn, clientBuf *bufio.Reader, cc *ConnectionConfig
     }
     defer serverConn.Close()
     // 转发 SSLRequest
-    // head 已经丢弃，用 c.Write 8 字节
-    serverConn.Write(head)
+    if _, err := serverConn.Write(head); err != nil {
+        log.Printf("forward SSLRequest failed: %v", err)
+        return
+    }
     // 读取并原样回写
     reply := make([]byte, 1)
     if _, err := io.ReadFull(serverConn, reply); err != nil {
         log.Printf("read SSL reply failed: %v", err)
         return
     }
-    clientConn.Write(reply)
+    if _, err := clientConn.Write(reply); err != nil {
+        log.Printf("write SSL reply to client failed: %v", err)
+        return
+    }
     if reply[0] == 'S' {
         tlsCfg := &tls.Config{InsecureSkipVerify: true}
         clientConn = tls.Server(clientConn, tlsCfg)
@@ -244,7 +249,6 @@ func handleAuth(serverConn, clientConn net.Conn, user, password string) error {
         authType := binary.BigEndian.Uint32(payload[:4])
         switch authType {
         case 0: // AuthenticationOk
-            // 转发给客户端
             clientConn.Write(t[:]); clientConn.Write(lenb[:]); clientConn.Write(payload)
             return nil
         case 3: // Cleartext
@@ -287,19 +291,15 @@ func md5Password(password, user string, salt []byte) string {
 // serializeStartup 序列化 StartupMessage（不含 password）
 func serializeStartup(msg *StartupMessage) ([]byte, error) {
     var buf bytes.Buffer
-    // 留出长度占位
     buf.Write([]byte{0, 0, 0, 0})
-    // 协议版本
     var pv [4]byte
     binary.BigEndian.PutUint32(pv[:], uint32(msg.ProtocolVersion))
     buf.Write(pv[:])
-    // 参数
     for k, v := range msg.Parameters {
         buf.WriteString(k); buf.WriteByte(0)
         buf.WriteString(v); buf.WriteByte(0)
     }
     buf.WriteByte(0)
-    // 回写长度
     length := int32(buf.Len())
     binary.BigEndian.PutUint32(buf.Bytes()[0:4], uint32(length))
     return buf.Bytes(), nil
