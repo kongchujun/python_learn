@@ -1,106 +1,354 @@
-import asyncio
-import os
-from dataclasses import dataclass
-from typing import List, Optional
+package main
 
-# Third-party imports
-import gradio as gr
-from dotenv import load_dotenv
-from langchain_openai import ChatOpenAI
-from rich.console import Console
-from rich.panel import Panel
-from rich.text import Text
+import (
+    "bufio"
+    "bytes"
+    "crypto/md5"
+    "crypto/tls"
+    "encoding/binary"
+    "encoding/hex"
+    "encoding/json"
+    "fmt"
+    "io"
+    "log"
+    "net"
+    "net/http"
+    "sync"
+)
 
-# Local module imports
-from browser_use import Agent
+// ConnectionConfig 存储 PostgreSQL 连接参数
+type ConnectionConfig struct {
+    hostname     string
+    port         int
+    username     string
+    password     string
+    databaseName string
+    mu           sync.RWMutex
+}
 
-load_dotenv()
+// SetConfig 更新连接参数
+func (cc *ConnectionConfig) SetConfig(hostname string, port int, username, password, databaseName string) {
+    cc.mu.Lock()
+    defer cc.mu.Unlock()
+    cc.hostname = hostname
+    cc.port = port
+    cc.username = username
+    cc.password = password
+    cc.databaseName = databaseName
+    log.Printf("Connection config updated: %s:%d user=%s db=%s", hostname, port, username, databaseName)
+}
 
+// GetConfig 返回当前连接配置
+func (cc *ConnectionConfig) GetConfig() (hostname string, port int, username, password, databaseName string) {
+    cc.mu.RLock()
+    defer cc.mu.RUnlock()
+    return cc.hostname, cc.port, cc.username, cc.password, cc.databaseName
+}
 
-@dataclass
-class ActionResult:
-	is_done: bool
-	extracted_content: Optional[str]
-	error: Optional[str]
-	include_in_memory: bool
+// GetPostgresAddr 返回 host:port
+func (cc *ConnectionConfig) GetPostgresAddr() string {
+    host, port, _, _, _ := cc.GetConfig()
+    return fmt.Sprintf("%s:%d", host, port)
+}
 
+// Config 定义代理和 API 服务地址
+type Config struct {
+    ProxyListenAddr   string // e.g. ":5433"
+    APIListenAddr     string // e.g. ":8080"
+    APIPasswordUpdate string // e.g. "/update-password"
+}
 
-@dataclass
-class AgentHistoryList:
-	all_results: List[ActionResult]
-	all_model_outputs: List[dict]
+// StartupMessage 解析后的启动消息
+type StartupMessage struct {
+    ProtocolVersion int32
+    Parameters      map[string]string
+    Raw             []byte
+}
 
+func main() {
+    config := Config{
+        ProxyListenAddr:   ":5433",
+        APIListenAddr:     ":8080",
+        APIPasswordUpdate: "/update-password",
+    }
+    cc := &ConnectionConfig{hostname: "postgres", port: 5432, username: "postgres", password: "initial_password", databaseName: "mydb"}
+    go startAPIServer(config, cc)
+    startProxyServer(config, cc)
+}
 
-def parse_agent_history(history_str: str) -> None:
-	console = Console()
+// startAPIServer 启动 HTTP API 服务
+func startAPIServer(cfg Config, cc *ConnectionConfig) {
+    http.HandleFunc(cfg.APIPasswordUpdate, func(w http.ResponseWriter, r *http.Request) {
+        if r.Method != http.MethodPost {
+            http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+            return
+        }
+        var req struct {
+            Hostname     string `json:"hostname"`
+            Port         int    `json:"port"`
+            Username     string `json:"username"`
+            Password     string `json:"password"`
+            DatabaseName string `json:"databasename"`
+        }
+        if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+            http.Error(w, "Invalid request body", http.StatusBadRequest)
+            return
+        }
+        if req.Hostname == "" || req.Port <= 0 || req.Username == "" || req.Password == "" || req.DatabaseName == "" {
+            http.Error(w, "All fields are required", http.StatusBadRequest)
+            return
+        }
+        cc.SetConfig(req.Hostname, req.Port, req.Username, req.Password, req.DatabaseName)
+        w.WriteHeader(http.StatusOK)
+        fmt.Fprint(w, "Connection config updated")
+    })
+    log.Printf("API server listening on %s", cfg.APIListenAddr)
+    if err := http.ListenAndServe(cfg.APIListenAddr, nil); err != nil {
+        log.Fatalf("API server failed: %v", err)
+    }
+}
 
-	# Split the content into sections based on ActionResult entries
-	sections = history_str.split('ActionResult(')
+// startProxyServer 启动代理服务
+func startProxyServer(cfg Config, cc *ConnectionConfig) {
+    listener, err := net.Listen("tcp", cfg.ProxyListenAddr)
+    if err != nil {
+        log.Fatalf("Proxy listen error: %v", err)
+    }
+    log.Printf("Proxy server listening on %s", cfg.ProxyListenAddr)
+    for {
+        clientConn, err := listener.Accept()
+        if err != nil {
+            log.Printf("Accept error: %v", err)
+            continue
+        }
+        go handleClientConnection(clientConn, cc)
+    }
+}
 
-	for i, section in enumerate(sections[1:], 1):  # Skip first empty section
-		# Extract relevant information
-		content = ''
-		if 'extracted_content=' in section:
-			content = section.split('extracted_content=')[1].split(',')[0].strip("'")
+// handleClientConnection 处理客户端连接，支持 SSLRequest
+func handleClientConnection(clientConn net.Conn, cc *ConnectionConfig) {
+    defer clientConn.Close()
+    clientBuf := bufio.NewReader(clientConn)
 
-		if content:
-			header = Text(f'Step {i}', style='bold blue')
-			panel = Panel(content, title=header, border_style='blue')
-			console.print(panel)
-			console.print()
+    // SSLRequest 检测
+    head, err := clientBuf.Peek(8)
+    if err == nil && binary.BigEndian.Uint32(head[0:4]) == 8 && binary.BigEndian.Uint32(head[4:8]) == 80877103 {
+        clientBuf.Discard(8)
+        proxySSL(clientConn, clientBuf, cc)
+        return
+    }
 
+    // 普通连接
+    postgresAddr := cc.GetPostgresAddr()
+    serverConn, err := net.Dial("tcp", postgresAddr)
+    if err != nil {
+        log.Printf("dial postgres failed: %v", err)
+        return
+    }
+    defer serverConn.Close()
+    proxyStartupAndAuth(clientBuf, clientConn, serverConn, cc)
+}
 
-async def run_browser_task(
-	task: str,
-	api_key: str,
-	model: str = 'gpt-4o',
-	headless: bool = True,
-) -> str:
-	if not api_key.strip():
-		return 'Please provide an API key'
+// proxySSL 处理 SSLRequest 中继
+func proxySSL(clientConn net.Conn, clientBuf *bufio.Reader, cc *ConnectionConfig) {
+    postgresAddr := cc.GetPostgresAddr()
+    serverConn, err := net.Dial("tcp", postgresAddr)
+    if err != nil {
+        log.Printf("dial postgres failed: %v", err)
+        return
+    }
+    defer serverConn.Close()
+    // 转发 SSLRequest
+    // head 已经丢弃，用 c.Write 8 字节
+    serverConn.Write(head)
+    // 读取并原样回写
+    reply := make([]byte, 1)
+    if _, err := io.ReadFull(serverConn, reply); err != nil {
+        log.Printf("read SSL reply failed: %v", err)
+        return
+    }
+    clientConn.Write(reply)
+    if reply[0] == 'S' {
+        tlsCfg := &tls.Config{InsecureSkipVerify: true}
+        clientConn = tls.Server(clientConn, tlsCfg)
+        if err := clientConn.(*tls.Conn).Handshake(); err != nil {
+            log.Printf("client TLS handshake failed: %v", err)
+            return
+        }
+        serverConn = tls.Client(serverConn, tlsCfg)
+        if err := serverConn.(*tls.Conn).Handshake(); err != nil {
+            log.Printf("server TLS handshake failed: %v", err)
+            return
+        }
+        clientBuf = bufio.NewReader(clientConn)
+    }
+    proxyStartupAndAuth(clientBuf, clientConn, serverConn, cc)
+}
 
-	os.environ['OPENAI_API_KEY'] = api_key
+// proxyStartupAndAuth 代理 StartupMessage 并处理认证
+func proxyStartupAndAuth(clientBuf *bufio.Reader, clientConn, serverConn net.Conn, cc *ConnectionConfig) {
+    // 1. 读取客户端 StartupMessage
+    startupMsg, err := readStartupMessage(clientBuf)
+    if err != nil {
+        log.Printf("readStartupMessage error: %v", err)
+        return
+    }
+    // 2. 修改 StartupMessage（不包含 password）
+    _, _, user, pass, db := cc.GetConfig()
+    startupMsg.Parameters["user"] = user
+    startupMsg.Parameters["database"] = db
+    modified, err := serializeStartup(startupMsg)
+    if err != nil {
+        log.Printf("serializeStartup error: %v", err)
+        return
+    }
+    // 3. 发送给后端
+    if _, err := serverConn.Write(modified); err != nil {
+        log.Printf("write startup to postgres failed: %v", err)
+        return
+    }
+    // 4. 处理后端认证阶段
+    if err := handleAuth(serverConn, clientConn, user, pass); err != nil {
+        log.Printf("authentication proxy error: %v", err)
+        return
+    }
+    // 5. 双向转发剩余数据
+    go io.Copy(serverConn, clientBuf)
+    io.Copy(clientConn, serverConn)
+}
 
-	try:
-		agent = Agent(
-			task=task,
-			llm=ChatOpenAI(model='gpt-4o'),
-		)
-		result = await agent.run()
-		#  TODO: The result cloud be parsed better
-		return result
-	except Exception as e:
-		return f'Error: {str(e)}'
+// handleAuth 中继认证：清除所有 Auth 请求/响应，自己向后端发送密码，并将最终 AuthOk 转发给客户端
+func handleAuth(serverConn, clientConn net.Conn, user, password string) error {
+    for {
+        // 从后端读一条消息
+        var t [1]byte
+        if _, err := io.ReadFull(serverConn, t[:]); err != nil {
+            return err
+        }
+        var lenb [4]byte
+        if _, err := io.ReadFull(serverConn, lenb[:]); err != nil {
+            return err
+        }
+        length := binary.BigEndian.Uint32(lenb[:])
+        payload := make([]byte, length-4)
+        if length > 4 {
+            if _, err := io.ReadFull(serverConn, payload); err != nil {
+                return err
+            }
+        }
+        if t[0] != 'R' {
+            // 非认证消息，直接转发给客户端
+            clientConn.Write(t[:]); clientConn.Write(lenb[:]); clientConn.Write(payload)
+            continue
+        }
+        authType := binary.BigEndian.Uint32(payload[:4])
+        switch authType {
+        case 0: // AuthenticationOk
+            // 转发给客户端
+            clientConn.Write(t[:]); clientConn.Write(lenb[:]); clientConn.Write(payload)
+            return nil
+        case 3: // Cleartext
+            sendPasswordMsg(serverConn, password)
+        case 5: // MD5
+            salt := payload[4:8]
+            hash := md5Password(password, user, salt)
+            sendPasswordMsg(serverConn, hash)
+        default:
+            return fmt.Errorf("unsupported auth type %d", authType)
+        }
+    }
+}
 
+// sendPasswordMsg 构造并发送 PasswordMessage
+func sendPasswordMsg(conn net.Conn, pwd string) error {
+    pbytes := []byte(pwd)
+    length := int32(len(pbytes) + 5)
+    buf := new(bytes.Buffer)
+    buf.WriteByte('p')
+    binary.Write(buf, binary.BigEndian, length)
+    buf.Write(pbytes)
+    buf.WriteByte(0)
+    _, err := conn.Write(buf.Bytes())
+    return err
+}
 
-def create_ui():
-	with gr.Blocks(title='Browser Use GUI') as interface:
-		gr.Markdown('# Browser Use Task Automation')
+// md5Password 生成 PostgreSQL MD5 密码散列
+func md5Password(password, user string, salt []byte) string {
+    h1 := md5.New()
+    h1.Write([]byte(password + user))
+    sum1 := h1.Sum(nil)
+    h2 := md5.New()
+    h2.Write(sum1)
+    h2.Write(salt)
+    sum2 := h2.Sum(nil)
+    return "md5" + hex.EncodeToString(sum2)
+}
 
-		with gr.Row():
-			with gr.Column():
-				api_key = gr.Textbox(label='OpenAI API Key', placeholder='sk-...', type='password')
-				task = gr.Textbox(
-					label='Task Description',
-					placeholder='E.g., Find flights from New York to London for next week',
-					lines=3,
-				)
-				model = gr.Dropdown(choices=['gpt-4', 'gpt-3.5-turbo'], label='Model', value='gpt-4')
-				headless = gr.Checkbox(label='Run Headless', value=True)
-				submit_btn = gr.Button('Run Task')
+// serializeStartup 序列化 StartupMessage（不含 password）
+func serializeStartup(msg *StartupMessage) ([]byte, error) {
+    var buf bytes.Buffer
+    // 留出长度占位
+    buf.Write([]byte{0, 0, 0, 0})
+    // 协议版本
+    var pv [4]byte
+    binary.BigEndian.PutUint32(pv[:], uint32(msg.ProtocolVersion))
+    buf.Write(pv[:])
+    // 参数
+    for k, v := range msg.Parameters {
+        buf.WriteString(k); buf.WriteByte(0)
+        buf.WriteString(v); buf.WriteByte(0)
+    }
+    buf.WriteByte(0)
+    // 回写长度
+    length := int32(buf.Len())
+    binary.BigEndian.PutUint32(buf.Bytes()[0:4], uint32(length))
+    return buf.Bytes(), nil
+}
 
-			with gr.Column():
-				output = gr.Textbox(label='Output', lines=10, interactive=False)
+// readStartupMessage 读取并解析 StartupMessage
+func readStartupMessage(reader *bufio.Reader) (*StartupMessage, error) {
+    header := make([]byte, 8)
+    if _, err := io.ReadFull(reader, header); err != nil {
+        return nil, fmt.Errorf("header read: %w", err)
+    }
+    length := int32(binary.BigEndian.Uint32(header[0:4]))
+    if length < 8 {
+        return nil, fmt.Errorf("invalid length: %d", length)
+    }
+    body := make([]byte, length-8)
+    if _, err := io.ReadFull(reader, body); err != nil {
+        return nil, fmt.Errorf("body read: %w", err)
+    }
+    raw := append(header, body...)
+    version := int32(binary.BigEndian.Uint32(header[4:8]))
+    params, err := parseParameters(body[4:])
+    if err != nil {
+        return nil, err
+    }
+    return &StartupMessage{ProtocolVersion: version, Parameters: params, Raw: raw}, nil
+}
 
-		submit_btn.click(
-			fn=lambda *args: asyncio.run(run_browser_task(*args)),
-			inputs=[task, api_key, model, headless],
-			outputs=output,
-		)
-
-	return interface
-
-
-if __name__ == '__main__':
-	demo = create_ui()
-	demo.launch()
+// parseParameters 逐项解析 key=value 参数列表，遇到空 key 时结束
+func parseParameters(data []byte) (map[string]string, error) {
+    params := make(map[string]string)
+    offset := 0
+    for offset < len(data) {
+        endKey := bytes.IndexByte(data[offset:], 0)
+        if endKey < 0 {
+            break
+        }
+        key := string(data[offset : offset+endKey])
+        offset += endKey + 1
+        if key == "" {
+            break
+        }
+        endVal := bytes.IndexByte(data[offset:], 0)
+        if endVal < 0 {
+            break
+        }
+        val := string(data[offset : offset+endVal])
+        offset += endVal + 1
+        params[key] = val
+    }
+    return params, nil
+}
