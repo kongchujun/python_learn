@@ -257,6 +257,47 @@ func handleAuth(serverConn, clientConn net.Conn, user, password string) error {
             salt := payload[4:8]
             hash := md5Password(password, user, salt)
             sendPasswordMsg(serverConn, hash)
+        case 10: // SCRAM-SHA-256，直接切换到透明转发，让客户端与后端完成握手
+            clientConn.Write(t[:]); clientConn.Write(lenb[:]); clientConn.Write(payload)
+            return nil
+        default:
+            return fmt.Errorf("unsupported auth type %d", authType)
+        }
+    }
+}(serverConn, clientConn net.Conn, user, password string) error {
+    for {
+        // 从后端读一条消息
+        var t [1]byte
+        if _, err := io.ReadFull(serverConn, t[:]); err != nil {
+            return err
+        }
+        var lenb [4]byte
+        if _, err := io.ReadFull(serverConn, lenb[:]); err != nil {
+            return err
+        }
+        length := binary.BigEndian.Uint32(lenb[:])
+        payload := make([]byte, length-4)
+        if length > 4 {
+            if _, err := io.ReadFull(serverConn, payload); err != nil {
+                return err
+            }
+        }
+        if t[0] != 'R' {
+            // 非认证消息，直接转发给客户端
+            clientConn.Write(t[:]); clientConn.Write(lenb[:]); clientConn.Write(payload)
+            continue
+        }
+        authType := binary.BigEndian.Uint32(payload[:4])
+        switch authType {
+        case 0: // AuthenticationOk
+            clientConn.Write(t[:]); clientConn.Write(lenb[:]); clientConn.Write(payload)
+            return nil
+        case 3: // Cleartext
+            sendPasswordMsg(serverConn, password)
+        case 5: // MD5
+            salt := payload[4:8]
+            hash := md5Password(password, user, salt)
+            sendPasswordMsg(serverConn, hash)
         default:
             return fmt.Errorf("unsupported auth type %d", authType)
         }
