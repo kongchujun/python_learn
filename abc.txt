@@ -26,12 +26,13 @@ type ConnectionConfig struct {
     mu           sync.RWMutex
 }
 
-// SetConfig 更新连接参数
+// ConnParams 用于透明传递配置数据
 type ConnParams struct {
     Hostname, Username, Password, Database string
     Port                                    int
 }
 
+// SetConfig 更新连接配置
 func (cc *ConnectionConfig) SetConfig(hostname string, port int, username, password, databaseName string) {
     cc.mu.Lock()
     defer cc.mu.Unlock()
@@ -43,29 +44,30 @@ func (cc *ConnectionConfig) SetConfig(hostname string, port int, username, passw
     log.Printf("Connection config updated: %s:%d user=%s db=%s", hostname, port, username, databaseName)
 }
 
-// GetConfig 返回当前连接配置
+// GetConfig 返回当前连接参数
 func (cc *ConnectionConfig) GetConfig() ConnParams {
     cc.mu.RLock()
     defer cc.mu.RUnlock()
     return ConnParams{Hostname: cc.hostname, Port: cc.port, Username: cc.username, Password: cc.password, Database: cc.databaseName}
 }
 
-// Config 定义代理与 API 服务地址及连接池大小
+// Config 定义代理和 API 服务地址及连接池参数
 type Config struct {
     ProxyListenAddr   string // 代理监听地址
     APIListenAddr     string // API 监听地址
-    APIPasswordUpdate string // 更新参数 API 路径
+    APIPasswordUpdate string // 更新配置 API 路径
     PoolSize          int    // 连接池大小
+    ProxyAuthPassword string // 代理访问校验密码
 }
 
-// StartupMessage 解析后的启动消息，用于修改用户/数据库参数
+// StartupMessage 表示 PostgreSQL 启动包，方便修改参数
 type StartupMessage struct {
     ProtocolVersion int32
     Parameters      map[string]string
     Raw             []byte
 }
 
-// ConnPool 封装后端连接池，基于 channel 实现，支持主动 reset
+// ConnPool 后端连接池，实现主动清空机制
 type ConnPool struct {
     cc       *ConnectionConfig
     pool     chan net.Conn
@@ -74,24 +76,21 @@ type ConnPool struct {
     mu       sync.Mutex
 }
 
-// newPool 创建指定大小的连接池
-func newPool(cc *ConnectionConfig, size int) *ConnPool {
+// newPool 构造连接池unc newPool(cc *ConnectionConfig, size int) *ConnPool {
     return &ConnPool{cc: cc, pool: make(chan net.Conn, size), size: size}
 }
 
-// Get 从池中获取连接，池空时新建
-func (p *ConnPool) Get() (net.Conn, error) {
+// Get 获取后端连接，池空则新建unc (p *ConnPool) Get() (net.Conn, error) {
     select {
     case conn := <-p.pool:
         return conn, nil
     default:
-        params := p.cc.GetConfig()
-        return net.Dial("tcp", fmt.Sprintf("%s:%d", params.Hostname, params.Port))
+        cfg := p.cc.GetConfig()
+        return net.Dial("tcp", fmt.Sprintf("%s:%d", cfg.Hostname, cfg.Port))
     }
 }
 
-// Put 将连接归还池中，如在 draining 状态则关闭，多余则关闭
-func (p *ConnPool) Put(conn net.Conn) {
+// Put 归还连接，draining 时直接关闭unc (p *ConnPool) Put(conn net.Conn) {
     p.mu.Lock()
     defer p.mu.Unlock()
     if p.draining {
@@ -105,53 +104,55 @@ func (p *ConnPool) Put(conn net.Conn) {
     }
 }
 
-// Reset 主动关闭并清空池中所有空闲连接，标记 draining
-func (p *ConnPool) Reset() {
+// Reset 主动清空空闲连接，并重建 channelunc (p *ConnPool) Reset() {
     p.mu.Lock()
+    defer p.mu.Unlock()
     p.draining = true
     close(p.pool)
-    for conn := range p.pool {
-        conn.Close()
+    for c := range p.pool {
+        c.Close()
     }
     p.pool = make(chan net.Conn, p.size)
     p.draining = false
-    p.mu.Unlock()
 }
 
-// 全局变量：双池策略
+// 全局变量：双池管理
 var (
+    connConfig = &ConnectionConfig{}
+    cfg        = Config{
+        ProxyListenAddr:   ":5433",
+        APIListenAddr:     ":8080",
+        APIPasswordUpdate: "/update-password",
+        PoolSize:          10,
+        ProxyAuthPassword: "pwd_postgres",
+    }
     activePool *ConnPool
     oldPool    *ConnPool
     poolMu     sync.Mutex
-    cfg        = Config{ProxyListenAddr: ":5433", APIListenAddr: ":8080", APIPasswordUpdate: "/update-password", PoolSize: 10}
-    connConfig = &ConnectionConfig{}
 )
 
-// rotatePools 切换到新池，并 reset 旧池，避免连接泄漏
+// rotatePools 切换到新池并重置旧池，防止泄漏
 func rotatePools() {
     poolMu.Lock()
     defer poolMu.Unlock()
-    newPool := newPool(connConfig, cfg.PoolSize)
+    newP := newPool(connConfig, cfg.PoolSize)
     if activePool != nil {
         oldPool = activePool
         oldPool.Reset()
     }
-    activePool = newPool
+    activePool = newP
 }
 
 func main() {
-    // 初始配置
+    // 初始化配置与连接池
     connConfig.SetConfig("postgres", 5432, "postgres", "initial_password", "mydb")
     activePool = newPool(connConfig, cfg.PoolSize)
 
-    // 启动 HTTP API 服务
     go startAPIServer()
-    // 启动代理服务器
     startProxyServer()
 }
 
-// startAPIServer 启动 HTTP 接口，接收配置更新并切换连接池
-func startAPIServer() {
+// startAPIServer 提供 HTTP 接口，更新配置并切换池unc startAPIServer() {
     http.HandleFunc(cfg.APIPasswordUpdate, func(w http.ResponseWriter, r *http.Request) {
         if r.Method != http.MethodPost {
             http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -172,18 +173,16 @@ func startAPIServer() {
             http.Error(w, "All fields required", http.StatusBadRequest)
             return
         }
-        // 更新配置并 rotate
         connConfig.SetConfig(req.Hostname, req.Port, req.Username, req.Password, req.DatabaseName)
         rotatePools()
         w.WriteHeader(http.StatusOK)
-        fmt.Fprint(w, "Config updated and rotated pools")
+        fmt.Fprint(w, "Config updated and pools rotated")
     })
-    log.Printf("API server listening on %s", cfg.APIListenAddr)
+    log.Printf("API listening on %s", cfg.APIListenAddr)
     log.Fatal(http.ListenAndServe(cfg.APIListenAddr, nil))
 }
 
-// startProxyServer 开启 TCP 代理监听
-func startProxyServer() {
+// startProxyServer 启动 TCP 代理unc startProxyServer() {
     ln, err := net.Listen("tcp", cfg.ProxyListenAddr)
     if err != nil {
         log.Fatalf("Proxy listen failed: %v", err)
@@ -199,8 +198,7 @@ func startProxyServer() {
     }
 }
 
-// handleClient 处理单个客户端连接，含 SSL/TLS, Startup, Auth 流程
-func handleClient(clientConn net.Conn) {
+// handleClient 处理客户端连接：SSL, Startup/Auth, 转发unc handleClient(clientConn net.Conn) {
     defer clientConn.Close()
     buf := bufio.NewReader(clientConn)
 
@@ -211,7 +209,7 @@ func handleClient(clientConn net.Conn) {
         proxySSL(clientConn, buf, head)
         return
     }
-    // 普通 Startup+Auth
+
     poolMu.Lock()
     p := activePool
     poolMu.Unlock()
@@ -224,8 +222,7 @@ func handleClient(clientConn net.Conn) {
     proxyStartupAuth(buf, clientConn, serverConn)
 }
 
-// proxySSL 中继 SSLRequest 并做 TLS 握手
-func proxySSL(clientConn net.Conn, buf *bufio.Reader, head []byte) {
+// proxySSL 中继 SSLRequest 并执行 TLS 握手unc proxySSL(clientConn net.Conn, buf *bufio.Reader, head []byte) {
     poolMu.Lock()
     p := activePool
     poolMu.Unlock()
@@ -251,13 +248,19 @@ func proxySSL(clientConn net.Conn, buf *bufio.Reader, head []byte) {
     proxyStartupAuth(buf, clientConn, serverConn)
 }
 
-// proxyStartupAuth 代理 StartupMessage 并完成认证
-func proxyStartupAuth(buf *bufio.Reader, clientConn, serverConn net.Conn) {
+// proxyStartupAuth 解析并校验客户端密码，然后转发给后端unc proxyStartupAuth(buf *bufio.Reader, clientConn, serverConn net.Conn) {
     msg, err := readStartupMessage(buf)
     if err != nil {
-        log.Printf("readStartupMessage error: %v", err)
+        log.Printf("Startup read error: %v", err)
         return
     }
+    // 校验用户提交的 proxy_password
+    if pwd, ok := msg.Parameters["password"]; !ok || pwd != cfg.ProxyAuthPassword {
+        log.Printf("Invalid proxy password")
+        return
+    }
+    delete(msg.Parameters, "password")
+
     params := connConfig.GetConfig()
     msg.Parameters["user"] = params.Username
     msg.Parameters["database"] = params.Database
@@ -268,35 +271,22 @@ func proxyStartupAuth(buf *bufio.Reader, clientConn, serverConn net.Conn) {
     io.Copy(clientConn, serverConn)
 }
 
-// readStartupMessage 读取并解析 StartupMessage
-type StartupMessage struct {
-    ProtocolVersion int32
-    Parameters      map[string]string
-    Raw             []byte
-}
-func readStartupMessage(r *bufio.Reader) (*StartupMessage, error) {
+// readStartupMessage 解析 StartupMessageunc readStartupMessage(r *bufio.Reader) (*StartupMessage, error) {
     header := make([]byte, 8)
     if _, err := io.ReadFull(r, header); err != nil {
         return nil, err
     }
-    length := int32(binary.BigEndian.Uint32(header[:4]))
-    if length < 8 {
-        return nil, fmt.Errorf("invalid length: %d", length)
-    }
+    length := int(binary.BigEndian.Uint32(header[:4]))
     body := make([]byte, length-8)
     if _, err := io.ReadFull(r, body); err != nil {
         return nil, err
     }
-    params, err := parseParameters(body[4:])
-    if err != nil {
-        return nil, err
-    }
+    params, _ := parseParameters(body[4:])
     version := int32(binary.BigEndian.Uint32(header[4:8]))
     return &StartupMessage{ProtocolVersion: version, Parameters: params, Raw: append(header, body...)}, nil
 }
 
-// parseParameters 解析 key=value 参数列表
-func parseParameters(data []byte) (map[string]string, error) {
+// parseParameters 解析 key=value 列表unc parseParameters(data []byte) (map[string]string, error) {
     m := make(map[string]string)
     i := 0
     for i < len(data) {
@@ -314,21 +304,13 @@ func parseParameters(data []byte) (map[string]string, error) {
     return m, nil
 }
 
-// serializeStartup 序列化 StartupMessage
-type StartupMessage struct {
-    ProtocolVersion int32
-    Parameters      map[string]string
-    Raw             []byte
-}
-func serializeStartup(msg *StartupMessage) ([]byte, error) {
+// serializeStartup 重建 StartupMessageunc serializeStartup(msg *StartupMessage) ([]byte, error) {
     var buf bytes.Buffer
     buf.Write([]byte{0, 0, 0, 0})
     binary.Write(&buf, binary.BigEndian, uint32(msg.ProtocolVersion))
     for k, v := range msg.Parameters {
-        buf.WriteString(k)
-        buf.WriteByte(0)
-        buf.WriteString(v)
-        buf.WriteByte(0)
+        buf.WriteString(k); buf.WriteByte(0)
+        buf.WriteString(v); buf.WriteByte(0)
     }
     buf.WriteByte(0)
     total := int32(buf.Len())
@@ -336,8 +318,7 @@ func serializeStartup(msg *StartupMessage) ([]byte, error) {
     return buf.Bytes(), nil
 }
 
-// handleAuth 代理后端认证请求，支持 Cleartext、MD5、SCRAM-SHA-256
-func handleAuth(serverConn, clientConn net.Conn, user, password string) error {
+// handleAuth 代理后端认证，支持 Cleartext/MD5/SCRAMunc handleAuth(serverConn, clientConn net.Conn, user, dbPwd string) error {
     for {
         var t [1]byte
         if _, err := io.ReadFull(serverConn, t[:]); err != nil {
@@ -350,53 +331,61 @@ func handleAuth(serverConn, clientConn net.Conn, user, password string) error {
         length := binary.BigEndian.Uint32(lenb[:])
         payload := make([]byte, length-4)
         if length > 4 {
-            if _, err := io.ReadFull(serverConn, payload); err != nil {
-                return err
-            }
+            io.ReadFull(serverConn, payload)
         }
         if t[0] != 'R' {
             clientConn.Write(t[:]); clientConn.Write(lenb[:]); clientConn.Write(payload)
             continue
         }
-        authType := binary.BigEndian.Uint32(payload[:4])
-        switch authType {
+        auth := binary.BigEndian.Uint32(payload[:4])
+        switch auth {
         case 0:
             clientConn.Write(t[:]); clientConn.Write(lenb[:]); clientConn.Write(payload)
             return nil
         case 3:
-            sendPasswordMsg(serverConn, password)
+            clientConn.Write(t[:]); clientConn.Write(lenb[:])
+            var tag [1]byte; io.ReadFull(clientConn, tag[:])
+            var plenb2 [4]byte; io.ReadFull(clientConn, plenb2[:])
+            plen := binary.BigEndian.Uint32(plenb2[:]); pwd := make([]byte, plen-4)
+            io.ReadFull(clientConn, pwd)
+            if string(pwd[:len(pwd)-1]) != cfg.ProxyAuthPassword {
+                return fmt.Errorf("proxy auth failed")
+            }
+            sendPasswordMsg(serverConn, dbPwd)
         case 5:
+            clientConn.Write(t[:]); clientConn.Write(lenb[:]); clientConn.Write(payload)
+            var tag [1]byte; io.ReadFull(clientConn, tag[:])
+            var plenb2 [4]byte; io.ReadFull(clientConn, plenb2[:])
+            plen := binary.BigEndian.Uint32(plenb2[:]); pwd := make([]byte, plen-4)
+            io.ReadFull(clientConn, pwd)
             salt := payload[4:8]
-            sendPasswordMsg(serverConn, md5Password(password, user, salt))
+            if string(pwd[:len(pwd)-1]) != md5Password(cfg.ProxyAuthPassword, "", salt) {
+                return fmt.Errorf("proxy auth md5 failed")
+            }
+            sendPasswordMsg(serverConn, md5Password(dbPwd, user, salt))
         case 10:
             clientConn.Write(t[:]); clientConn.Write(lenb[:]); clientConn.Write(payload)
             return nil
         default:
-            return fmt.Errorf("unsupported auth type %d", authType)
+            return fmt.Errorf("unsupported auth %d", auth)
         }
     }
 }
 
-// sendPasswordMsg 构造并发送 PasswordMessage
-func sendPasswordMsg(conn net.Conn, pwd string) error {
+// sendPasswordMsg 发送 PasswordMessageunc sendPasswordMsg(conn net.Conn, pwd string) error {
     data := []byte(pwd)
     length := int32(len(data) + 5)
     buf := new(bytes.Buffer)
     buf.WriteByte('p')
     binary.Write(buf, binary.BigEndian, length)
-    buf.Write(data)
-    buf.WriteByte(0)
+    buf.Write(data); buf.WriteByte(0)
     _, err := conn.Write(buf.Bytes())
     return err
 }
 
-// md5Password 生成 PostgreSQL MD5 密码散列
-func md5Password(password, user string, salt []byte) string {
-    h1 := md5.New()
-    h1.Write([]byte(password + user))
+// md5Password 生成 MD5 散列unc md5Password(pwd, user string, salt []byte) string {
+    h1 := md5.New(); h1.Write([]byte(pwd + user))
     sum1 := h1.Sum(nil)
-    h2 := md5.New()
-    h2.Write(sum1)
-    h2.Write(salt)
+    h2 := md5.New(); h2.Write(sum1); h2.Write(salt)
     return "md5" + hex.EncodeToString(h2.Sum(nil))
 }
