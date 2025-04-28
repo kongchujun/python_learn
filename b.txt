@@ -2,63 +2,93 @@ package main
 
 import (
     "bufio"
+    "bytes"
+    "encoding/binary"
     "encoding/json"
     "fmt"
     "io"
     "log"
     "net"
     "net/http"
+    "strconv"
     "sync"
 )
 
-// PasswordManager 管理 PostgreSQL 密码
-type PasswordManager struct {
-    currentPassword string
-    mu              sync.RWMutex
+// ConnectionConfig 存储 PostgreSQL 连接参数
+type ConnectionConfig struct {
+    Hostname     string
+    Port         int
+    Username     string
+    Password     string
+    DatabaseName string
+    mu           sync.RWMutex
 }
 
-// SetPassword 更新密码
-func (pm *PasswordManager) SetPassword(newPassword string) {
-    pm.mu.Lock()
-    defer pm.mu.Unlock()
-    pm.currentPassword = newPassword
-    log.Printf("Password updated to: %s", newPassword)
+// SetConfig 更新连接参数
+func (cc *ConnectionConfig) SetConfig(hostname string, port int, username, password, databaseName string) {
+    cc.mu.Lock()
+    defer cc.mu.Unlock()
+    cc.Hostname = hostname
+    cc.Port = port
+    cc.Username = username
+    cc.Password = password
+    cc.DatabaseName = databaseName
+    log.Printf("Connection config updated: hostname=%s, port=%d, username=%s, database=%s", hostname, port, username, databaseName)
 }
 
-// GetPassword 获取当前密码
-func (pm *PasswordManager) GetPassword() string {
-    pm.mu.RLock()
-    defer pm.mu.RUnlock()
-    return pm.currentPassword
+// GetConfig 获取当前连接参数
+func (cc *ConnectionConfig) GetConfig() (string, int, string, string, string) {
+    cc.mu.RLock()
+    defer cc.mu.RUnlock()
+    return cc.Hostname, cc.Port, cc.Username, cc.Password, cc.DatabaseName
+}
+
+// GetPostgresAddr 获取 PostgreSQL 地址（hostname:port）
+func (cc *ConnectionConfig) GetPostgresAddr() string {
+    cc.mu.RLock()
+    defer cc.mu.RUnlock()
+    return fmt.Sprintf("%s:%d", cc.Hostname, cc.Port)
 }
 
 // Config 代理配置
 type Config struct {
     ProxyListenAddr   string // 代理监听地址，如 ":5433"
-    PostgresAddr      string // 真实 PostgreSQL 地址，如 "postgres:5432"
     APIListenAddr     string // API 监听地址，如 ":8080"
-    APIPasswordUpdate string // 密码更新 API 路径，如 "/update-password"
+    APIPasswordUpdate string // 连接参数更新 API 路径，如 "/update-password"
+}
+
+// StartupMessage 表示解析后的 StartupMessage
+type StartupMessage struct {
+    ProtocolVersion int32             // 协议版本
+    Parameters      map[string]string // 参数键值对
+    Raw             []byte            // 原始字节
 }
 
 func main() {
     config := Config{
         ProxyListenAddr:   ":5433",
-        PostgresAddr:      "postgres:5432",
         APIListenAddr:     ":8080",
         APIPasswordUpdate: "/update-password",
     }
 
-    pm := &PasswordManager{currentPassword: "initial_password"}
+    // 初始化连接配置
+    cc := &ConnectionConfig{
+        Hostname:     "postgres",
+        Port:         5432,
+        Username:     "postgres",
+        Password:     "initial_password",
+        DatabaseName: "mydb",
+    }
 
     // 启动 HTTP API 服务
-    go startAPIServer(config, pm)
+    go startAPIServer(config, cc)
 
     // 启动代理服务
-    startProxyServer(config, pm)
+    startProxyServer(config, cc)
 }
 
 // startAPIServer 启动 HTTP API 服务
-func startAPIServer(config Config, pm *PasswordManager) {
+func startAPIServer(config Config, cc *ConnectionConfig) {
     http.HandleFunc(config.APIPasswordUpdate, func(w http.ResponseWriter, r *http.Request) {
         if r.Method != http.MethodPost {
             http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -66,21 +96,27 @@ func startAPIServer(config Config, pm *PasswordManager) {
         }
 
         var req struct {
-            NewPassword string `json:"new_password"`
+            Hostname     string `json:"hostname"`
+            Port         int    `json:"port"`
+            Username     string `json:"username"`
+            Password     string `json:"password"`
+            DatabaseName string `json:"databasename"`
         }
         if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
             http.Error(w, "Invalid request body", http.StatusBadRequest)
             return
         }
 
-        if req.NewPassword == "" {
-            http.Error(w, "New password cannot be empty", http.StatusBadRequest)
+        // 验证参数
+        if req.Hostname == "" || req.Port <= 0 || req.Username == "" || req.Password == "" || req.DatabaseName == "" {
+            http.Error(w, "All fields (hostname, port, username, password, databasename) are required", http.StatusBadRequest)
             return
         }
 
-        pm.SetPassword(req.NewPassword)
+        // 更新连接配置
+        cc.SetConfig(req.Hostname, req.Port, req.Username, req.Password, req.DatabaseName)
         w.WriteHeader(http.StatusOK)
-        fmt.Fprintf(w, "Password updated successfully")
+        fmt.Fprintf(w, "Connection config updated successfully")
     })
 
     log.Printf("API server listening on %s", config.APIListenAddr)
@@ -90,7 +126,7 @@ func startAPIServer(config Config, pm *PasswordManager) {
 }
 
 // startProxyServer 启动代理服务
-func startProxyServer(config Config, pm *PasswordManager) {
+func startProxyServer(config Config, cc *ConnectionConfig) {
     listener, err := net.Listen("tcp", config.ProxyListenAddr)
     if err != nil {
         log.Fatalf("Failed to start proxy server: %v", err)
@@ -106,23 +142,26 @@ func startProxyServer(config Config, pm *PasswordManager) {
             continue
         }
 
-        go handleClientConnection(clientConn, config.PostgresAddr, pm)
+        go handleClientConnection(clientConn, cc)
     }
 }
 
 // handleClientConnection 处理客户端连接
-func handleClientConnection(clientConn net.Conn, postgresAddr string, pm *PasswordManager) {
+func handleClientConnection(clientConn net.Conn, cc *ConnectionConfig) {
     defer clientConn.Close()
 
-    // 连接到真实的 PostgreSQL 服务
+    // 获取最新的 PostgreSQL 地址
+    postgresAddr := cc.GetPostgresAddr()
+
+    // 连接到 PostgreSQL 服务
     serverConn, err := net.Dial("tcp", postgresAddr)
     if err != nil {
-        log.Printf("Failed to connect to PostgreSQL: %v", err)
+        log.Printf("Failed to connect to PostgreSQL (%s): %v", postgresAddr, err)
         return
     }
     defer serverConn.Close()
 
-    // 读取客户端的 StartupMessage（PostgreSQL 协议）
+    // 读取客户端的 StartupMessage
     clientReader := bufio.NewReader(clientConn)
     startupMsg, err := readStartupMessage(clientReader)
     if err != nil {
@@ -130,36 +169,131 @@ func handleClientConnection(clientConn net.Conn, postgresAddr string, pm *Passwo
         return
     }
 
-    // 修改认证信息（替换密码）
-    startupMsg = modifyStartupMessage(startupMsg, pm.GetPassword())
+    // 获取最新的连接参数
+    _, _, username, password, databaseName := cc.GetConfig()
 
-    // 将修改后的 StartupMessage 发送到 PostgreSQL
-    if _, err := serverConn.Write(startupMsg); err != nil {
+    // 修改 StartupMessage
+    modifiedMsg, err := modifyStartupMessage(startupMsg, username, password, databaseName)
+    if err != nil {
+        log.Printf("Failed to modify startup message: %v", err)
+        return
+    }
+
+    // 发送到 PostgreSQL
+    if _, err := serverConn.Write(modifiedMsg); err != nil {
         log.Printf("Failed to send startup message to PostgreSQL: %v", err)
         return
     }
 
-    // 双向转发数据
+    // 双向转发后续数据
     go io.Copy(serverConn, clientReader)
     io.Copy(clientConn, serverConn)
 }
 
-// readStartupMessage 读取 PostgreSQL StartupMessage
-func readStartupMessage(reader *bufio.Reader) ([]byte, error) {
-    // 简单示例：读取固定长度的 StartupMessage
-    // 实际需要解析 PostgreSQL 协议（参见协议文档）
-    buf := make([]byte, 1024)
-    n, err := reader.Read(buf)
+// readStartupMessage 读取并解析 PostgreSQL StartupMessage
+func readStartupMessage(reader *bufio.Reader) (*StartupMessage, error) {
+    // 读取前 8 字节，判断消息类型
+    header := make([]byte, 8)
+    _, err := io.ReadFull(reader, header)
     if err != nil {
-        return nil, err
+        return nil, fmt.Errorf("failed to read header: %w", err)
     }
-    return buf[:n], nil
+
+    // 检查是否为 SSL 请求
+    if bytes.Equal(header, []byte{0x00, 0x00, 0x00, 0x08, 0x04, 0xD2, 0x16, 0x2F}) {
+        return nil, fmt.Errorf("SSL request not supported")
+    }
+
+    // 解析 StartupMessage
+    length := int32(binary.BigEndian.Uint32(header[:4]))
+    if length < 8 {
+        return nil, fmt.Errorf("invalid message length: %d", length)
+    }
+
+    // 读取剩余的消息内容
+    remainingLength := length - 8
+    body := make([]byte, remainingLength)
+    _, err = io.ReadFull(reader, body)
+    if err != nil {
+        return nil, fmt.Errorf("failed to read message body: %w", err)
+    }
+
+    // 合并 header 和 body
+    raw := append(header, body...)
+
+    // 解析协议版本
+    protocolVersion := int32(binary.BigEndian.Uint32(header[4:8]))
+
+    // 解析参数
+    params, err := parseParameters(body[4:])
+    if err != nil {
+        return nil, fmt.Errorf("failed to parse parameters: %w", err)
+    }
+
+    return &StartupMessage{
+        ProtocolVersion: protocolVersion,
+        Parameters:      params,
+        Raw:             raw,
+    }, nil
 }
 
-// modifyStartupMessage 修改 StartupMessage 中的密码
-func modifyStartupMessage(msg []byte, newPassword string) []byte {
-    // 简化处理：实际需要解析 PostgreSQL 协议的 StartupMessage
-    // 这里假设直接附加新密码（仅为示例）
-    // 真实场景需解析参数键值对，替换 "password" 参数
-    return append(msg, []byte(fmt.Sprintf("password=%s", newPassword))...)
+// parseParameters 解析 StartupMessage 的参数列表
+func parseParameters(data []byte) (map[string]string, error) {
+    params := make(map[string]string)
+    if len(data) == 0 {
+        return params, nil
+    }
+
+    // 参数以 null 终止的字符串对（key=value\0）组成，最后以 \0 结束
+    parts := bytes.Split(data[:len(data)-1], []byte{0})
+    if len(parts)%2 != 0 {
+        return nil, fmt.Errorf("invalid parameter format")
+    }
+
+    for i := 0; i < len(parts); i += 2 {
+        key := string(parts[i])
+        value := string(parts[i+1])
+        params[key] = value
+    }
+
+    return params, nil
+}
+
+// modifyStartupMessage 修改 StartupMessage 中的参数
+func modifyStartupMessage(msg *StartupMessage, username, password, databaseName string) ([]byte, error) {
+    // 更新参数
+    msg.Parameters["user"] = username
+    msg.Parameters["password"] = password
+    msg.Parameters["database"] = databaseName
+
+    // 序列化参数
+    var paramsBuf bytes.Buffer
+    for key, value := range msg.Parameters {
+        paramsBuf.WriteString(key)
+        paramsBuf.WriteByte(0)
+        paramsBuf.WriteString(value)
+        paramsBuf.WriteByte(0)
+    }
+    paramsBuf.WriteByte(0) // 参数列表以 \0 结束
+
+    // 构造新的 StartupMessage
+    var newMsg bytes.Buffer
+    // 写入消息长度（稍后计算）
+    lengthPlaceholder := make([]byte, 4)
+    newMsg.Write(lengthPlaceholder)
+
+    // 写入协议版本
+    var protocolBytes [4]byte
+    binary.BigEndian.PutUint32(protocolBytes[:], uint32(msg.ProtocolVersion))
+    newMsg.Write(protocolBytes[:])
+
+    // 写入参数
+    newMsg.Write(paramsBuf.Bytes())
+
+    // 计算并写入消息长度
+    length := int32(newMsg.Len())
+    binary.BigEndian.PutUint32(lengthPlaceholder, uint32(length))
+    copy(newMsg.Bytes()[:4], lengthPlaceholder)
+
+    return newMsg.Bytes(), nil
 }
