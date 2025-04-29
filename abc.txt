@@ -4,7 +4,6 @@ import (
     "bufio"
     "bytes"
     "crypto/md5"
-    "crypto/tls"
     "encoding/binary"
     "encoding/hex"
     "encoding/json"
@@ -48,7 +47,13 @@ func (cc *ConnectionConfig) SetConfig(hostname string, port int, username, passw
 func (cc *ConnectionConfig) GetConfig() ConnParams {
     cc.mu.RLock()
     defer cc.mu.RUnlock()
-    return ConnParams{Hostname: cc.hostname, Port: cc.port, Username: cc.username, Password: cc.password, Database: cc.databaseName}
+    return ConnParams{
+        Hostname: cc.hostname,
+        Port:     cc.port,
+        Username: cc.username,
+        Password: cc.password,
+        Database: cc.databaseName,
+    }
 }
 
 // Config 定义代理和 API 服务地址及连接池参数
@@ -120,7 +125,6 @@ func (p *ConnPool) Reset() {
     p.draining = false
 }
 
-// 全局变量：双池管理
 var (
     connConfig = &ConnectionConfig{}
     cfg        = Config{
@@ -148,7 +152,6 @@ func rotatePools() {
 }
 
 func main() {
-    // 初始化配置与连接池
     connConfig.SetConfig("postgres", 5432, "postgres", "initial_password", "mydb")
     activePool = newPool(connConfig, cfg.PoolSize)
 
@@ -204,20 +207,10 @@ func startProxyServer() {
     }
 }
 
-// handleClient 处理客户端连接：SSL 检测 + Startup/Auth
+// handleClient 处理客户端连接：Startup/Auth 转发
 func handleClient(clientConn net.Conn) {
     defer clientConn.Close()
-    buf := bufio.NewReader(clientConn)
-
-    // 读取首个 8 字节：可能是 SSLRequest 或 Startup header
-    header8 := make([]byte, 8)
-    if _, err := io.ReadFull(buf, header8); err != nil {
-        log.Printf("Failed to read initial 8 bytes: %v", err)
-        return
-    }
-    isSSL := binary.BigEndian.Uint32(header8[:4]) == 8 && binary.BigEndian.Uint32(header8[4:]) == 80877103
-
-    // 获取后端连接
+    // 直接获取后端连接
     poolMu.Lock()
     p := activePool
     poolMu.Unlock()
@@ -228,63 +221,24 @@ func handleClient(clientConn net.Conn) {
     }
     defer p.Put(serverConn)
 
-    if isSSL {
-        // 转发 SSLRequest
-        serverConn.Write(header8)
-        reply := make([]byte, 1)
-        _, err := io.ReadFull(serverConn, reply)
-        if err != nil {
-            log.Printf("Read SSL reply failed, fallback to non-SSL: %v", err)
-            // 将 header8 回插到 buf，后续作为 Startup header 处理
-            buf = bufio.NewReader(io.MultiReader(bytes.NewReader(header8), buf))
-        } else {
-            clientConn.Write(reply)
-            if reply[0] == 'S' {
-                // 仅当支持 SSL 时做 TLS 握手
-                tlsCfg := &tls.Config{InsecureSkipVerify: true}
-                clientTLS := tls.Server(clientConn, tlsCfg)
-                if err := clientTLS.Handshake(); err != nil {
-                    log.Printf("Client TLS handshake failed: %v", err)
-                    return
-                }
-                serverTLS := tls.Client(serverConn, tlsCfg)
-                if err := serverTLS.Handshake(); err != nil {
-                    log.Printf("Server TLS handshake failed: %v", err)
-                    return
-                }
-                clientConn = clientTLS
-                serverConn = serverTLS
-                buf = bufio.NewReader(clientConn)
-            } else {
-                // 后端不支持 SSL，同样回插 header8
-                buf = bufio.NewReader(io.MultiReader(bytes.NewReader(header8), buf))
-            }
-        }
-    } else {
-        // 非 SSL，将 header8 当作 Startup header 推入 buf
-        buf = bufio.NewReader(io.MultiReader(bytes.NewReader(header8), buf))
-    }
-
+    buf := bufio.NewReader(clientConn)
     // 读取并修改 StartupMessage
-    startupMsg, err := readStartupMessage(buf)
+    skb, err := readStartupMessage(buf)
     if err != nil {
         log.Printf("readStartupMessage error: %v", err)
         return
     }
-    proxyPwd := startupMsg.Parameters["password"]
-    delete(startupMsg.Parameters, "password")
+    proxyPwd := skb.Parameters["password"]
+    delete(skb.Parameters, "password")
     params := connConfig.GetConfig()
-    startupMsg.Parameters["user"] = params.Username
-    startupMsg.Parameters["database"] = params.Database
-    modified, err := serializeStartup(startupMsg)
+    skb.Parameters["user"] = params.Username
+    skb.Parameters["database"] = params.Database
+    data, err := serializeStartup(skb)
     if err != nil {
         log.Printf("serializeStartup error: %v", err)
         return
     }
-    if _, err := serverConn.Write(modified); err != nil {
-        log.Printf("Write modified startup failed: %v", err)
-        return
-    }
+    serverConn.Write(data)
 
     // 认证中继
     if err := handleAuth(serverConn, clientConn, params.Username, params.Password, proxyPwd); err != nil {
@@ -297,7 +251,7 @@ func handleClient(clientConn net.Conn) {
     io.Copy(clientConn, serverConn)
 }
 
-// handleAuth 认证中继：db 用户认证 + 代理密码校验
+// handleAuth 认证中继：支持 Cleartext/MD5/SCRAM
 func handleAuth(serverConn, clientConn net.Conn, user, dbPwd, proxyPwd string) error {
     for {
         var t [1]byte
@@ -309,10 +263,13 @@ func handleAuth(serverConn, clientConn net.Conn, user, dbPwd, proxyPwd string) e
             return err
         }
         length := binary.BigEndian.Uint32(lenb[:])
-        payload := make([]byte, length-4)
-        if length > 4 {
-            io.ReadFull(serverConn, payload)
+        payload := make([]byte, length)
+        if length > 0 {
+            if _, err := io.ReadFull(serverConn, payload); err != nil {
+                return err
+            }
         }
+        // 转发到客户端
         clientConn.Write(t[:]); clientConn.Write(lenb[:]); clientConn.Write(payload)
         if t[0] != 'R' {
             continue
@@ -325,7 +282,6 @@ func handleAuth(serverConn, clientConn net.Conn, user, dbPwd, proxyPwd string) e
             if proxyPwd != cfg.ProxyAuthPassword {
                 return fmt.Errorf("invalid proxy auth password")
             }
-            // 读取并忽略客户端密码消息
             var tag [1]byte; io.ReadFull(clientConn, tag[:])
             var plenb2 [4]byte; io.ReadFull(clientConn, plenb2[:])
             plen := binary.BigEndian.Uint32(plenb2[:]); pwdBytes := make([]byte, plen-4)
