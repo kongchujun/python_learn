@@ -4,6 +4,7 @@ import (
     "bufio"
     "bytes"
     "crypto/md5"
+    "crypto/tls"
     "encoding/binary"
     "encoding/hex"
     "encoding/json"
@@ -15,7 +16,7 @@ import (
     "sync"
 )
 
-// ConnectionConfig 存储 PostgreSQL 连接参数，支持并发安全读写
+// ConnectionConfig safely holds backend PostgreSQL connection parameters
 type ConnectionConfig struct {
     hostname     string
     port         int
@@ -25,13 +26,11 @@ type ConnectionConfig struct {
     mu           sync.RWMutex
 }
 
-// ConnParams 用于传递配置数据
 type ConnParams struct {
     Hostname, Username, Password, Database string
     Port                                    int
 }
 
-// SetConfig 更新连接配置
 func (cc *ConnectionConfig) SetConfig(hostname string, port int, username, password, databaseName string) {
     cc.mu.Lock()
     defer cc.mu.Unlock()
@@ -40,10 +39,9 @@ func (cc *ConnectionConfig) SetConfig(hostname string, port int, username, passw
     cc.username = username
     cc.password = password
     cc.databaseName = databaseName
-    log.Printf("Connection config updated: %s:%d user=%s db=%s", hostname, port, username, databaseName)
+    log.Printf("Config updated: %s:%d user=%s db=%s", hostname, port, username, databaseName)
 }
 
-// GetConfig 返回当前连接参数
 func (cc *ConnectionConfig) GetConfig() ConnParams {
     cc.mu.RLock()
     defer cc.mu.RUnlock()
@@ -56,23 +54,25 @@ func (cc *ConnectionConfig) GetConfig() ConnParams {
     }
 }
 
-// Config 定义代理和 API 服务地址及连接池参数
+// Config holds proxy/API addresses, pool settings and TLS files
 type Config struct {
-    ProxyListenAddr   string // 代理监听地址
-    APIListenAddr     string // API 监听地址
-    APIPasswordUpdate string // 更新配置 API 路径
-    PoolSize          int    // 连接池大小
-    ProxyAuthPassword string // 代理访问校验密码
+    ProxyListenAddr   string
+    APIListenAddr     string
+    APIPasswordUpdate string
+    PoolSize          int
+    ProxyAuthPassword string
+    TLSCertFile       string
+    TLSKeyFile        string
 }
 
-// StartupMessage 表示 PostgreSQL 启动包
+// StartupMessage is a parsed PostgreSQL startup packet
 type StartupMessage struct {
     ProtocolVersion int32
     Parameters      map[string]string
     Raw             []byte
 }
 
-// ConnPool 后端连接池，支持主动清空机制
+// ConnPool manages backend TCP connections with reset capability
 type ConnPool struct {
     cc       *ConnectionConfig
     pool     chan net.Conn
@@ -81,12 +81,10 @@ type ConnPool struct {
     mu       sync.Mutex
 }
 
-// newPool 创建连接池
 func newPool(cc *ConnectionConfig, size int) *ConnPool {
     return &ConnPool{cc: cc, pool: make(chan net.Conn, size), size: size}
 }
 
-// Get 从池中获取连接，池空则新建
 func (p *ConnPool) Get() (net.Conn, error) {
     select {
     case conn := <-p.pool:
@@ -97,7 +95,6 @@ func (p *ConnPool) Get() (net.Conn, error) {
     }
 }
 
-// Put 将连接归还池中，draining 时关闭
 func (p *ConnPool) Put(conn net.Conn) {
     p.mu.Lock()
     defer p.mu.Unlock()
@@ -112,7 +109,6 @@ func (p *ConnPool) Put(conn net.Conn) {
     }
 }
 
-// Reset 主动清空空闲连接，并重建 channel
 func (p *ConnPool) Reset() {
     p.mu.Lock()
     defer p.mu.Unlock()
@@ -133,13 +129,15 @@ var (
         APIPasswordUpdate: "/update-password",
         PoolSize:          10,
         ProxyAuthPassword: "pwd_postgres",
+        TLSCertFile:       "server.crt",
+        TLSKeyFile:        "server.key",
     }
     activePool *ConnPool
     oldPool    *ConnPool
     poolMu     sync.Mutex
+    tlsConfig  *tls.Config
 )
 
-// rotatePools 切换到新池并重置旧池
 func rotatePools() {
     poolMu.Lock()
     defer poolMu.Unlock()
@@ -152,6 +150,14 @@ func rotatePools() {
 }
 
 func main() {
+    // load TLS certificate for SSL proxying
+    cert, err := tls.LoadX509KeyPair(cfg.TLSCertFile, cfg.TLSKeyFile)
+    if err != nil {
+        log.Fatalf("Failed to load TLS certificate: %v", err)
+    }
+    tlsConfig = &tls.Config{Certificates: []tls.Certificate{cert}}
+
+    // initial backend config
     connConfig.SetConfig("postgres", 5432, "postgres", "initial_password", "mydb")
     activePool = newPool(connConfig, cfg.PoolSize)
 
@@ -159,7 +165,6 @@ func main() {
     startProxyServer()
 }
 
-// startAPIServer 提供 HTTP 接口，更新配置并切换池
 func startAPIServer() {
     http.HandleFunc(cfg.APIPasswordUpdate, func(w http.ResponseWriter, r *http.Request) {
         if r.Method != http.MethodPost {
@@ -190,7 +195,6 @@ func startAPIServer() {
     log.Fatal(http.ListenAndServe(cfg.APIListenAddr, nil))
 }
 
-// startProxyServer 启动 TCP 代理
 func startProxyServer() {
     ln, err := net.Listen("tcp", cfg.ProxyListenAddr)
     if err != nil {
@@ -207,10 +211,10 @@ func startProxyServer() {
     }
 }
 
-// handleClient 处理客户端连接：Startup/Auth 转发
 func handleClient(clientConn net.Conn) {
     defer clientConn.Close()
-    // 直接获取后端连接
+
+    // get a backend connection from pool
     poolMu.Lock()
     p := activePool
     poolMu.Unlock()
@@ -222,7 +226,52 @@ func handleClient(clientConn net.Conn) {
     defer p.Put(serverConn)
 
     buf := bufio.NewReader(clientConn)
-    // 读取并修改 StartupMessage
+
+    // SSLRequest intercept
+    header, err := buf.Peek(8)
+    if err != nil {
+        log.Printf("peek error: %v", err)
+        return
+    }
+    length := binary.BigEndian.Uint32(header[0:4])
+    proto := binary.BigEndian.Uint32(header[4:8])
+    if length == 8 && proto == 80877103 {
+        // consume SSLRequest
+        buf.Discard(8)
+        // forward to backend
+        if _, err := serverConn.Write(header); err != nil {
+            log.Printf("forward SSLRequest: %v", err)
+            return
+        }
+        // read response ('S' or 'N')
+        var resp [1]byte
+        if _, err := io.ReadFull(serverConn, resp[:]); err != nil {
+            log.Printf("read SSL response: %v", err)
+            return
+        }
+        clientConn.Write(resp[:])
+
+        if resp[0] == 'S' {
+            // upgrade client connection to TLS
+            clientTLS := tls.Server(clientConn, tlsConfig)
+            if err := clientTLS.Handshake(); err != nil {
+                log.Printf("client TLS handshake failed: %v", err)
+                return
+            }
+            clientConn = clientTLS
+            buf = bufio.NewReader(clientConn)
+
+            // upgrade backend connection to TLS (skip verification)
+            serverTLS := tls.Client(serverConn, &tls.Config{InsecureSkipVerify: true})
+            if err := serverTLS.Handshake(); err != nil {
+                log.Printf("backend TLS handshake failed: %v", err)
+                return
+            }
+            serverConn = serverTLS
+        }
+    }
+
+    // read and rewrite StartupMessage
     skb, err := readStartupMessage(buf)
     if err != nil {
         log.Printf("readStartupMessage error: %v", err)
@@ -240,18 +289,17 @@ func handleClient(clientConn net.Conn) {
     }
     serverConn.Write(data)
 
-    // 认证中继
+    // authentication relay
     if err := handleAuth(serverConn, clientConn, params.Username, params.Password, proxyPwd); err != nil {
         log.Printf("authentication error: %v", err)
         return
     }
 
-    // 转发剩余流量
+    // data proxying
     go io.Copy(serverConn, buf)
     io.Copy(clientConn, serverConn)
 }
 
-// handleAuth 认证中继：支持 Cleartext/MD5/SCRAM
 func handleAuth(serverConn, clientConn net.Conn, user, dbPwd, proxyPwd string) error {
     for {
         var t [1]byte
@@ -269,7 +317,7 @@ func handleAuth(serverConn, clientConn net.Conn, user, dbPwd, proxyPwd string) e
                 return err
             }
         }
-        // 转发到客户端
+        // relay to client
         clientConn.Write(t[:]); clientConn.Write(lenb[:]); clientConn.Write(payload)
         if t[0] != 'R' {
             continue
@@ -279,26 +327,29 @@ func handleAuth(serverConn, clientConn net.Conn, user, dbPwd, proxyPwd string) e
         case 0:
             return nil
         case 3:
+            // Cleartext
             if proxyPwd != cfg.ProxyAuthPassword {
                 return fmt.Errorf("invalid proxy auth password")
             }
+            // read client password message, then send backend password
             var tag [1]byte; io.ReadFull(clientConn, tag[:])
             var plenb2 [4]byte; io.ReadFull(clientConn, plenb2[:])
             plen := binary.BigEndian.Uint32(plenb2[:]); pwdBytes := make([]byte, plen-4)
             io.ReadFull(clientConn, pwdBytes)
             sendPasswordMsg(serverConn, dbPwd)
         case 5:
+            // MD5
             salt := payload[4:8]
             sendPasswordMsg(serverConn, md5Password(dbPwd, user, salt))
         case 10:
-            return nil
+            // SCRAM: just continue relaying until AuthenticationOk
+            continue
         default:
             return fmt.Errorf("unsupported auth type %d", authType)
         }
     }
 }
 
-// sendPasswordMsg 构造并发送 PasswordMessage
 func sendPasswordMsg(conn net.Conn, pwd string) error {
     data := []byte(pwd)
     length := int32(len(data) + 5)
@@ -310,34 +361,46 @@ func sendPasswordMsg(conn net.Conn, pwd string) error {
     return err
 }
 
-// readStartupMessage 解析 StartupMessage
 func readStartupMessage(r *bufio.Reader) (*StartupMessage, error) {
     header := make([]byte, 8)
     if _, err := io.ReadFull(r, header); err != nil {
         return nil, err
     }
     length := int(binary.BigEndian.Uint32(header[:4]))
+    if length < 8 {
+        return nil, fmt.Errorf("invalid startup message length: %d", length)
+    }
     body := make([]byte, length-8)
     if _, err := io.ReadFull(r, body); err != nil {
         return nil, err
     }
-    params, _ := parseParameters(body[4:])
     version := int32(binary.BigEndian.Uint32(header[4:8]))
+    var params map[string]string
+    if len(body) > 4 {
+        params, _ = parseParameters(body[4:])
+    } else {
+        params = make(map[string]string)
+    }
     return &StartupMessage{ProtocolVersion: version, Parameters: params, Raw: append(header, body...)}, nil
 }
 
-// parseParameters 解析 key=value 列表
 func parseParameters(data []byte) (map[string]string, error) {
     m := make(map[string]string)
     i := 0
     for i < len(data) {
         j := bytes.IndexByte(data[i:], 0)
-        if j < 0 { break }
+        if j < 0 {
+            break
+        }
         key := string(data[i : i+j])
         i += j + 1
-        if key == "" { break }
+        if key == "" {
+            break
+        }
         k := bytes.IndexByte(data[i:], 0)
-        if k < 0 { break }
+        if k < 0 {
+            break
+        }
         val := string(data[i : i+k])
         i += k + 1
         m[key] = val
@@ -345,7 +408,6 @@ func parseParameters(data []byte) (map[string]string, error) {
     return m, nil
 }
 
-// serializeStartup 重建 StartupMessage
 func serializeStartup(msg *StartupMessage) ([]byte, error) {
     var buf bytes.Buffer
     buf.Write([]byte{0, 0, 0, 0})
@@ -360,7 +422,6 @@ func serializeStartup(msg *StartupMessage) ([]byte, error) {
     return buf.Bytes(), nil
 }
 
-// md5Password 生成 PostgreSQL MD5 密码散列
 func md5Password(password, user string, salt []byte) string {
     h1 := md5.New()
     h1.Write([]byte(password + user))
