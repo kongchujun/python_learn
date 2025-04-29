@@ -4,7 +4,6 @@ import (
     "bufio"
     "bytes"
     "crypto/md5"
-    "crypto/tls"
     "encoding/binary"
     "encoding/hex"
     "encoding/json"
@@ -54,15 +53,13 @@ func (cc *ConnectionConfig) GetConfig() ConnParams {
     }
 }
 
-// Config holds proxy/API addresses, pool settings and TLS files
+// Config holds proxy/API addresses and pool settings
 type Config struct {
     ProxyListenAddr   string
     APIListenAddr     string
     APIPasswordUpdate string
     PoolSize          int
     ProxyAuthPassword string
-    TLSCertFile       string
-    TLSKeyFile        string
 }
 
 // StartupMessage is a parsed PostgreSQL startup packet
@@ -129,13 +126,10 @@ var (
         APIPasswordUpdate: "/update-password",
         PoolSize:          10,
         ProxyAuthPassword: "pwd_postgres",
-        TLSCertFile:       "server.crt",
-        TLSKeyFile:        "server.key",
     }
     activePool *ConnPool
     oldPool    *ConnPool
     poolMu     sync.Mutex
-    tlsConfig  *tls.Config
 )
 
 func rotatePools() {
@@ -150,13 +144,6 @@ func rotatePools() {
 }
 
 func main() {
-    // load TLS certificate for SSL proxying
-    cert, err := tls.LoadX509KeyPair(cfg.TLSCertFile, cfg.TLSKeyFile)
-    if err != nil {
-        log.Fatalf("Failed to load TLS certificate: %v", err)
-    }
-    tlsConfig = &tls.Config{Certificates: []tls.Certificate{cert}}
-
     // initial backend config
     connConfig.SetConfig("postgres", 5432, "postgres", "initial_password", "mydb")
     activePool = newPool(connConfig, cfg.PoolSize)
@@ -214,20 +201,9 @@ func startProxyServer() {
 func handleClient(clientConn net.Conn) {
     defer clientConn.Close()
 
-    // get a backend connection from pool
-    poolMu.Lock()
-    p := activePool
-    poolMu.Unlock()
-    serverConn, err := p.Get()
-    if err != nil {
-        log.Printf("Get backend conn failed: %v", err)
-        return
-    }
-    defer p.Put(serverConn)
-
     buf := bufio.NewReader(clientConn)
 
-    // SSLRequest intercept
+    // SSLRequest: reject so client falls back to plaintext
     header, err := buf.Peek(8)
     if err != nil {
         log.Printf("peek error: %v", err)
@@ -238,38 +214,24 @@ func handleClient(clientConn net.Conn) {
     if length == 8 && proto == 80877103 {
         // consume SSLRequest
         buf.Discard(8)
-        // forward to backend
-        if _, err := serverConn.Write(header); err != nil {
-            log.Printf("forward SSLRequest: %v", err)
+        // respond 'N' (no SSL)
+        if _, err := clientConn.Write([]byte{'N'}); err != nil {
+            log.Printf("write SSL reject: %v", err)
             return
         }
-        // read response ('S' or 'N')
-        var resp [1]byte
-        if _, err := io.ReadFull(serverConn, resp[:]); err != nil {
-            log.Printf("read SSL response: %v", err)
-            return
-        }
-        clientConn.Write(resp[:])
-
-        if resp[0] == 'S' {
-            // upgrade client connection to TLS
-            clientTLS := tls.Server(clientConn, tlsConfig)
-            if err := clientTLS.Handshake(); err != nil {
-                log.Printf("client TLS handshake failed: %v", err)
-                return
-            }
-            clientConn = clientTLS
-            buf = bufio.NewReader(clientConn)
-
-            // upgrade backend connection to TLS (skip verification)
-            serverTLS := tls.Client(serverConn, &tls.Config{InsecureSkipVerify: true})
-            if err := serverTLS.Handshake(); err != nil {
-                log.Printf("backend TLS handshake failed: %v", err)
-                return
-            }
-            serverConn = serverTLS
-        }
+        // continue to read StartupMessage in plaintext
     }
+
+    // get backend connection
+    poolMu.Lock()
+    p := activePool
+    poolMu.Unlock()
+    serverConn, err := p.Get()
+    if err != nil {
+        log.Printf("Get backend conn failed: %v", err)
+        return
+    }
+    defer p.Put(serverConn)
 
     // read and rewrite StartupMessage
     skb, err := readStartupMessage(buf)
@@ -331,18 +293,17 @@ func handleAuth(serverConn, clientConn net.Conn, user, dbPwd, proxyPwd string) e
             if proxyPwd != cfg.ProxyAuthPassword {
                 return fmt.Errorf("invalid proxy auth password")
             }
-            // read client password message, then send backend password
+            // read client password message
             var tag [1]byte; io.ReadFull(clientConn, tag[:])
             var plenb2 [4]byte; io.ReadFull(clientConn, plenb2[:])
             plen := binary.BigEndian.Uint32(plenb2[:]); pwdBytes := make([]byte, plen-4)
             io.ReadFull(clientConn, pwdBytes)
             sendPasswordMsg(serverConn, dbPwd)
         case 5:
-            // MD5
             salt := payload[4:8]
             sendPasswordMsg(serverConn, md5Password(dbPwd, user, salt))
         case 10:
-            // SCRAM: just continue relaying until AuthenticationOk
+            // SCRAM: continue relaying until AuthenticationOk
             continue
         default:
             return fmt.Errorf("unsupported auth type %d", authType)
