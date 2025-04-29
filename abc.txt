@@ -256,28 +256,39 @@ func proxySSL(clientConn net.Conn, buf *bufio.Reader, head []byte) {
     proxyStartupAuth(buf, clientConn, serverConn)
 }
 
-// proxyStartupAuth 解析并校验客户端密码，然后转发给后端
+// proxyStartupAuth 代理 StartupMessage，然后在 handleAuth 中进行密码校验并转发给后端
 func proxyStartupAuth(buf *bufio.Reader, clientConn, serverConn net.Conn) {
+    // 1. 读取并解析客户端 StartupMessage
     msg, err := readStartupMessage(buf)
     if err != nil {
         log.Printf("Startup read error: %v", err)
         return
     }
-    // 校验用户提交的 proxy 密码
-    if pwd, ok := msg.Parameters["password"]; !ok || pwd != cfg.ProxyAuthPassword {
-        log.Printf("Invalid proxy password")
-        return
-    }
+    // 2. 删除客户端可能带来的私有字段（如 proxy 参数），避免泄露给后端
     delete(msg.Parameters, "password")
 
+    // 3. 替换为后端真实用户和数据库
     params := connConfig.GetConfig()
     msg.Parameters["user"] = params.Username
     msg.Parameters["database"] = params.Database
+
+    // 4. 序列化并发送给后端
     data, _ := serializeStartup(msg)
-    serverConn.Write(data)
-    handleAuth(serverConn, clientConn, params.Username, params.Password)
+    if _, err := serverConn.Write(data); err != nil {
+        log.Printf("Failed to write startup to backend: %v", err)
+        return
+    }
+
+    // 5. 在 handleAuth 里完成代理密码校验和后端认证流
+    if err := handleAuth(serverConn, clientConn, params.Username, params.Password); err != nil {
+        log.Printf("authentication error: %v", err)
+        return
+    }
+
+    // 6. 双向转发剩余流量
     go io.Copy(serverConn, buf)
     io.Copy(clientConn, serverConn)
+}
 }
 
 // readStartupMessage 解析 StartupMessage
