@@ -3,7 +3,7 @@ func handleClient(clientConn net.Conn) {
     defer clientConn.Close()
     buf := bufio.NewReader(clientConn)
 
-    // 读取首个 8 字节：可能是 SSLRequest 或 Startup header
+    // 读取首个 8 字节
     header8 := make([]byte, 8)
     if _, err := io.ReadFull(buf, header8); err != nil {
         log.Printf("Failed to read initial 8 bytes: %v", err)
@@ -26,49 +26,21 @@ func handleClient(clientConn net.Conn) {
         // 转发 SSLRequest
         serverConn.Write(header8)
         reply := make([]byte, 1)
-        n, err := io.ReadFull(serverConn, reply)
-        if err != nil || n != 1 {
-            log.Printf("Read SSL reply failed, fallback to plaintext: %v", err)
-            // 将 header8 回插到 buf，后续作为 Startup header 处理
+        if _, err := io.ReadFull(serverConn, reply); err != nil {
+            log.Printf("Read SSL reply failed: %v", err)
             buf = bufio.NewReader(io.MultiReader(bytes.NewReader(header8), buf))
         } else {
             clientConn.Write(reply)
             if reply[0] == 'S' {
-                // 后端支持 SSL，透明转发 TLS 流量，不在此终止TLS
-                log.Printf("Proxying SSL/TLS traffic transparently")
+                // 透明转发 TLS
                 go io.Copy(serverConn, clientConn)
                 io.Copy(clientConn, serverConn)
                 return
             } else {
-                // 后端不支持 SSL，回插 header8
                 buf = bufio.NewReader(io.MultiReader(bytes.NewReader(header8), buf))
             }
         }
     } else {
-            clientConn.Write(reply)
-            if reply[0] == 'S' {
-                // 仅当支持 SSL 时做 TLS 握手
-                tlsCfg := &tls.Config{InsecureSkipVerify: true}
-                clientTLS := tls.Server(clientConn, tlsCfg)
-                if err := clientTLS.Handshake(); err != nil {
-                    log.Printf("Client TLS handshake failed: %v", err)
-                    return
-                }
-                serverTLS := tls.Client(serverConn, tlsCfg)
-                if err := serverTLS.Handshake(); err != nil {
-                    log.Printf("Server TLS handshake failed: %v", err)
-                    return
-                }
-                clientConn = clientTLS
-                serverConn = serverTLS
-                buf = bufio.NewReader(clientConn)
-            } else {
-                // 后端不支持 SSL，同样回插 header8
-                buf = bufio.NewReader(io.MultiReader(bytes.NewReader(header8), buf))
-            }
-        }
-    } else {
-        // 非 SSL，将 header8 当作 Startup header 推入 buf
         buf = bufio.NewReader(io.MultiReader(bytes.NewReader(header8), buf))
     }
 
