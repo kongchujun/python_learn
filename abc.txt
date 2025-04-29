@@ -209,7 +209,14 @@ func handleClient(clientConn net.Conn) {
     defer clientConn.Close()
     buf := bufio.NewReader(clientConn)
 
+    // 先 Peek 看客户端是否发送了启动消息或 SSLRequest
+    head, err := buf.Peek(8)
+    if err != nil {
+        log.Printf("Failed to peek startup/SSLRequest: %v", err)
+        return
+    }
     // 检测 SSLRequest
+
     head, err := buf.Peek(8)
     if err == nil && binary.BigEndian.Uint32(head[:4]) == 8 && binary.BigEndian.Uint32(head[4:]) == 80877103 {
         buf.Discard(8)
