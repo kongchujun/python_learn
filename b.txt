@@ -1,77 +1,23 @@
-// handleClient 处理客户端连接：SSL 检测 + Startup/Auth
-func handleClient(clientConn net.Conn) {
-    defer clientConn.Close()
-    buf := bufio.NewReader(clientConn)
-
-    // 读取首个 8 字节
-    header8 := make([]byte, 8)
-    if _, err := io.ReadFull(buf, header8); err != nil {
-        log.Printf("Failed to read initial 8 bytes: %v", err)
-        return
+// readStartupMessage 解析 StartupMessage
+func readStartupMessage(r *bufio.Reader) (*StartupMessage, error) {
+    header := make([]byte, 8)
+    if _, err := io.ReadFull(r, header); err != nil {
+        return nil, err
     }
-    isSSL := binary.BigEndian.Uint32(header8[:4]) == 8 && binary.BigEndian.Uint32(header8[4:]) == 80877103
-
-    // 获取后端连接
-    poolMu.Lock()
-    p := activePool
-    poolMu.Unlock()
-    serverConn, err := p.Get()
-    if err != nil {
-        log.Printf("Get backend conn failed: %v", err)
-        return
+    length := int(binary.BigEndian.Uint32(header[:4]))
+    if length < 8 {
+        return nil, fmt.Errorf("invalid startup message length: %d", length)
     }
-    defer p.Put(serverConn)
-
-    if isSSL {
-        // 转发 SSLRequest
-        serverConn.Write(header8)
-        reply := make([]byte, 1)
-        if _, err := io.ReadFull(serverConn, reply); err != nil {
-            log.Printf("Read SSL reply failed: %v", err)
-            buf = bufio.NewReader(io.MultiReader(bytes.NewReader(header8), buf))
-        } else {
-            clientConn.Write(reply)
-            if reply[0] == 'S' {
-                // 透明转发 TLS
-                go io.Copy(serverConn, clientConn)
-                io.Copy(clientConn, serverConn)
-                return
-            } else {
-                buf = bufio.NewReader(io.MultiReader(bytes.NewReader(header8), buf))
-            }
-        }
+    body := make([]byte, length-8)
+    if _, err := io.ReadFull(r, body); err != nil {
+        return nil, err
+    }
+    version := int32(binary.BigEndian.Uint32(header[4:8]))
+    var params map[string]string
+    if len(body) > 4 {
+        params, _ = parseParameters(body[4:])
     } else {
-        buf = bufio.NewReader(io.MultiReader(bytes.NewReader(header8), buf))
+        params = make(map[string]string)
     }
-
-    // 读取并修改 StartupMessage
-    startupMsg, err := readStartupMessage(buf)
-    if err != nil {
-        log.Printf("readStartupMessage error: %v", err)
-        return
-    }
-    proxyPwd := startupMsg.Parameters["password"]
-    delete(startupMsg.Parameters, "password")
-    params := connConfig.GetConfig()
-    startupMsg.Parameters["user"] = params.Username
-    startupMsg.Parameters["database"] = params.Database
-    modified, err := serializeStartup(startupMsg)
-    if err != nil {
-        log.Printf("serializeStartup error: %v", err)
-        return
-    }
-    if _, err := serverConn.Write(modified); err != nil {
-        log.Printf("Write modified startup failed: %v", err)
-        return
-    }
-
-    // 认证中继
-    if err := handleAuth(serverConn, clientConn, params.Username, params.Password, proxyPwd); err != nil {
-        log.Printf("authentication error: %v", err)
-        return
-    }
-
-    // 转发剩余流量
-    go io.Copy(serverConn, buf)
-    io.Copy(clientConn, serverConn)
+    return &StartupMessage{ProtocolVersion: version, Parameters: params, Raw: append(header, body...)}, nil{ProtocolVersion: version, Parameters: params, Raw: append(header, body...)}, nil
 }
