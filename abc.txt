@@ -209,16 +209,13 @@ func handleClient(clientConn net.Conn) {
     defer clientConn.Close()
     buf := bufio.NewReader(clientConn)
 
-    // 先 Peek 看客户端是否发送了启动消息或 SSLRequest
+    // 检测 SSLRequest 或 StartupMessage
     head, err := buf.Peek(8)
     if err != nil {
         log.Printf("Failed to peek startup/SSLRequest: %v", err)
         return
     }
-    // 检测 SSLRequest
-
-    head, err := buf.Peek(8)
-    if err == nil && binary.BigEndian.Uint32(head[:4]) == 8 && binary.BigEndian.Uint32(head[4:]) == 80877103 {
+    if binary.BigEndian.Uint32(head[:4]) == 8 && binary.BigEndian.Uint32(head[4:]) == 80877103 {
         buf.Discard(8)
         proxySSL(clientConn, buf, head)
         return
@@ -263,39 +260,27 @@ func proxySSL(clientConn net.Conn, buf *bufio.Reader, head []byte) {
     proxyStartupAuth(buf, clientConn, serverConn)
 }
 
-// proxyStartupAuth 代理 StartupMessage，然后在 handleAuth 中进行密码校验并转发给后端
+// proxyStartupAuth 代理 StartupMessage 并完成认证
 func proxyStartupAuth(buf *bufio.Reader, clientConn, serverConn net.Conn) {
-    // 1. 读取并解析客户端 StartupMessage
     msg, err := readStartupMessage(buf)
     if err != nil {
         log.Printf("Startup read error: %v", err)
         return
     }
-    // 2. 删除客户端可能带来的私有字段（如 proxy 参数），避免泄露给后端
+    // client中Password将用于认证，不在此阶段校验
     delete(msg.Parameters, "password")
 
-    // 3. 替换为后端真实用户和数据库
     params := connConfig.GetConfig()
     msg.Parameters["user"] = params.Username
     msg.Parameters["database"] = params.Database
-
-    // 4. 序列化并发送给后端
     data, _ := serializeStartup(msg)
-    if _, err := serverConn.Write(data); err != nil {
-        log.Printf("Failed to write startup to backend: %v", err)
-        return
-    }
-
-    // 5. 在 handleAuth 里完成代理密码校验和后端认证流
+    serverConn.Write(data)
     if err := handleAuth(serverConn, clientConn, params.Username, params.Password); err != nil {
         log.Printf("authentication error: %v", err)
         return
     }
-
-    // 6. 双向转发剩余流量
     go io.Copy(serverConn, buf)
     io.Copy(clientConn, serverConn)
-}
 }
 
 // readStartupMessage 解析 StartupMessage
