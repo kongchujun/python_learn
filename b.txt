@@ -19,5 +19,5 @@ func readStartupMessage(r *bufio.Reader) (*StartupMessage, error) {
     } else {
         params = make(map[string]string)
     }
-    return &StartupMessage{ProtocolVersion: version, Parameters: params, Raw: append(header, body...)}, nil{ProtocolVersion: version, Parameters: params, Raw: append(header, body...)}, nil
+    return &StartupMessage{ProtocolVersion: version, Parameters: params, Raw: append(header, body...)}, nil
 }
