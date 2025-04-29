@@ -254,7 +254,7 @@ func handleClient(clientConn net.Conn) {
             buf = bufio.NewReader(clientConn)
         }
     } else {
-        // 非 SSL，将 header8 当作 Startup header 推入下一步解析
+        // 非 SSL，将 header8 当作 Startup header 推入 buf
         buf = bufio.NewReader(io.MultiReader(bytes.NewReader(header8), buf))
     }
 
@@ -275,7 +275,7 @@ func handleClient(clientConn net.Conn) {
         return
     }
     if _, err := serverConn.Write(modified); err != nil {
-        log.Printf("Write modified startup to backend failed: %v", err)
+        log.Printf("Write modified startup failed: %v", err)
         return
     }
 
@@ -323,12 +323,9 @@ func handleAuth(serverConn, clientConn net.Conn, user, dbPwd, proxyPwd string) e
             var plenb2 [4]byte; io.ReadFull(clientConn, plenb2[:])
             plen := binary.BigEndian.Uint32(plenb2[:]); pwdBytes := make([]byte, plen-4)
             io.ReadFull(clientConn, pwdBytes)
-            // 向后端发送真实 dbPwd
             sendPasswordMsg(serverConn, dbPwd)
         case 5:
             salt := payload[4:8]
-            // 忽略客户端 MD5 散列
-            // 直接发送真实 dbPwd 散列
             sendPasswordMsg(serverConn, md5Password(dbPwd, user, salt))
         case 10:
             return nil
@@ -338,4 +335,75 @@ func handleAuth(serverConn, clientConn net.Conn, user, dbPwd, proxyPwd string) e
     }
 }
 
-// 以下辅助函数保持不变：sendPasswordMsg, readStartupMessage, parseParameters, serializeStartup, md5Password
+// sendPasswordMsg 构造并发送 PasswordMessage
+func sendPasswordMsg(conn net.Conn, pwd string) error {
+    data := []byte(pwd)
+    length := int32(len(data) + 5)
+    buf := new(bytes.Buffer)
+    buf.WriteByte('p')
+    binary.Write(buf, binary.BigEndian, length)
+    buf.Write(data); buf.WriteByte(0)
+    _, err := conn.Write(buf.Bytes())
+    return err
+}
+
+// readStartupMessage 解析 StartupMessage
+func readStartupMessage(r *bufio.Reader) (*StartupMessage, error) {
+    header := make([]byte, 8)
+    if _, err := io.ReadFull(r, header); err != nil {
+        return nil, err
+    }
+    length := int(binary.BigEndian.Uint32(header[:4]))
+    body := make([]byte, length-8)
+    if _, err := io.ReadFull(r, body); err != nil {
+        return nil, err
+    }
+    params, _ := parseParameters(body[4:])
+    version := int32(binary.BigEndian.Uint32(header[4:8]))
+    return &StartupMessage{ProtocolVersion: version, Parameters: params, Raw: append(header, body...)}, nil
+}
+
+// parseParameters 解析 key=value 列表
+func parseParameters(data []byte) (map[string]string, error) {
+    m := make(map[string]string)
+    i := 0
+    for i < len(data) {
+        j := bytes.IndexByte(data[i:], 0)
+        if j < 0 { break }
+        key := string(data[i : i+j])
+        i += j + 1
+        if key == "" { break }
+        k := bytes.IndexByte(data[i:], 0)
+        if k < 0 { break }
+        val := string(data[i : i+k])
+        i += k + 1
+        m[key] = val
+    }
+    return m, nil
+}
+
+// serializeStartup 重建 StartupMessage
+func serializeStartup(msg *StartupMessage) ([]byte, error) {
+    var buf bytes.Buffer
+    buf.Write([]byte{0, 0, 0, 0})
+    binary.Write(&buf, binary.BigEndian, uint32(msg.ProtocolVersion))
+    for k, v := range msg.Parameters {
+        buf.WriteString(k); buf.WriteByte(0)
+        buf.WriteString(v); buf.WriteByte(0)
+    }
+    buf.WriteByte(0)
+    total := int32(buf.Len())
+    binary.BigEndian.PutUint32(buf.Bytes()[0:4], uint32(total))
+    return buf.Bytes(), nil
+}
+
+// md5Password 生成 PostgreSQL MD5 密码散列
+func md5Password(password, user string, salt []byte) string {
+    h1 := md5.New()
+    h1.Write([]byte(password + user))
+    sum1 := h1.Sum(nil)
+    h2 := md5.New()
+    h2.Write(sum1)
+    h2.Write(salt)
+    return "md5" + hex.EncodeToString(h2.Sum(nil))
+}
