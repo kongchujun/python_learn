@@ -1,299 +1,105 @@
-package main
-
-import (
-    "bufio"
-    "bytes"
-    "encoding/binary"
-    "encoding/json"
-    "fmt"
-    "io"
-    "log"
-    "net"
-    "net/http"
-    "strconv"
-    "sync"
-)
-
-// ConnectionConfig 存储 PostgreSQL 连接参数
-type ConnectionConfig struct {
-    Hostname     string
-    Port         int
-    Username     string
-    Password     string
-    DatabaseName string
-    mu           sync.RWMutex
-}
-
-// SetConfig 更新连接参数
-func (cc *ConnectionConfig) SetConfig(hostname string, port int, username, password, databaseName string) {
-    cc.mu.Lock()
-    defer cc.mu.Unlock()
-    cc.Hostname = hostname
-    cc.Port = port
-    cc.Username = username
-    cc.Password = password
-    cc.DatabaseName = databaseName
-    log.Printf("Connection config updated: hostname=%s, port=%d, username=%s, database=%s", hostname, port, username, databaseName)
-}
-
-// GetConfig 获取当前连接参数
-func (cc *ConnectionConfig) GetConfig() (string, int, string, string, string) {
-    cc.mu.RLock()
-    defer cc.mu.RUnlock()
-    return cc.Hostname, cc.Port, cc.Username, cc.Password, cc.DatabaseName
-}
-
-// GetPostgresAddr 获取 PostgreSQL 地址（hostname:port）
-func (cc *ConnectionConfig) GetPostgresAddr() string {
-    cc.mu.RLock()
-    defer cc.mu.RUnlock()
-    return fmt.Sprintf("%s:%d", cc.Hostname, cc.Port)
-}
-
-// Config 代理配置
-type Config struct {
-    ProxyListenAddr   string // 代理监听地址，如 ":5433"
-    APIListenAddr     string // API 监听地址，如 ":8080"
-    APIPasswordUpdate string // 连接参数更新 API 路径，如 "/update-password"
-}
-
-// StartupMessage 表示解析后的 StartupMessage
-type StartupMessage struct {
-    ProtocolVersion int32             // 协议版本
-    Parameters      map[string]string // 参数键值对
-    Raw             []byte            // 原始字节
-}
-
-func main() {
-    config := Config{
-        ProxyListenAddr:   ":5433",
-        APIListenAddr:     ":8080",
-        APIPasswordUpdate: "/update-password",
-    }
-
-    // 初始化连接配置
-    cc := &ConnectionConfig{
-        Hostname:     "postgres",
-        Port:         5432,
-        Username:     "postgres",
-        Password:     "initial_password",
-        DatabaseName: "mydb",
-    }
-
-    // 启动 HTTP API 服务
-    go startAPIServer(config, cc)
-
-    // 启动代理服务
-    startProxyServer(config, cc)
-}
-
-// startAPIServer 启动 HTTP API 服务
-func startAPIServer(config Config, cc *ConnectionConfig) {
-    http.HandleFunc(config.APIPasswordUpdate, func(w http.ResponseWriter, r *http.Request) {
-        if r.Method != http.MethodPost {
-            http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-            return
-        }
-
-        var req struct {
-            Hostname     string `json:"hostname"`
-            Port         int    `json:"port"`
-            Username     string `json:"username"`
-            Password     string `json:"password"`
-            DatabaseName string `json:"databasename"`
-        }
-        if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-            http.Error(w, "Invalid request body", http.StatusBadRequest)
-            return
-        }
-
-        // 验证参数
-        if req.Hostname == "" || req.Port <= 0 || req.Username == "" || req.Password == "" || req.DatabaseName == "" {
-            http.Error(w, "All fields (hostname, port, username, password, databasename) are required", http.StatusBadRequest)
-            return
-        }
-
-        // 更新连接配置
-        cc.SetConfig(req.Hostname, req.Port, req.Username, req.Password, req.DatabaseName)
-        w.WriteHeader(http.StatusOK)
-        fmt.Fprintf(w, "Connection config updated successfully")
-    })
-
-    log.Printf("API server listening on %s", config.APIListenAddr)
-    if err := http.ListenAndServe(config.APIListenAddr, nil); err != nil {
-        log.Fatalf("API server failed: %v", err)
-    }
-}
-
-// startProxyServer 启动代理服务
-func startProxyServer(config Config, cc *ConnectionConfig) {
-    listener, err := net.Listen("tcp", config.ProxyListenAddr)
-    if err != nil {
-        log.Fatalf("Failed to start proxy server: %v", err)
-    }
-    defer listener.Close()
-
-    log.Printf("Proxy server listening on %s", config.ProxyListenAddr)
-
-    for {
-        clientConn, err := listener.Accept()
-        if err != nil {
-            log.Printf("Failed to accept client connection: %v", err)
-            continue
-        }
-
-        go handleClientConnection(clientConn, cc)
-    }
-}
-
-// handleClientConnection 处理客户端连接
-func handleClientConnection(clientConn net.Conn, cc *ConnectionConfig) {
+// handleClient 处理客户端连接：SSL 检测 + Startup/Auth
+func handleClient(clientConn net.Conn) {
     defer clientConn.Close()
+    buf := bufio.NewReader(clientConn)
 
-    // 获取最新的 PostgreSQL 地址
-    postgresAddr := cc.GetPostgresAddr()
+    // 读取首个 8 字节：可能是 SSLRequest 或 Startup header
+    header8 := make([]byte, 8)
+    if _, err := io.ReadFull(buf, header8); err != nil {
+        log.Printf("Failed to read initial 8 bytes: %v", err)
+        return
+    }
+    isSSL := binary.BigEndian.Uint32(header8[:4]) == 8 && binary.BigEndian.Uint32(header8[4:]) == 80877103
 
-    // 连接到 PostgreSQL 服务
-    serverConn, err := net.Dial("tcp", postgresAddr)
+    // 获取后端连接
+    poolMu.Lock()
+    p := activePool
+    poolMu.Unlock()
+    serverConn, err := p.Get()
     if err != nil {
-        log.Printf("Failed to connect to PostgreSQL (%s): %v", postgresAddr, err)
+        log.Printf("Get backend conn failed: %v", err)
         return
     }
-    defer serverConn.Close()
+    defer p.Put(serverConn)
 
-    // 读取客户端的 StartupMessage
-    clientReader := bufio.NewReader(clientConn)
-    startupMsg, err := readStartupMessage(clientReader)
+    if isSSL {
+        // 转发 SSLRequest
+        serverConn.Write(header8)
+        reply := make([]byte, 1)
+        n, err := io.ReadFull(serverConn, reply)
+        if err != nil || n != 1 {
+            log.Printf("Read SSL reply failed, fallback to plaintext: %v", err)
+            // 将 header8 回插到 buf，后续作为 Startup header 处理
+            buf = bufio.NewReader(io.MultiReader(bytes.NewReader(header8), buf))
+        } else {
+            clientConn.Write(reply)
+            if reply[0] == 'S' {
+                // 后端支持 SSL，透明转发 TLS 流量，不在此终止TLS
+                log.Printf("Proxying SSL/TLS traffic transparently")
+                go io.Copy(serverConn, clientConn)
+                io.Copy(clientConn, serverConn)
+                return
+            } else {
+                // 后端不支持 SSL，回插 header8
+                buf = bufio.NewReader(io.MultiReader(bytes.NewReader(header8), buf))
+            }
+        }
+    } else {
+            clientConn.Write(reply)
+            if reply[0] == 'S' {
+                // 仅当支持 SSL 时做 TLS 握手
+                tlsCfg := &tls.Config{InsecureSkipVerify: true}
+                clientTLS := tls.Server(clientConn, tlsCfg)
+                if err := clientTLS.Handshake(); err != nil {
+                    log.Printf("Client TLS handshake failed: %v", err)
+                    return
+                }
+                serverTLS := tls.Client(serverConn, tlsCfg)
+                if err := serverTLS.Handshake(); err != nil {
+                    log.Printf("Server TLS handshake failed: %v", err)
+                    return
+                }
+                clientConn = clientTLS
+                serverConn = serverTLS
+                buf = bufio.NewReader(clientConn)
+            } else {
+                // 后端不支持 SSL，同样回插 header8
+                buf = bufio.NewReader(io.MultiReader(bytes.NewReader(header8), buf))
+            }
+        }
+    } else {
+        // 非 SSL，将 header8 当作 Startup header 推入 buf
+        buf = bufio.NewReader(io.MultiReader(bytes.NewReader(header8), buf))
+    }
+
+    // 读取并修改 StartupMessage
+    startupMsg, err := readStartupMessage(buf)
     if err != nil {
-        log.Printf("Failed to read startup message: %v", err)
+        log.Printf("readStartupMessage error: %v", err)
         return
     }
-
-    // 获取最新的连接参数
-    _, _, username, password, databaseName := cc.GetConfig()
-
-    // 修改 StartupMessage
-    modifiedMsg, err := modifyStartupMessage(startupMsg, username, password, databaseName)
+    proxyPwd := startupMsg.Parameters["password"]
+    delete(startupMsg.Parameters, "password")
+    params := connConfig.GetConfig()
+    startupMsg.Parameters["user"] = params.Username
+    startupMsg.Parameters["database"] = params.Database
+    modified, err := serializeStartup(startupMsg)
     if err != nil {
-        log.Printf("Failed to modify startup message: %v", err)
+        log.Printf("serializeStartup error: %v", err)
+        return
+    }
+    if _, err := serverConn.Write(modified); err != nil {
+        log.Printf("Write modified startup failed: %v", err)
         return
     }
 
-    // 发送到 PostgreSQL
-    if _, err := serverConn.Write(modifiedMsg); err != nil {
-        log.Printf("Failed to send startup message to PostgreSQL: %v", err)
+    // 认证中继
+    if err := handleAuth(serverConn, clientConn, params.Username, params.Password, proxyPwd); err != nil {
+        log.Printf("authentication error: %v", err)
         return
     }
 
-    // 双向转发后续数据
-    go io.Copy(serverConn, clientReader)
+    // 转发剩余流量
+    go io.Copy(serverConn, buf)
     io.Copy(clientConn, serverConn)
-}
-
-// readStartupMessage 读取并解析 PostgreSQL StartupMessage
-func readStartupMessage(reader *bufio.Reader) (*StartupMessage, error) {
-    // 读取前 8 字节，判断消息类型
-    header := make([]byte, 8)
-    _, err := io.ReadFull(reader, header)
-    if err != nil {
-        return nil, fmt.Errorf("failed to read header: %w", err)
-    }
-
-    // 检查是否为 SSL 请求
-    if bytes.Equal(header, []byte{0x00, 0x00, 0x00, 0x08, 0x04, 0xD2, 0x16, 0x2F}) {
-        return nil, fmt.Errorf("SSL request not supported")
-    }
-
-    // 解析 StartupMessage
-    length := int32(binary.BigEndian.Uint32(header[:4]))
-    if length < 8 {
-        return nil, fmt.Errorf("invalid message length: %d", length)
-    }
-
-    // 读取剩余的消息内容
-    remainingLength := length - 8
-    body := make([]byte, remainingLength)
-    _, err = io.ReadFull(reader, body)
-    if err != nil {
-        return nil, fmt.Errorf("failed to read message body: %w", err)
-    }
-
-    // 合并 header 和 body
-    raw := append(header, body...)
-
-    // 解析协议版本
-    protocolVersion := int32(binary.BigEndian.Uint32(header[4:8]))
-
-    // 解析参数
-    params, err := parseParameters(body[4:])
-    if err != nil {
-        return nil, fmt.Errorf("failed to parse parameters: %w", err)
-    }
-
-    return &StartupMessage{
-        ProtocolVersion: protocolVersion,
-        Parameters:      params,
-        Raw:             raw,
-    }, nil
-}
-
-// parseParameters 解析 StartupMessage 的参数列表
-func parseParameters(data []byte) (map[string]string, error) {
-    params := make(map[string]string)
-    if len(data) == 0 {
-        return params, nil
-    }
-
-    // 参数以 null 终止的字符串对（key=value\0）组成，最后以 \0 结束
-    parts := bytes.Split(data[:len(data)-1], []byte{0})
-    if len(parts)%2 != 0 {
-        return nil, fmt.Errorf("invalid parameter format")
-    }
-
-    for i := 0; i < len(parts); i += 2 {
-        key := string(parts[i])
-        value := string(parts[i+1])
-        params[key] = value
-    }
-
-    return params, nil
-}
-
-// modifyStartupMessage 修改 StartupMessage 中的参数
-func modifyStartupMessage(msg *StartupMessage, username, password, databaseName string) ([]byte, error) {
-    // 更新参数
-    msg.Parameters["user"] = username
-    msg.Parameters["password"] = password
-    msg.Parameters["database"] = databaseName
-
-    // 序列化参数
-    var paramsBuf bytes.Buffer
-    for key, value := range msg.Parameters {
-        paramsBuf.WriteString(key)
-        paramsBuf.WriteByte(0)
-        paramsBuf.WriteString(value)
-        paramsBuf.WriteByte(0)
-    }
-    paramsBuf.WriteByte(0) // 参数列表以 \0 结束
-
-    // 构造新的 StartupMessage
-    var newMsg bytes.Buffer
-    // 写入消息长度（稍后计算）
-    lengthPlaceholder := make([]byte, 4)
-    newMsg.Write(lengthPlaceholder)
-
-    // 写入协议版本
-    var protocolBytes [4]byte
-    binary.BigEndian.PutUint32(protocolBytes[:], uint32(msg.ProtocolVersion))
-    newMsg.Write(protocolBytes[:])
-
-    // 写入参数
-    newMsg.Write(paramsBuf.Bytes())
-
-    // 计算并写入消息长度
-    length := int32(newMsg.Len())
-    binary.BigEndian.PutUint32(lengthPlaceholder, uint32(length))
-    copy(newMsg.Bytes()[:4], lengthPlaceholder)
-
-    return newMsg.Bytes(), nil
 }
