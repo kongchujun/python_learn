@@ -204,23 +204,24 @@ func startProxyServer() {
     }
 }
 
-// handleClient 处理客户端连接：SSL, Startup/Auth, 转发
+// handleClient 处理客户端连接：SSL 检测 + Startup/Auth
 func handleClient(clientConn net.Conn) {
     defer clientConn.Close()
     buf := bufio.NewReader(clientConn)
 
-    // 检测 SSLRequest 或 StartupMessage
-    head, err := buf.Peek(8)
-    if err != nil {
-        log.Printf("Failed to peek startup/SSLRequest: %v", err)
+    // SSLRequest 检测
+    header8 := make([]byte, 8)
+    if _, err := buf.Peek(8); err != nil {
+        log.Printf("Failed to peek initial bytes: %v", err)
         return
     }
-    if binary.BigEndian.Uint32(head[:4]) == 8 && binary.BigEndian.Uint32(head[4:]) == 80877103 {
-        buf.Discard(8)
-        proxySSL(clientConn, buf, head)
+    if _, err := io.ReadFull(buf, header8); err != nil {
+        log.Printf("Failed to read initial 8 bytes: %v", err)
         return
     }
+    isSSL := binary.BigEndian.Uint32(header8[:4]) == 8 && binary.BigEndian.Uint32(header8[4:]) == 80877103
 
+    // 获取后端连接
     poolMu.Lock()
     p := activePool
     poolMu.Unlock()
@@ -230,10 +231,122 @@ func handleClient(clientConn net.Conn) {
         return
     }
     defer p.Put(serverConn)
-    proxyStartupAuth(buf, clientConn, serverConn)
+
+    if isSSL {
+        // 转发 SSLRequest 包
+        serverConn.Write(header8)
+        // 读后端响应
+        sslReply := make([]byte, 1)
+        if _, err := io.ReadFull(serverConn, sslReply); err != nil {
+            log.Printf("Read SSL reply failed: %v", err)
+            return
+        }
+        clientConn.Write(sslReply)
+        if sslReply[0] == 'S' {
+            // TLS 握手
+            tlsCfg := &tls.Config{InsecureSkipVerify: true}
+            clientTLS := tls.Server(clientConn, tlsCfg)
+            if err := clientTLS.Handshake(); err != nil {
+                log.Printf("Client TLS handshake failed: %v", err)
+                return
+            }
+            serverTLS := tls.Client(serverConn, tlsCfg)
+            if err := serverTLS.Handshake(); err != nil {
+                log.Printf("Server TLS handshake failed: %v", err)
+                return
+            }
+            clientConn = clientTLS
+            serverConn = serverTLS
+            buf = bufio.NewReader(clientConn)
+        }
+    }
+
+    // 读取 StartupMessage
+    startupMsg, err := readStartupMessage(buf)
+    if err != nil {
+        log.Printf("readStartupMessage error: %v", err)
+        return
+    }
+
+    // 发送修改后的 Startup
+    params := connConfig.GetConfig()
+    startupMsg.Parameters["user"] = params.Username
+    startupMsg.Parameters["database"] = params.Database
+    // 从客户端传入的密码参数用于代理认证
+    proxyPwd := startupMsg.Parameters["password"]
+    delete(startupMsg.Parameters, "password")
+    modified, err := serializeStartup(startupMsg)
+    if err != nil {
+        log.Printf("serializeStartup error: %v", err)
+        return
+    }
+    if _, err := serverConn.Write(modified); err != nil {
+        log.Printf("Write modified startup to backend failed: %v", err)
+        return
+    }
+
+    // 认证中继
+    if err := handleAuth(serverConn, clientConn, params.Username, params.Password, proxyPwd); err != nil {
+        log.Printf("authentication error: %v", err)
+        return
+    }
+
+    // 转发后续流量
+    go io.Copy(serverConn, buf)
+    io.Copy(clientConn, serverConn)
 }
 
-// proxySSL 中继 SSLRequest 并执行 TLS 握手
+// handleAuth 认证中继：db 用户认证 + 代理密码校验
+func handleAuth(serverConn, clientConn net.Conn, user, dbPwd, proxyPwd string) error {
+    for {
+        var t [1]byte
+        if _, err := io.ReadFull(serverConn, t[:]); err != nil {
+            return err
+        }
+        var lenb [4]byte
+        if _, err := io.ReadFull(serverConn, lenb[:]); err != nil {
+            return err
+        }
+        length := binary.BigEndian.Uint32(lenb[:])
+        payload := make([]byte, length-4)
+        if length > 4 {
+            if _, err := io.ReadFull(serverConn, payload); err != nil {
+                return err
+            }
+        }
+        clientConn.Write(t[:]); clientConn.Write(lenb[:]); clientConn.Write(payload)
+        if t[0] != 'R' {
+            continue
+        }
+        authType := binary.BigEndian.Uint32(payload[:4])
+        switch authType {
+        case 0:
+            return nil
+        case 3:
+            // Cleartext: 验证 proxyPwd 与 cfg.ProxyAuthPassword
+            if proxyPwd != cfg.ProxyAuthPassword {
+                return fmt.Errorf("invalid proxy auth password")
+            }
+            // 读客户端 PasswordMessage
+            var tag [1]byte; if _, err := io.ReadFull(clientConn, tag[:]); err != nil { return err }
+            var plenb2 [4]byte; if _, err := io.ReadFull(clientConn, plenb2[:]); err != nil { return err }
+            plen := binary.BigEndian.Uint32(plenb2[:]); pwdBytes := make([]byte, plen-4)
+            if _, err := io.ReadFull(clientConn, pwdBytes); err != nil { return err }
+            // 忽略客户端密码，使用 dbPwd
+            sendPasswordMsg(serverConn, dbPwd)
+        case 5:
+            // MD5: 同上，忽略客户端hash，使用 dbPwd的hash
+            salt := payload[4:8]
+            sendPasswordMsg(serverConn, md5Password(dbPwd, user, salt))
+        case 10:
+            return nil
+        default:
+            return fmt.Errorf("unsupported auth type %d", authType)
+        }
+    }
+}
+
+// 其余函数保持不变
 func proxySSL(clientConn net.Conn, buf *bufio.Reader, head []byte) {
     poolMu.Lock()
     p := activePool
