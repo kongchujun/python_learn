@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
@@ -69,16 +70,17 @@ func (cc *ConnectionConfig) GetConfig() ConnParams {
 
 // Config 定义代理和 API 服务地址及连接池参数
 type Config struct {
-	ProxyListenAddr    string // 代理监听地址
-	APIListenAddr      string // API 监听地址
-	APIPasswordUpdate  string // 更新配置 API 路径
-	PoolSize           int    // 连接池大小
-	ProxyAuthPassword  string // 代理访问校验密码
+	ProxyListenAddr    string        // 代理监听地址
+	APIListenAddr      string        // API 监听地址
+	APIPasswordUpdate  string        // 更新配置 API 路径
+	PoolSize           int           // 连接池大小
+	ProxyAuthPassword  string        // 代理访问校验密码
 	ConnectTimeout     time.Duration // 连接超时
 	ConnectionAttempts int           // 连接尝试次数
 	EnableSSL          bool          // 是否启用SSL
 	SSLCertPath        string        // SSL证书路径
 	SSLKeyPath         string        // SSL密钥路径
+	RelayAuth          bool          // 是否完全转发认证 (包括SASL)
 }
 
 // StartupMessage 表示 PostgreSQL 启动包
@@ -118,7 +120,7 @@ func (p *ConnPool) Get() (net.Conn, error) {
 		one := make([]byte, 1)
 		_, err := conn.Read(one)
 		conn.SetReadDeadline(time.Time{}) // 重置读取超时
-		
+
 		if err == nil {
 			// 连接有数据，不能重用
 			logger.Printf("Connection has data, cannot reuse")
@@ -126,7 +128,7 @@ func (p *ConnPool) Get() (net.Conn, error) {
 		} else if err != io.EOF && !os.IsTimeout(err) {
 			// 连接出错且不是EOF或超时，不能重用
 			logger.Printf("Connection error: %v, cannot reuse", err)
-			conn.Close() 
+			conn.Close()
 		} else {
 			// 连接看起来正常，可以重用
 			logger.Printf("Reusing connection from pool")
@@ -135,15 +137,15 @@ func (p *ConnPool) Get() (net.Conn, error) {
 	default:
 		// 池为空，需要新建
 	}
-	
+
 	params := p.cc.GetConfig()
 	addr := fmt.Sprintf("%s:%d", params.Hostname, params.Port)
 	logger.Printf("Dialing backend at %s", addr)
-	
+
 	// 尝试多次连接
 	var conn net.Conn
 	var err error
-	
+
 	for i := 0; i < p.cfg.ConnectionAttempts; i++ {
 		dialer := net.Dialer{Timeout: p.cfg.ConnectTimeout}
 		conn, err = dialer.Dial("tcp", addr)
@@ -153,12 +155,12 @@ func (p *ConnPool) Get() (net.Conn, error) {
 		logger.Printf("Connection attempt %d failed: %v", i+1, err)
 		time.Sleep(100 * time.Millisecond) // 短暂延迟后重试
 	}
-	
+
 	if err != nil {
-		return nil, fmt.Errorf("failed to connect to backend after %d attempts: %w", 
+		return nil, fmt.Errorf("failed to connect to backend after %d attempts: %w",
 			p.cfg.ConnectionAttempts, err)
 	}
-	
+
 	logger.Printf("New connection established to %s", addr)
 	return conn, nil
 }
@@ -168,22 +170,22 @@ func (p *ConnPool) Put(conn net.Conn) {
 	if conn == nil {
 		return
 	}
-	
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	
+
 	if p.draining {
 		logger.Printf("Pool is draining, closing connection")
 		conn.Close()
 		return
 	}
-	
+
 	// 设置超时以检测连接是否可用
 	conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
 	one := make([]byte, 1)
 	_, err := conn.Read(one)
 	conn.SetReadDeadline(time.Time{}) // 重置超时
-	
+
 	if err == io.EOF {
 		logger.Printf("Connection EOF, may be closed by server")
 		conn.Close()
@@ -207,10 +209,10 @@ func (p *ConnPool) Put(conn net.Conn) {
 func (p *ConnPool) Reset() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	
+
 	logger.Printf("Resetting connection pool")
 	p.draining = true
-	
+
 	// 关闭所有连接
 	close(p.pool)
 	count := 0
@@ -219,7 +221,7 @@ func (p *ConnPool) Reset() {
 		count++
 	}
 	logger.Printf("Closed %d connections from pool", count)
-	
+
 	// 重建池
 	p.pool = make(chan net.Conn, p.size)
 	p.draining = false
@@ -235,9 +237,10 @@ var (
 		ProxyAuthPassword:  "pwd_postgres",
 		ConnectTimeout:     5 * time.Second,
 		ConnectionAttempts: 3,
-		EnableSSL:          false, // 默认不启用SSL，可通过API设置
+		EnableSSL:          false, // 默认不启用SSL
 		SSLCertPath:        "server.crt",
 		SSLKeyPath:         "server.key",
+		RelayAuth:          true, // 默认启用完整的认证转发
 	}
 	activePool *ConnPool
 	oldPool    *ConnPool
@@ -248,15 +251,15 @@ var (
 func rotatePools() {
 	poolMu.Lock()
 	defer poolMu.Unlock()
-	
+
 	logger.Printf("Rotating connection pools")
 	newP := newPool(connConfig, cfg.PoolSize, &cfg)
-	
+
 	if activePool != nil {
 		oldPool = activePool
 		oldPool.Reset()
 	}
-	
+
 	activePool = newP
 }
 
@@ -267,12 +270,12 @@ func main() {
 		multiWriter := io.MultiWriter(os.Stdout, f)
 		logger = log.New(multiWriter, "[PG-PROXY] ", log.LstdFlags|log.Lshortfile)
 	}
-	
+
 	// 打印启动信息
 	logger.Printf("Starting PostgreSQL Proxy")
 	logger.Printf("Proxy will listen on: %s", cfg.ProxyListenAddr)
 	logger.Printf("API will listen on: %s", cfg.APIListenAddr)
-	
+
 	// 初始化
 	connConfig.SetConfig("postgres", 5432, "postgres", "initial_password", "mydb")
 	activePool = newPool(connConfig, cfg.PoolSize, &cfg)
@@ -283,7 +286,7 @@ func main() {
 			logger.Fatalf("API server failed: %v", err)
 		}
 	}()
-	
+
 	// 启动代理服务器
 	if err := startProxyServer(); err != nil {
 		logger.Fatalf("Proxy server failed: %v", err)
@@ -298,7 +301,7 @@ func startAPIServer() error {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		
+
 		var req struct {
 			Hostname     string `json:"hostname"`
 			Port         int    `json:"port"`
@@ -306,46 +309,46 @@ func startAPIServer() error {
 			Password     string `json:"password"`
 			DatabaseName string `json:"databasename"`
 		}
-		
+
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			logger.Printf("Failed to parse update request: %v", err)
 			http.Error(w, "Bad request: "+err.Error(), http.StatusBadRequest)
 			return
 		}
-		
+
 		if req.Hostname == "" || req.Port == 0 || req.Username == "" || req.Password == "" || req.DatabaseName == "" {
 			logger.Printf("Incomplete update request: %+v", req)
 			http.Error(w, "All fields required", http.StatusBadRequest)
 			return
 		}
-		
+
 		logger.Printf("Updating config with new parameters")
 		connConfig.SetConfig(req.Hostname, req.Port, req.Username, req.Password, req.DatabaseName)
 		rotatePools()
-		
+
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprint(w, "Config updated and pools rotated")
 		logger.Printf("Config update successful")
 	})
-	
+
 	// SSL配置更新
 	http.HandleFunc("/update-ssl", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		
+
 		var req struct {
 			EnableSSL   bool   `json:"enable_ssl"`
 			SSLCertPath string `json:"ssl_cert_path,omitempty"`
 			SSLKeyPath  string `json:"ssl_key_path,omitempty"`
 		}
-		
+
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "Bad request: "+err.Error(), http.StatusBadRequest)
 			return
 		}
-		
+
 		cfg.EnableSSL = req.EnableSSL
 		if req.SSLCertPath != "" {
 			cfg.SSLCertPath = req.SSLCertPath
@@ -353,53 +356,76 @@ func startAPIServer() error {
 		if req.SSLKeyPath != "" {
 			cfg.SSLKeyPath = req.SSLKeyPath
 		}
-		
+
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintf(w, "SSL config updated: enabled=%v", cfg.EnableSSL)
 	})
-	
+
+	// 认证模式配置
+	http.HandleFunc("/update-auth-mode", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req struct {
+			RelayAuth bool `json:"relay_auth"`
+		}
+
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Bad request: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		cfg.RelayAuth = req.RelayAuth
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, "Auth mode updated: relay_auth=%v", cfg.RelayAuth)
+	})
+
 	// 添加健康检查端点
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprint(w, "OK")
 	})
-	
+
 	// 显示当前配置状态（敏感信息隐藏）
 	http.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
 		params := connConfig.GetConfig()
 		status := struct {
-			Hostname string `json:"hostname"`
-			Port     int    `json:"port"`
-			Username string `json:"username"`
-			Database string `json:"database"`
-			SSLEnabled bool `json:"ssl_enabled"`
+			Hostname   string `json:"hostname"`
+			Port       int    `json:"port"`
+			Username   string `json:"username"`
+			Database   string `json:"database"`
+			SSLEnabled bool   `json:"ssl_enabled"`
+			RelayAuth  bool   `json:"relay_auth"`
 		}{
-			Hostname: params.Hostname,
-			Port:     params.Port,
-			Username: params.Username,
-			Database: params.Database,
+			Hostname:   params.Hostname,
+			Port:       params.Port,
+			Username:   params.Username,
+			Database:   params.Database,
 			SSLEnabled: cfg.EnableSSL,
+			RelayAuth:  cfg.RelayAuth,
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(status)
 	})
-	
+
 	// 启动测试端点 - 测试到后端的连接
 	http.HandleFunc("/test-connection", func(w http.ResponseWriter, r *http.Request) {
 		poolMu.Lock()
 		p := activePool
 		poolMu.Unlock()
-		
+
 		conn, err := p.Get()
 		if err != nil {
 			http.Error(w, fmt.Sprintf("Failed to connect to backend: %v", err), http.StatusInternalServerError)
 			return
 		}
 		defer p.Put(conn)
-		
+
 		fmt.Fprintf(w, "Successfully connected to backend PostgreSQL")
 	})
-	
+
 	logger.Printf("API server listening on %s", cfg.APIListenAddr)
 	return http.ListenAndServe(cfg.APIListenAddr, nil)
 }
@@ -410,19 +436,19 @@ func startProxyServer() error {
 	if err != nil {
 		return fmt.Errorf("proxy listen failed: %w", err)
 	}
-	
+
 	logger.Printf("Proxy server listening on %s", cfg.ProxyListenAddr)
-	
+
 	for {
 		clientConn, err := ln.Accept()
 		if err != nil {
 			logger.Printf("Accept error: %v", err)
 			continue
 		}
-		
+
 		clientAddr := clientConn.RemoteAddr()
 		logger.Printf("New client connection from %s", clientAddr)
-		
+
 		go handleClient(clientConn)
 	}
 }
@@ -431,14 +457,14 @@ func startProxyServer() error {
 func handleClient(clientConn net.Conn) {
 	clientAddr := clientConn.RemoteAddr()
 	logger.Printf("Handling client connection from %s", clientAddr)
-	
+
 	defer func() {
 		clientConn.Close()
 		logger.Printf("Client connection from %s closed", clientAddr)
 	}()
-	
+
 	clientBuf := bufio.NewReader(clientConn)
-	
+
 	// 读取客户端的startup消息
 	logger.Printf("Reading startup message from client %s", clientAddr)
 	skb, err := readStartupMessage(clientBuf)
@@ -446,24 +472,24 @@ func handleClient(clientConn net.Conn) {
 		logger.Printf("Failed to read startup message from client %s: %v", clientAddr, err)
 		return
 	}
-	
+
 	// 处理SSL请求
 	if skb.IsSSLRequest {
 		handleSSLRequest(clientConn, clientBuf)
 		return
 	}
-	
+
 	logger.Printf("Client %s startup parameters: %v", clientAddr, skb.Parameters)
-	
+
 	// 保存客户端提供的密码用于代理认证
 	proxyPwd := skb.Parameters["password"]
 	delete(skb.Parameters, "password")
-	
+
+	// 获取后端连接
 	poolMu.Lock()
 	p := activePool
 	poolMu.Unlock()
-	
-	// 获取后端连接
+
 	logger.Printf("Acquiring backend connection for client %s", clientAddr)
 	serverConn, err := p.Get()
 	if err != nil {
@@ -472,22 +498,22 @@ func handleClient(clientConn net.Conn) {
 		sendErrorToClient(clientConn, "Backend connection failed")
 		return
 	}
-	
+
 	serverAddr := serverConn.RemoteAddr()
 	logger.Printf("Got backend connection to %s for client %s", serverAddr, clientAddr)
-	
+
 	defer func() {
 		logger.Printf("Closing backend connection to %s", serverAddr)
 		p.Put(serverConn)
 	}()
-	
+
 	// 用后端真实的用户名和数据库替换客户端提供的
 	params := connConfig.GetConfig()
 	skb.Parameters["user"] = params.Username
 	skb.Parameters["database"] = params.Database
-	
+
 	logger.Printf("Modified startup parameters for client %s: %v", clientAddr, skb.Parameters)
-	
+
 	// 序列化并发送到后端
 	logger.Printf("Serializing and sending startup message to backend %s", serverAddr)
 	data, err := serializeStartup(skb)
@@ -495,7 +521,7 @@ func handleClient(clientConn net.Conn) {
 		logger.Printf("Failed to serialize startup message for client %s: %v", clientAddr, err)
 		return
 	}
-	
+
 	// 添加详细诊断
 	logger.Printf("Sending %d bytes of startup data to backend %s", len(data), serverAddr)
 	_, err = serverConn.Write(data)
@@ -506,30 +532,39 @@ func handleClient(clientConn net.Conn) {
 		return
 	}
 
-	// 处理身份验证
-	logger.Printf("Starting authentication for client %s", clientAddr)
-	if err := handleAuth(serverConn, clientConn, params.Username, params.Password, proxyPwd); err != nil {
-		logger.Printf("Authentication error for client %s: %v", clientAddr, err)
+	// 处理身份验证 - 新增全转发模式支持
+	logger.Printf("Starting authentication for client %s (relay_mode=%v)", clientAddr, cfg.RelayAuth)
+	var authErr error
+	if cfg.RelayAuth {
+		// 使用完整的认证转发模式
+		authErr = handleCompleteAuth(serverConn, clientConn, params.Password, proxyPwd)
+	} else {
+		// 使用传统的基于类型的认证处理
+		authErr = handleAuth(serverConn, clientConn, params.Username, params.Password, proxyPwd)
+	}
+
+	if authErr != nil {
+		logger.Printf("Authentication error for client %s: %v", clientAddr, authErr)
 		return
 	}
 
 	logger.Printf("Authentication successful for client %s, entering relay mode", clientAddr)
-	
+
 	// 正向和反向复制数据
 	errCh := make(chan error, 2)
-	
+
 	go func() {
 		_, err := io.Copy(serverConn, clientBuf)
 		logger.Printf("Client->Server data transfer ended for %s: %v", clientAddr, err)
 		errCh <- err
 	}()
-	
+
 	go func() {
 		_, err := io.Copy(clientConn, serverConn)
 		logger.Printf("Server->Client data transfer ended for %s: %v", clientAddr, err)
 		errCh <- err
 	}()
-	
+
 	// 等待其中一个数据通道结束
 	err = <-errCh
 	if err != nil && err != io.EOF {
@@ -539,11 +574,378 @@ func handleClient(clientConn net.Conn) {
 	}
 }
 
+// handleCompleteAuth 完整的认证转发模式，支持所有认证类型
+func handleCompleteAuth(serverConn, clientConn net.Conn, serverPwd, proxyPwd string) error {
+	clientAddr := clientConn.RemoteAddr()
+	serverAddr := serverConn.RemoteAddr()
+	serverBuf := make([]byte, 8192)
+	clientBuf := make([]byte, 8192)
+
+	// 首先验证代理密码
+	if proxyPwd != cfg.ProxyAuthPassword {
+		return fmt.Errorf("invalid proxy auth password from client %s", clientAddr)
+	}
+
+	logger.Printf("Proxy password verified for %s, starting auth relay", clientAddr)
+
+	// 读取和处理所有认证消息直到成功或失败
+	for {
+		// 从服务器读取消息
+		serverConn.SetReadDeadline(time.Now().Add(30 * time.Second))
+		msgType, msgLen, payload, err := readMessage(serverConn, serverBuf)
+		serverConn.SetReadDeadline(time.Time{})
+
+		if err != nil {
+			return fmt.Errorf("failed to read from server: %w", err)
+		}
+
+		logger.Printf("Server->Client: type=%c, len=%d", msgType, msgLen)
+
+		// 识别认证消息类型
+		if msgType == 'R' {
+			// 认证请求消息
+			authType := binary.BigEndian.Uint32(payload[:4])
+			logger.Printf("Authentication message, type=%d", authType)
+
+			if authType == 0 {
+				// 认证成功
+				logger.Printf("Authentication successful")
+				// 转发认证成功消息给客户端
+				if err := forwardMessage(clientConn, msgType, msgLen, payload); err != nil {
+					return fmt.Errorf("failed to forward auth success: %w", err)
+				}
+				continue
+			} else if authType == 3 {
+				// 明文密码认证
+				logger.Printf("Cleartext password authentication")
+				// 转发认证请求给客户端
+				if err := forwardMessage(clientConn, msgType, msgLen, payload); err != nil {
+					return fmt.Errorf("failed to forward auth request: %w", err)
+				}
+
+				// 读取客户端密码响应
+				clientConn.SetReadDeadline(time.Now().Add(30 * time.Second))
+				cMsgType, cMsgLen, cPayload, err := readMessage(clientConn, clientBuf)
+				clientConn.SetReadDeadline(time.Time{})
+
+				if err != nil {
+					return fmt.Errorf("failed to read password from client: %w", err)
+				}
+
+				if cMsgType != 'p' {
+					return fmt.Errorf("expected password message, got %c", cMsgType)
+				}
+
+				// 发送真实密码给服务器
+				if err := sendPasswordMsg(serverConn, serverPwd); err != nil {
+					return fmt.Errorf("failed to send password to server: %w", err)
+				}
+			} else if authType == 5 {
+				// MD5密码认证
+				logger.Printf("MD5 password authentication")
+				// 转发认证请求给客户端
+				if err := forwardMessage(clientConn, msgType, msgLen, payload); err != nil {
+					return fmt.Errorf("failed to forward auth request: %w", err)
+				}
+
+				// 读取客户端密码响应
+				clientConn.SetReadDeadline(time.Now().Add(30 * time.Second))
+				cMsgType, cMsgLen, cPayload, err := readMessage(clientConn, clientBuf)
+				clientConn.SetReadDeadline(time.Time{})
+
+				if err != nil {
+					return fmt.Errorf("failed to read password from client: %w", err)
+				}
+
+				if cMsgType != 'p' {
+					return fmt.Errorf("expected password message, got %c", cMsgType)
+				}
+
+				// 获取salt
+				salt := payload[4:8]
+				logger.Printf("MD5 salt: %v", salt)
+
+				// 发送MD5密码给服务器
+				hashedPwd := md5Password(serverPwd, connConfig.GetConfig().Username, salt)
+				logger.Printf("Sending MD5 password to server")
+				if err := sendPasswordMsg(serverConn, hashedPwd); err != nil {
+					return fmt.Errorf("failed to send MD5 password to server: %w", err)
+				}
+			} else if authType == 10 {
+				// SASL/SCRAM认证 - 完整转发
+				logger.Printf("SASL/SCRAM authentication")
+				// 转发认证请求给客户端
+				if err := forwardMessage(clientConn, msgType, msgLen, payload); err != nil {
+					return fmt.Errorf("failed to forward SASL request: %w", err)
+				}
+
+				// SASL机制信息在payload中
+				mechanisms := extractSaslMechanisms(payload)
+				logger.Printf("SASL mechanisms: %v", mechanisms)
+
+				// 处理客户端的SASL Initial Response
+				clientConn.SetReadDeadline(time.Now().Add(30 * time.Second))
+				cMsgType, cMsgLen, cPayload, err := readMessage(clientConn, clientBuf)
+				clientConn.SetReadDeadline(time.Time{})
+
+				if err != nil {
+					return fmt.Errorf("failed to read SASL response from client: %w", err)
+				}
+
+				if cMsgType != 'p' {
+					return fmt.Errorf("expected SASL response message, got %c", cMsgType)
+				}
+
+				// 分析客户端选择的机制和初始响应
+				saslResponse := extractSaslResponse(cPayload)
+				logger.Printf("Client selected SASL mechanism: %s", saslResponse.mechanism)
+
+				// 构造我们自己的SASL Initial Response
+				serverInitial, err := buildSaslInitialResponse(serverPwd, saslResponse.mechanism)
+				if err != nil {
+					return fmt.Errorf("failed to build SASL initial response: %w", err)
+				}
+
+				// 发送到服务器
+				if err := sendMessage(serverConn, 'p', serverInitial); err != nil {
+					return fmt.Errorf("failed to send SASL initial response: %w", err)
+				}
+
+				// 进入SASL交换循环
+				for {
+					// 从服务器读取
+					serverConn.SetReadDeadline(time.Now().Add(30 * time.Second))
+					sMsgType, sMsgLen, sPayload, err := readMessage(serverConn, serverBuf)
+					serverConn.SetReadDeadline(time.Time{})
+
+					if err != nil {
+						return fmt.Errorf("failed to read SASL challenge: %w", err)
+					}
+
+					// 转发到客户端
+					if err := forwardMessage(clientConn, sMsgType, sMsgLen, sPayload); err != nil {
+						return fmt.Errorf("failed to forward SASL message: %w", err)
+					}
+
+					// 如果是认证成功或继续消息
+					if sMsgType == 'R' {
+						authType := binary.BigEndian.Uint32(sPayload[:4])
+						if authType == 0 {
+							// 认证成功
+							logger.Printf("SASL authentication successful")
+							break
+						} else if authType == 11 {
+							// SASL继续 - 从客户端读取响应并转发到服务器
+							clientConn.SetReadDeadline(time.Now().Add(30 * time.Second))
+							cMsgType, cMsgLen, cPayload, err := readMessage(clientConn, clientBuf)
+							clientConn.SetReadDeadline(time.Time{})
+
+							if err != nil {
+								return fmt.Errorf("failed to read SASL response: %w", err)
+							}
+
+							// 发送到服务器
+							if err := forwardMessage(serverConn, cMsgType, cMsgLen, cPayload); err != nil {
+								return fmt.Errorf("failed to forward SASL response: %w", err)
+							}
+						} else if authType == 12 {
+							// SASL最终消息
+							logger.Printf("SASL final message received")
+							// 等待客户端响应
+							clientConn.SetReadDeadline(time.Now().Add(30 * time.Second))
+							cMsgType, cMsgLen, cPayload, err := readMessage(clientConn, clientBuf)
+							clientConn.SetReadDeadline(time.Time{})
+
+							if err != nil {
+								return fmt.Errorf("failed to read final SASL response: %w", err)
+							}
+
+							// 发送到服务器
+							if err := forwardMessage(serverConn, cMsgType, cMsgLen, cPayload); err != nil {
+								return fmt.Errorf("failed to forward final SASL response: %w", err)
+							}
+						}
+					} else if sMsgType == 'E' {
+						// 错误消息
+						logger.Printf("Authentication error from server")
+						return fmt.Errorf("server returned auth error")
+					} else if sMsgType == 'Z' {
+						// ReadyForQuery - 认证流程结束
+						logger.Printf("Authentication complete, server ready")
+						return nil
+					}
+				}
+			} else {
+				// 其他认证类型，直接转发
+				logger.Printf("Unknown authentication type %d, forwarding as-is", authType)
+				if err := forwardMessage(clientConn, msgType, msgLen, payload); err != nil {
+					return fmt.Errorf("failed to forward auth message: %w", err)
+				}
+			}
+		} else if msgType == 'E' {
+			// 错误消息，转发给客户端
+			logger.Printf("Error message from server")
+			if err := forwardMessage(clientConn, msgType, msgLen, payload); err != nil {
+				return fmt.Errorf("failed to forward error message: %w", err)
+			}
+			// 提取并打印错误消息
+			errMsg := extractErrorMessage(payload)
+			logger.Printf("Server error: %s", errMsg)
+			return fmt.Errorf("server returned error: %s", errMsg)
+		} else if msgType == 'Z' {
+			// ReadyForQuery - 认证流程结束
+			logger.Printf("Authentication complete, server ready")
+			if err := forwardMessage(clientConn, msgType, msgLen, payload); err != nil {
+				return fmt.Errorf("failed to forward ready message: %w", err)
+			}
+			return nil
+		} else {
+			// 其他消息类型，转发给客户端
+			logger.Printf("Other message type %c, forwarding as-is", msgType)
+			if err := forwardMessage(clientConn, msgType, msgLen, payload); err != nil {
+				return fmt.Errorf("failed to forward message: %w", err)
+			}
+		}
+	}
+}
+
+// 提取PostgreSQL错误消息
+func extractErrorMessage(payload []byte) string {
+	var errMsg string
+	for i := 0; i < len(payload); {
+		fieldType := payload[i]
+		if fieldType == 0 {
+			break
+		}
+		i++
+		end := bytes.IndexByte(payload[i:], 0)
+		if end < 0 {
+			break
+		}
+		value := string(payload[i : i+end])
+		i += end + 1
+		if fieldType == 'M' {
+			errMsg = value
+			break
+		}
+	}
+	return errMsg
+}
+
+// SASL认证响应
+type saslResponse struct {
+	mechanism string
+	data      []byte
+}
+
+// 提取SASL机制列表
+func extractSaslMechanisms(payload []byte) []string {
+	// Skip auth type (4 bytes)
+	offset := 4
+	nullPos := bytes.IndexByte(payload[offset:], 0)
+	if nullPos < 0 {
+		return nil
+	}
+	mechanisms := string(payload[offset : offset+nullPos])
+	return strings.Split(mechanisms, ",")
+}
+
+// 解析客户端SASL初始响应
+func extractSaslResponse(payload []byte) saslResponse {
+	var resp saslResponse
+	// Find mechanism name (null-terminated)
+	nullPos := bytes.IndexByte(payload, 0)
+	if nullPos < 0 {
+		return resp
+	}
+	resp.mechanism = string(payload[:nullPos])
+
+	// Get response data length
+	if len(payload) <= nullPos+5 {
+		return resp
+	}
+	dataLen := binary.BigEndian.Uint32(payload[nullPos+1:])
+	if int(dataLen) > len(payload)-nullPos-5 {
+		return resp
+	}
+	resp.data = payload[nullPos+5 : nullPos+5+int(dataLen)]
+	return resp
+}
+
+// 构造SASL初始响应
+func buildSaslInitialResponse(password, mechanism string) ([]byte, error) {
+	var buf bytes.Buffer
+
+	// 机制名称
+	buf.WriteString(mechanism)
+	buf.WriteByte(0)
+
+	// 响应数据长度占位
+	buf.Write([]byte{0, 0, 0, 0})
+
+	// 对于SCRAM-SHA-256，构造客户端首个消息
+	// 格式为: n,,n=user,r=client_nonce
+	// 简化起见，我们使用固定的客户端随机数
+	clientNonce := "rOprNGfwEbeRWgbNEkqO"
+	data := fmt.Sprintf("n,,n=%s,r=%s", connConfig.GetConfig().Username, clientNonce)
+	buf.WriteString(data)
+
+	// 填充长度
+	dataLen := len(data)
+	binary.BigEndian.PutUint32(buf.Bytes()[len(mechanism)+1:], uint32(dataLen))
+
+	return buf.Bytes(), nil
+}
+
+// 转发消息
+func forwardMessage(conn net.Conn, msgType byte, msgLen uint32, payload []byte) error {
+	// 构造消息头
+	header := make([]byte, 5)
+	header[0] = msgType
+	binary.BigEndian.PutUint32(header[1:], msgLen)
+
+	// 发送头部
+	if _, err := conn.Write(header); err != nil {
+		return fmt.Errorf("write message header: %w", err)
+	}
+
+	// 发送数据
+	if len(payload) > 0 && msgLen > 4 {
+		if _, err := conn.Write(payload[:msgLen-4]); err != nil {
+			return fmt.Errorf("write message payload: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// 发送任意消息
+func sendMessage(conn net.Conn, msgType byte, data []byte) error {
+	msgLen := uint32(len(data) + 4)
+	header := make([]byte, 5)
+	header[0] = msgType
+	binary.BigEndian.PutUint32(header[1:], msgLen)
+
+	// 发送头部
+	if _, err := conn.Write(header); err != nil {
+		return fmt.Errorf("write message header: %w", err)
+	}
+
+	// 发送数据
+	if len(data) > 0 {
+		if _, err := conn.Write(data); err != nil {
+			return fmt.Errorf("write message data: %w", err)
+		}
+	}
+
+	return nil
+}
+
 // handleSSLRequest 处理SSL连接请求
 func handleSSLRequest(clientConn net.Conn, reader *bufio.Reader) {
 	clientAddr := clientConn.RemoteAddr()
 	logger.Printf("Client %s requested SSL connection", clientAddr)
-	
+
 	if cfg.EnableSSL {
 		// 告诉客户端我们支持SSL
 		_, err := clientConn.Write([]byte{'S'})
@@ -551,7 +953,7 @@ func handleSSLRequest(clientConn net.Conn, reader *bufio.Reader) {
 			logger.Printf("Failed to send SSL accept to client %s: %v", clientAddr, err)
 			return
 		}
-		
+
 		// 加载证书
 		cert, err := tls.LoadX509KeyPair(cfg.SSLCertPath, cfg.SSLKeyPath)
 		if err != nil {
@@ -559,13 +961,13 @@ func handleSSLRequest(clientConn net.Conn, reader *bufio.Reader) {
 			clientConn.Close()
 			return
 		}
-		
+
 		// 配置TLS
 		tlsConfig := &tls.Config{
 			Certificates: []tls.Certificate{cert},
 			MinVersion:   tls.VersionTLS12,
 		}
-		
+
 		// 升级连接为TLS
 		tlsConn := tls.Server(clientConn, tlsConfig)
 		err = tlsConn.Handshake()
@@ -574,9 +976,9 @@ func handleSSLRequest(clientConn net.Conn, reader *bufio.Reader) {
 			clientConn.Close()
 			return
 		}
-		
+
 		logger.Printf("TLS handshake successful with client %s", clientAddr)
-		
+
 		// 递归调用，处理升级后的连接
 		handleClient(tlsConn)
 	} else {
@@ -586,7 +988,7 @@ func handleSSLRequest(clientConn net.Conn, reader *bufio.Reader) {
 			logger.Printf("Failed to send SSL reject to client %s: %v", clientAddr, err)
 			return
 		}
-		
+
 		// 客户端应该会继续发送普通StartupMessage
 		handleClient(clientConn)
 	}
@@ -597,29 +999,29 @@ func sendErrorToClient(clientConn net.Conn, message string) {
 	// PostgreSQL 错误响应格式
 	buf := new(bytes.Buffer)
 	buf.WriteByte('E') // 错误消息
-	
+
 	// 占位符，稍后填充长度
 	buf.Write([]byte{0, 0, 0, 0})
-	
+
 	// 错误字段
 	buf.WriteByte('S') // Severity
 	buf.WriteString("ERROR")
 	buf.WriteByte(0)
-	
+
 	buf.WriteByte('C') // Code
 	buf.WriteString("08006") // 连接失败代码
 	buf.WriteByte(0)
-	
+
 	buf.WriteByte('M') // Message
 	buf.WriteString(message)
 	buf.WriteByte(0)
-	
+
 	buf.WriteByte(0) // 终止符
-	
+
 	// 计算并填充消息长度
 	data := buf.Bytes()
 	binary.BigEndian.PutUint32(data[1:5], uint32(buf.Len()-1))
-	
+
 	// 发送错误消息
 	clientConn.Write(data)
 }
@@ -634,24 +1036,24 @@ func testBackendConnection(conn net.Conn) {
 			return
 		}
 		defer file.Close()
-		
+
 		logger.Printf("Connection file descriptor: %v", file.Fd())
 	}
-	
+
 	// 尝试发送测试数据
 	conn.SetWriteDeadline(time.Now().Add(time.Second))
 	_, err := conn.Write([]byte{0})
 	conn.SetWriteDeadline(time.Time{})
-	
+
 	if err != nil {
 		logger.Printf("Test write failed: %v", err)
-		
+
 		// 检查错误类型
 		if netErr, ok := err.(net.Error); ok {
-			logger.Printf("Network error details - Timeout: %v, Temporary: %v", 
+			logger.Printf("Network error details - Timeout: %v, Temporary: %v",
 				netErr.Timeout(), netErr.Temporary())
 		}
-		
+
 		// 检查特定操作系统错误
 		logger.Printf("Error type: %T", err)
 	} else {
@@ -660,6 +1062,7 @@ func testBackendConnection(conn net.Conn) {
 }
 
 // handleAuth 认证中继：支持 Cleartext/MD5/SCRAM
+// 这个是不完整的处理，只保留作为后备
 func handleAuth(serverConn, clientConn net.Conn, user, dbPwd, proxyPwd string) error {
 	serverBuf := make([]byte, 4096)
 	clientBuf := make([]byte, 4096)
@@ -669,36 +1072,36 @@ func handleAuth(serverConn, clientConn net.Conn, user, dbPwd, proxyPwd string) e
 	for {
 		// 设置读取超时，避免永久阻塞
 		serverConn.SetReadDeadline(time.Now().Add(30 * time.Second))
-		
+
 		// 读取服务器认证消息
 		msgType, msgLen, payload, err := readMessage(serverConn, serverBuf)
-		
+
 		// 重置读取超时
 		serverConn.SetReadDeadline(time.Time{})
-		
+
 		if err != nil {
 			return fmt.Errorf("failed to read server auth message: %w", err)
 		}
 
 		logger.Printf("Server %s auth message: type=%c len=%d", serverAddr, msgType, msgLen)
-		
+
 		// 转发到客户端
 		header := make([]byte, 5)
 		header[0] = msgType
 		binary.BigEndian.PutUint32(header[1:], msgLen)
-		
+
 		_, err = clientConn.Write(header)
 		if err != nil {
 			return fmt.Errorf("failed to forward auth header to client %s: %w", clientAddr, err)
 		}
-		
+
 		if msgLen > 4 {
 			_, err = clientConn.Write(payload[:msgLen-4])
 			if err != nil {
 				return fmt.Errorf("failed to forward auth payload to client %s: %w", clientAddr, err)
 			}
 		}
-		
+
 		if msgType != 'R' {
 			// 非认证消息，继续处理
 			// 如果是认证成功后的消息（如ReadyForQuery），可以继续或返回
@@ -708,85 +1111,85 @@ func handleAuth(serverConn, clientConn net.Conn, user, dbPwd, proxyPwd string) e
 			}
 			continue
 		}
-		
+
 		// 处理不同类型的认证请求
 		authType := binary.BigEndian.Uint32(payload[:4])
 		logger.Printf("Auth type from server %s: %d", serverAddr, authType)
-		
+
 		switch authType {
 		case 0:
 			// 认证成功
 			logger.Printf("Authentication success message from server %s", serverAddr)
 			return nil
-			
+
 		case 3: // 明文密码认证
 			logger.Printf("Server %s requested cleartext password auth", serverAddr)
-			
+
 			// 校验代理密码
 			if proxyPwd != cfg.ProxyAuthPassword {
 				return fmt.Errorf("invalid proxy auth password from client %s", clientAddr)
 			}
-			
+
 			// 读取客户端的密码响应
 			clientConn.SetReadDeadline(time.Now().Add(30 * time.Second))
 			msgType, msgLen, payload, err := readMessage(clientConn, clientBuf)
 			clientConn.SetReadDeadline(time.Time{})
-			
+
 			if err != nil {
 				return fmt.Errorf("failed to read client %s password response: %w", clientAddr, err)
 			}
-			
+
 			logger.Printf("Client %s password response: type=%c len=%d", clientAddr, msgType, msgLen)
-			
+
 			if msgType != 'p' {
 				return fmt.Errorf("unexpected message type from client %s: %c", clientAddr, msgType)
 			}
-			
+
 			// 发送真正的数据库密码到服务器
 			logger.Printf("Sending real password to server %s", serverAddr)
 			if err := sendPasswordMsg(serverConn, dbPwd); err != nil {
 				return fmt.Errorf("failed to send password to server %s: %w", serverAddr, err)
 			}
-			
+
 		case 5: // MD5密码认证
 			logger.Printf("Server %s requested MD5 password auth", serverAddr)
-			
+
 			// 验证代理密码
 			if proxyPwd != cfg.ProxyAuthPassword {
 				return fmt.Errorf("invalid proxy auth password from client %s", clientAddr)
 			}
-			
+
 			salt := payload[4:8]
 			logger.Printf("MD5 auth salt from server %s: %v", serverAddr, salt)
-			
+
 			// 读取客户端的密码响应
 			clientConn.SetReadDeadline(time.Now().Add(30 * time.Second))
 			msgType, msgLen, payload, err := readMessage(clientConn, clientBuf)
 			clientConn.SetReadDeadline(time.Time{})
-			
+
 			if err != nil {
 				return fmt.Errorf("failed to read client %s password response: %w", clientAddr, err)
 			}
-			
+
 			logger.Printf("Client %s password response: type=%c len=%d", clientAddr, msgType, msgLen)
-			
+
 			if msgType != 'p' {
 				return fmt.Errorf("unexpected message type from client %s: %c", clientAddr, msgType)
 			}
-			
+
 			// 发送MD5散列密码到服务器
 			hashedPwd := md5Password(dbPwd, user, salt)
 			logger.Printf("Sending MD5 password to server %s: %s", serverAddr, hashedPwd)
-			
+
 			if err := sendPasswordMsg(serverConn, hashedPwd); err != nil {
 				return fmt.Errorf("failed to send MD5 password to server %s: %w", serverAddr, err)
 			}
-			
+
 		case 10: // SCRAM-SHA-256
-			logger.Printf("Server %s requested SCRAM-SHA-256 auth, passing through", serverAddr)
-			// SCRAM认证需要多次交互，简单透传
-			return nil
-			
+			logger.Printf("Server %s requested SCRAM-SHA-256 auth - switching to relay mode", serverAddr)
+			// 切换到完整的认证转发模式
+			return handleCompleteAuth(serverConn, clientConn, dbPwd, proxyPwd)
+
 		default:
 			return fmt.Errorf("unsupported auth type %d from server %s", authType, serverAddr)
 		}
@@ -800,29 +1203,29 @@ func readMessage(conn net.Conn, buf []byte) (byte, uint32, []byte, error) {
 	if _, err := io.ReadFull(conn, msgType); err != nil {
 		return 0, 0, nil, fmt.Errorf("read message type: %w", err)
 	}
-	
+
 	// 读取消息长度
 	lenBuf := make([]byte, 4)
 	if _, err := io.ReadFull(conn, lenBuf); err != nil {
 		return 0, 0, nil, fmt.Errorf("read message length: %w", err)
 	}
-	
+
 	length := binary.BigEndian.Uint32(lenBuf)
 	if length < 4 {
 		return 0, 0, nil, fmt.Errorf("invalid message length: %d", length)
 	}
-	
+
 	// 读取消息内容
 	payloadLen := length - 4
 	if uint32(cap(buf)) < payloadLen {
 		buf = make([]byte, payloadLen)
 	}
 	payload := buf[:payloadLen]
-	
+
 	if _, err := io.ReadFull(conn, payload); err != nil {
 		return 0, 0, nil, fmt.Errorf("read message payload: %w", err)
 	}
-	
+
 	return msgType[0], length, payload, nil
 }
 
@@ -836,7 +1239,7 @@ func sendPasswordMsg(conn net.Conn, pwd string) error {
 	binary.Write(buf, binary.BigEndian, length)
 	buf.Write(data)
 	buf.WriteByte(0) // 终止符
-	
+
 	logger.Printf("Sending %d bytes password message", buf.Len())
 	_, err := conn.Write(buf.Bytes())
 	if err != nil {
@@ -852,23 +1255,23 @@ func readStartupMessage(r *bufio.Reader) (*StartupMessage, error) {
 	if _, err := io.ReadFull(r, lenBuf); err != nil {
 		return nil, fmt.Errorf("read startup message length: %w", err)
 	}
-	
+
 	length := int(binary.BigEndian.Uint32(lenBuf))
 	logger.Printf("Startup message length: %d bytes", length)
-	
+
 	if length < 4 || length > 10000 {
 		return nil, fmt.Errorf("invalid startup message length: %d", length)
 	}
-	
+
 	// 读取版本号/请求代码
 	verBuf := make([]byte, 4)
 	if _, err := io.ReadFull(r, verBuf); err != nil {
 		return nil, fmt.Errorf("read protocol version: %w", err)
 	}
-	
+
 	version := int32(binary.BigEndian.Uint32(verBuf))
 	logger.Printf("Protocol version: %d", version)
-	
+
 	// 检查是否是SSL请求
 	if version == SSLRequestCode {
 		// 这是SSL请求，不需要读取更多数据
@@ -880,26 +1283,26 @@ func readStartupMessage(r *bufio.Reader) (*StartupMessage, error) {
 			IsSSLRequest:    true,
 		}, nil
 	}
-	
+
 	// 不是SSL请求，处理常规StartupMessage
 	paramLen := length - 8
 	body := make([]byte, paramLen)
 	if _, err := io.ReadFull(r, body); err != nil {
 		return nil, fmt.Errorf("read startup message body: %w", err)
 	}
-	
+
 	// 解析参数
 	params, err := parseParameters(body)
 	if err != nil {
 		return nil, fmt.Errorf("parse parameters: %w", err)
 	}
-	
+
 	// 构建完整消息
 	raw := make([]byte, length)
 	copy(raw[0:], lenBuf)
 	copy(raw[4:], verBuf)
 	copy(raw[8:], body)
-	
+
 	logger.Printf("Parsed %d startup parameters", len(params))
 	return &StartupMessage{ProtocolVersion: version, Parameters: params, Raw: raw, IsSSLRequest: false}, nil
 }
@@ -908,48 +1311,48 @@ func readStartupMessage(r *bufio.Reader) (*StartupMessage, error) {
 func parseParameters(data []byte) (map[string]string, error) {
 	m := make(map[string]string)
 	i := 0
-	
+
 	for i < len(data) {
 		// 找键的结束位置
 		j := bytes.IndexByte(data[i:], 0)
 		if j < 0 {
 			return m, fmt.Errorf("malformed parameter format at offset %d", i)
 		}
-		
+
 		if j == 0 {
 			// 参数列表结束
 			break
 		}
-		
+
 		key := string(data[i : i+j])
 		i += j + 1
-		
+
 		// 找值的结束位置
 		k := bytes.IndexByte(data[i:], 0)
 		if k < 0 {
 			return m, fmt.Errorf("malformed parameter value for key '%s' at offset %d", key, i)
 		}
-		
+
 		val := string(data[i : i+k])
 		i += k + 1
-		
+
 		logger.Printf("Parameter: %s = %s", key, val)
 		m[key] = val
 	}
-	
+
 	return m, nil
 }
 
 // serializeStartup 重建 StartupMessage
 func serializeStartup(msg *StartupMessage) ([]byte, error) {
 	var buf bytes.Buffer
-	
+
 	// 占位符，后面再填充长度
 	buf.Write([]byte{0, 0, 0, 0})
-	
+
 	// 写入协议版本
 	binary.Write(&buf, binary.BigEndian, uint32(msg.ProtocolVersion))
-	
+
 	// 写入参数
 	for k, v := range msg.Parameters {
 		buf.WriteString(k)
@@ -958,15 +1361,15 @@ func serializeStartup(msg *StartupMessage) ([]byte, error) {
 		buf.WriteByte(0)
 		logger.Printf("Serializing parameter: %s = %s", k, v)
 	}
-	
+
 	// 参数列表结束
 	buf.WriteByte(0)
-	
+
 	// 填充消息长度
 	data := buf.Bytes()
 	binary.BigEndian.PutUint32(data[0:4], uint32(buf.Len()))
 	logger.Printf("Serialized startup message: %d bytes", buf.Len())
-	
+
 	return data, nil
 }
 
@@ -975,10 +1378,10 @@ func md5Password(password, user string, salt []byte) string {
 	h1 := md5.New()
 	h1.Write([]byte(password + user))
 	sum1 := h1.Sum(nil)
-	
+
 	h2 := md5.New()
 	h2.Write(sum1)
 	h2.Write(salt)
-	
+
 	return "md5" + hex.EncodeToString(h2.Sum(nil))
 }
