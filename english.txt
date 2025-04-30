@@ -1,77 +1,189 @@
-// handleClient 处理客户端连接：SSL 检测 + Startup/Auth
+package main
+
+import (
+    "bufio"
+    "bytes"
+    "encoding/binary"
+    "encoding/json"
+    "fmt"
+    "io"
+    "log"
+    "net"
+    "net/http"
+    "sync"
+)
+
+// ConnectionConfig safely holds backend PostgreSQL parameters
+type ConnectionConfig struct {
+    hostname string
+    port     int
+    mu       sync.RWMutex
+}
+
+func (cc *ConnectionConfig) SetConfig(hostname string, port int) {
+    cc.mu.Lock()
+    defer cc.mu.Unlock()
+    cc.hostname = hostname
+    cc.port = port
+    log.Printf("Config updated: %s:%d", hostname, port)
+}
+
+func (cc *ConnectionConfig) Get() (string, int) {
+    cc.mu.RLock()
+    defer cc.mu.RUnlock()
+    return cc.hostname, cc.port
+}
+
+// Global configuration for proxy and API endpoints
+type Config struct {
+    ProxyListenAddr   string
+    APIListenAddr     string
+    APIPasswordUpdate string
+    ProxyAuthPassword string
+}
+
+var (
+    connConfig = &ConnectionConfig{}
+    cfg = Config{
+        ProxyListenAddr:   ":5433",
+        APIListenAddr:     ":8080",
+        APIPasswordUpdate: "/update-password",
+        ProxyAuthPassword: "pwd_postgres",
+    }
+)
+
+func main() {
+    // Initialize backend settings
+    connConfig.SetConfig("postgres", 5432)
+
+    // Start API server for hot rotation
+    go startAPIServer()
+    // Start TCP proxy
+    startProxy()
+}
+
+// startAPIServer exposes an HTTP endpoint to rotate backend host and port
+func startAPIServer() {
+    http.HandleFunc(cfg.APIPasswordUpdate, func(w http.ResponseWriter, r *http.Request) {
+        if r.Method != http.MethodPost {
+            http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+            return
+        }
+        var req struct {
+            Hostname string `json:"hostname"`
+            Port     int    `json:"port"`
+        }
+        if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+            http.Error(w, "Bad request", http.StatusBadRequest)
+            return
+        }
+        if req.Hostname == "" || req.Port == 0 {
+            http.Error(w, "All fields required", http.StatusBadRequest)
+            return
+        }
+        connConfig.SetConfig(req.Hostname, req.Port)
+        w.WriteHeader(http.StatusOK)
+        fmt.Fprint(w, "Backend rotated")
+    })
+
+    log.Printf("API listening on %s", cfg.APIListenAddr)
+    log.Fatal(http.ListenAndServe(cfg.APIListenAddr, nil))
+}
+
+// startProxy listens for incoming client connections and handles them
+func startProxy() {
+    listener, err := net.Listen("tcp", cfg.ProxyListenAddr)
+    if err != nil {
+        log.Fatalf("Proxy listen failed: %v", err)
+    }
+    log.Printf("Proxy listening on %s", cfg.ProxyListenAddr)
+
+    for {
+        clientConn, err := listener.Accept()
+        if err != nil {
+            log.Printf("Accept error: %v", err)
+            continue
+        }
+        go handleClient(clientConn)
+    }
+}
+
+// handleClient authenticates the proxy password then tunnels traffic
 func handleClient(clientConn net.Conn) {
     defer clientConn.Close()
     buf := bufio.NewReader(clientConn)
 
-    // 读取首个 8 字节
-    header8 := make([]byte, 8)
-    if _, err := io.ReadFull(buf, header8); err != nil {
-        log.Printf("Failed to read initial 8 bytes: %v", err)
-        return
-    }
-    isSSL := binary.BigEndian.Uint32(header8[:4]) == 8 && binary.BigEndian.Uint32(header8[4:]) == 80877103
-
-    // 获取后端连接
-    poolMu.Lock()
-    p := activePool
-    poolMu.Unlock()
-    serverConn, err := p.Get()
+    // Read StartupMessage and extract parameters
+    raw, params, err := readStartupMessage(buf)
     if err != nil {
-        log.Printf("Get backend conn failed: %v", err)
+        log.Printf("Startup read error: %v", err)
         return
     }
-    defer p.Put(serverConn)
 
-    if isSSL {
-        // 转发 SSLRequest
-        serverConn.Write(header8)
-        reply := make([]byte, 1)
-        if _, err := io.ReadFull(serverConn, reply); err != nil {
-            log.Printf("Read SSL reply failed: %v", err)
-            buf = bufio.NewReader(io.MultiReader(bytes.NewReader(header8), buf))
-        } else {
-            clientConn.Write(reply)
-            if reply[0] == 'S' {
-                // 透明转发 TLS
-                go io.Copy(serverConn, clientConn)
-                io.Copy(clientConn, serverConn)
-                return
-            } else {
-                buf = bufio.NewReader(io.MultiReader(bytes.NewReader(header8), buf))
-            }
+    // Validate proxy password
+    if params["password"] != cfg.ProxyAuthPassword {
+        log.Printf("Invalid proxy password: %s", params["password"])
+        return
+    }
+
+    // Connect to backend
+    host, port := connConfig.Get()
+    backendConn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", host, port))
+    if err != nil {
+        log.Printf("Backend dial error: %v", err)
+        return
+    }
+    defer backendConn.Close()
+
+    // Forward the original startup packet
+    if _, err := backendConn.Write(raw); err != nil {
+        log.Printf("Failed to write StartupMessage to backend: %v", err)
+        return
+    }
+
+    // Relay traffic between client and backend
+    go io.Copy(backendConn, buf)
+    io.Copy(clientConn, backendConn)
+}
+
+// readStartupMessage reads raw StartupMessage and returns raw bytes and parsed params
+func readStartupMessage(r *bufio.Reader) ([]byte, map[string]string, error) {
+    header := make([]byte, 8)
+    if _, err := io.ReadFull(r, header); err != nil {
+        return nil, nil, err
+    }
+
+    length := int(binary.BigEndian.Uint32(header[:4]))
+    body := make([]byte, length-8)
+    if _, err := io.ReadFull(r, body); err != nil {
+        return nil, nil, err
+    }
+
+    raw := append(header, body...)
+    params := parseParameters(body[4:])
+    return raw, params, nil
+}
+
+// parseParameters extracts key=value pairs from StartupMessage body
+func parseParameters(data []byte) map[string]string {
+    m := make(map[string]string)
+    i := 0
+    for i < len(data) {
+        j := bytes.IndexByte(data[i:], 0)
+        if j < 0 {
+            break
         }
-    } else {
-        buf = bufio.NewReader(io.MultiReader(bytes.NewReader(header8), buf))
-    }
+        key := string(data[i : i+j])
+        i += j + 1
 
-    // 读取并修改 StartupMessage
-    startupMsg, err := readStartupMessage(buf)
-    if err != nil {
-        log.Printf("readStartupMessage error: %v", err)
-        return
-    }
-    proxyPwd := startupMsg.Parameters["password"]
-    delete(startupMsg.Parameters, "password")
-    params := connConfig.GetConfig()
-    startupMsg.Parameters["user"] = params.Username
-    startupMsg.Parameters["database"] = params.Database
-    modified, err := serializeStartup(startupMsg)
-    if err != nil {
-        log.Printf("serializeStartup error: %v", err)
-        return
-    }
-    if _, err := serverConn.Write(modified); err != nil {
-        log.Printf("Write modified startup failed: %v", err)
-        return
-    }
+        k := bytes.IndexByte(data[i:], 0)
+        if k < 0 {
+            break
+        }
+        val := string(data[i : i+k])
+        i += k + 1
 
-    // 认证中继
-    if err := handleAuth(serverConn, clientConn, params.Username, params.Password, proxyPwd); err != nil {
-        log.Printf("authentication error: %v", err)
-        return
+        m[key] = val
     }
-
-    // 转发剩余流量
-    go io.Copy(serverConn, buf)
-    io.Copy(clientConn, serverConn)
+    return m
 }
