@@ -204,25 +204,15 @@ func handleClient(clientConn net.Conn) {
     buf := bufio.NewReader(clientConn)
 
     // SSLRequest: reject so client falls back to plaintext
-    header, err := buf.Peek(8)
-    if err != nil {
-        log.Printf("peek error: %v", err)
-        return
-    }
-    length := binary.BigEndian.Uint32(header[0:4])
-    proto := binary.BigEndian.Uint32(header[4:8])
-    if length == 8 && proto == 80877103 {
-        // consume SSLRequest
-        buf.Discard(8)
-        // respond 'N' (no SSL)
-        if _, err := clientConn.Write([]byte{'N'}); err != nil {
-            log.Printf("write SSL reject: %v", err)
-            return
+    if header, err := buf.Peek(8); err == nil {
+        length := binary.BigEndian.Uint32(header[0:4])
+        proto := binary.BigEndian.Uint32(header[4:8])
+        if length == 8 && proto == 80877103 {
+            buf.Discard(8)
+            clientConn.Write([]byte{'N'})
         }
-        // continue to read StartupMessage in plaintext
     }
 
-    // get backend connection
     poolMu.Lock()
     p := activePool
     poolMu.Unlock()
@@ -233,7 +223,6 @@ func handleClient(clientConn net.Conn) {
     }
     defer p.Put(serverConn)
 
-    // read and rewrite StartupMessage
     skb, err := readStartupMessage(buf)
     if err != nil {
         log.Printf("readStartupMessage error: %v", err)
@@ -251,64 +240,142 @@ func handleClient(clientConn net.Conn) {
     }
     serverConn.Write(data)
 
-    // authentication relay
     if err := handleAuth(serverConn, clientConn, params.Username, params.Password, proxyPwd); err != nil {
         log.Printf("authentication error: %v", err)
         return
     }
 
-    // data proxying
     go io.Copy(serverConn, buf)
     io.Copy(clientConn, serverConn)
 }
 
 func handleAuth(serverConn, clientConn net.Conn, user, dbPwd, proxyPwd string) error {
     for {
+        // read server message type
         var t [1]byte
         if _, err := io.ReadFull(serverConn, t[:]); err != nil {
             return err
         }
+        // read length
         var lenb [4]byte
         if _, err := io.ReadFull(serverConn, lenb[:]); err != nil {
             return err
         }
         length := binary.BigEndian.Uint32(lenb[:])
-        payload := make([]byte, length)
-        if length > 0 {
+        // read payload if any
+        var payload []byte
+        if length > 4 {
+            payload = make([]byte, length-4)
             if _, err := io.ReadFull(serverConn, payload); err != nil {
                 return err
             }
         }
-        // relay to client
-        clientConn.Write(t[:]); clientConn.Write(lenb[:]); clientConn.Write(payload)
+        // relay server->client
+        clientConn.Write(t[:])
+        clientConn.Write(lenb[:])
+        if len(payload) > 0 {
+            clientConn.Write(payload)
+        }
+        // only act on Authentication (R)
         if t[0] != 'R' {
             continue
         }
         authType := binary.BigEndian.Uint32(payload[:4])
         switch authType {
         case 0:
+            // AuthenticationOk
             return nil
         case 3:
             // Cleartext
             if proxyPwd != cfg.ProxyAuthPassword {
                 return fmt.Errorf("invalid proxy auth password")
             }
-            // read client password message
-            var tag [1]byte; io.ReadFull(clientConn, tag[:])
-            var plenb2 [4]byte; io.ReadFull(clientConn, plenb2[:])
-            plen := binary.BigEndian.Uint32(plenb2[:]); pwdBytes := make([]byte, plen-4)
-            io.ReadFull(clientConn, pwdBytes)
-            sendPasswordMsg(serverConn, dbPwd)
+            if err := proxyPasswordMessage(serverConn, clientConn, dbPwd); err != nil {
+                return err
+            }
+            continue
         case 5:
+            // MD5
             salt := payload[4:8]
-            sendPasswordMsg(serverConn, md5Password(dbPwd, user, salt))
-        case 10:
-            // SCRAM: continue relaying until AuthenticationOk
+            if err := proxyMD5PasswordMessage(serverConn, clientConn, dbPwd, user, salt); err != nil {
+                return err
+            }
+            continue
+        case 10, 11:
+            // SCRAM initial/continue: client must respond
+            if err := proxyClientToServerMessage(serverConn, clientConn); err != nil {
+                return err
+            }
+            continue
+        case 12:
+            // SCRAM final: just forwarded above
             continue
         default:
             return fmt.Errorf("unsupported auth type %d", authType)
         }
     }
+}
+
+// Reads client PasswordMessage and sends real password
+func proxyPasswordMessage(serverConn, clientConn net.Conn, dbPwd string) error {
+    var tag [1]byte
+    if _, err := io.ReadFull(clientConn, tag[:]); err != nil {
+        return err
+    }
+    var lenb [4]byte
+    if _, err := io.ReadFull(clientConn, lenb[:]); err != nil {
+        return err
+    }
+    length := binary.BigEndian.Uint32(lenb[:])
+    if length > 4 {
+        discard := make([]byte, length-4)
+        if _, err := io.ReadFull(clientConn, discard); err != nil { return err }
+    }
+    return sendPasswordMsg(serverConn, dbPwd)
+}
+
+// Reads client MD5 PasswordMessage and sends correct MD5
+func proxyMD5PasswordMessage(serverConn, clientConn net.Conn, dbPwd, user string, salt []byte) error {
+    var tag [1]byte
+    if _, err := io.ReadFull(clientConn, tag[:]); err != nil {
+        return err
+    }
+    var lenb [4]byte
+    if _, err := io.ReadFull(clientConn, lenb[:]); err != nil {
+        return err
+    }
+    length := binary.BigEndian.Uint32(lenb[:])
+    if length > 4 {
+        discard := make([]byte, length-4)
+        if _, err := io.ReadFull(clientConn, discard); err != nil { return err }
+    }
+    return sendPasswordMsg(serverConn, md5Password(dbPwd, user, salt))
+}
+
+// For SCRAM: reads a message from client and forwards to server
+func proxyClientToServerMessage(serverConn, clientConn net.Conn) error {
+    var tag [1]byte
+    if _, err := io.ReadFull(clientConn, tag[:]); err != nil {
+        return err
+    }
+    var lenb [4]byte
+    if _, err := io.ReadFull(clientConn, lenb[:]); err != nil {
+        return err
+    }
+    length := binary.BigEndian.Uint32(lenb[:])
+    var payload []byte
+    if length > 4 {
+        payload = make([]byte, length-4)
+        if _, err := io.ReadFull(clientConn, payload); err != nil {
+            return err
+        }
+    }
+    serverConn.Write(tag[:])
+    serverConn.Write(lenb[:])
+    if len(payload) > 0 {
+        serverConn.Write(payload)
+    }
+    return nil
 }
 
 func sendPasswordMsg(conn net.Conn, pwd string) error {
@@ -317,7 +384,8 @@ func sendPasswordMsg(conn net.Conn, pwd string) error {
     buf := new(bytes.Buffer)
     buf.WriteByte('p')
     binary.Write(buf, binary.BigEndian, length)
-    buf.Write(data); buf.WriteByte(0)
+    buf.Write(data)
+    buf.WriteByte(0)
     _, err := conn.Write(buf.Bytes())
     return err
 }
@@ -374,8 +442,10 @@ func serializeStartup(msg *StartupMessage) ([]byte, error) {
     buf.Write([]byte{0, 0, 0, 0})
     binary.Write(&buf, binary.BigEndian, uint32(msg.ProtocolVersion))
     for k, v := range msg.Parameters {
-        buf.WriteString(k); buf.WriteByte(0)
-        buf.WriteString(v); buf.WriteByte(0)
+        buf.WriteString(k)
+        buf.WriteByte(0)
+        buf.WriteString(v)
+        buf.WriteByte(0)
     }
     buf.WriteByte(0)
     total := int32(buf.Len())
