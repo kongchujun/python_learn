@@ -1,9 +1,224 @@
-Flask==3.0.3
-aiohttp==3.9.5
-uvicorn==0.30.1
-fastapi==0.111.0
-traits==6.4.3
-psycopg2-binary
-sqlalchemy
-psycopg2
-langgraph==0.2.3
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"sync"
+	"time"
+)
+
+// 配置信息
+type Config struct {
+	ProxyPort       int    `json:"proxyPort"`       // 代理监听的端口
+	ApiPort         int    `json:"apiPort"`         // API服务监听的端口
+	PgmakerEndpoint string `json:"pgmakerEndpoint"` // pgmaker的API端点
+}
+
+// 数据库连接信息
+type DBCredentials struct {
+	Host     string `json:"host"`
+	Port     int    `json:"port"`
+	Username string `json:"username"`
+	Password string `json:"password"`
+	DBName   string `json:"dbname"`
+}
+
+// 全局状态
+var (
+	config      Config
+	dbCreds     DBCredentials
+	dbCredMutex sync.RWMutex
+	isReady     bool = false
+	readyMutex  sync.RWMutex
+)
+
+func main() {
+	// 解析命令行参数
+	proxyPort := flag.Int("proxy-port", 5432, "Port for PostgreSQL proxy to listen on")
+	apiPort := flag.Int("api-port", 8080, "Port for API server to listen on")
+	pgmakerEndpoint := flag.String("pgmaker-endpoint", "https://nic-infra-router.uat.digital.gbm.cloud.uk.hsbc.9500/pgmaker/aimpg_db", "PGMaker endpoint URL")
+	flag.Parse()
+
+	config = Config{
+		ProxyPort:       *proxyPort,
+		ApiPort:         *apiPort,
+		PgmakerEndpoint: *pgmakerEndpoint,
+	}
+
+	// 启动API服务器
+	go startAPIServer()
+
+	// 注册到 pgmaker 服务
+	go registerToPGMaker()
+
+	// 启动代理服务器
+	startProxyServer()
+}
+
+// 启动API服务器，用于接收pgmaker的凭据更新
+func startAPIServer() {
+	http.HandleFunc("/update-credentials", handleCredentialsUpdate)
+	http.HandleFunc("/health", handleHealthCheck)
+
+	log.Printf("API server listening on port %d", config.ApiPort)
+	if err := http.ListenAndServe(fmt.Sprintf(":%d", config.ApiPort), nil); err != nil {
+		log.Fatalf("Failed to start API server: %v", err)
+	}
+}
+
+// 处理来自pgmaker的凭据更新请求
+func handleCredentialsUpdate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var newCreds DBCredentials
+	if err := json.NewDecoder(r.Body).Decode(&newCreds); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	// 更新凭据
+	dbCredMutex.Lock()
+	dbCreds = newCreds
+	dbCredMutex.Unlock()
+
+	// 标记服务就绪
+	readyMutex.Lock()
+	isReady = true
+	readyMutex.Unlock()
+
+	log.Printf("Credentials updated: host=%s, port=%d, user=%s, db=%s", 
+		newCreds.Host, newCreds.Port, newCreds.Username, newCreds.DBName)
+
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("Credentials updated successfully"))
+}
+
+// 健康检查端点
+func handleHealthCheck(w http.ResponseWriter, r *http.Request) {
+	readyMutex.RLock()
+	ready := isReady
+	readyMutex.RUnlock()
+
+	if ready {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("Service is ready"))
+	} else {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		w.Write([]byte("Service is not ready yet"))
+	}
+}
+
+// 向pgmaker服务注册
+func registerToPGMaker() {
+	// 准备注册数据
+	registerData := map[string]interface{}{
+		"api_endpoint": fmt.Sprintf("http://localhost:%d/update-credentials", config.ApiPort),
+	}
+	jsonData, err := json.Marshal(registerData)
+	if err != nil {
+		log.Fatalf("Failed to marshal registration data: %v", err)
+	}
+
+	// 发送注册请求
+	log.Printf("Registering with pgmaker at %s", config.PgmakerEndpoint)
+	resp, err := http.Post(config.PgmakerEndpoint, "application/json", bytes.NewBuffer(jsonData))
+	if err != nil {
+		log.Fatalf("Failed to register with pgmaker: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// 检查响应
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		log.Fatalf("Registration failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	log.Println("Successfully registered with pgmaker")
+
+	// 每小时重新注册，确保连接持续有效
+	ticker := time.NewTicker(50 * time.Minute)
+	for range ticker.C {
+		log.Println("Re-registering with pgmaker...")
+		resp, err := http.Post(config.PgmakerEndpoint, "application/json", bytes.NewBuffer(jsonData))
+		if err != nil {
+			log.Printf("Failed to re-register with pgmaker: %v", err)
+			continue
+		}
+		resp.Body.Close()
+		log.Println("Successfully re-registered with pgmaker")
+	}
+}
+
+// 启动代理服务器
+func startProxyServer() {
+	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", config.ProxyPort))
+	if err != nil {
+		log.Fatalf("Failed to start proxy server: %v", err)
+	}
+	defer listener.Close()
+
+	log.Printf("Proxy server listening on port %d", config.ProxyPort)
+
+	for {
+		clientConn, err := listener.Accept()
+		if err != nil {
+			log.Printf("Failed to accept connection: %v", err)
+			continue
+		}
+
+		go handleConnection(clientConn)
+	}
+}
+
+// 处理客户端连接
+func handleConnection(clientConn net.Conn) {
+	defer clientConn.Close()
+
+	// 等待服务就绪
+	readyMutex.RLock()
+	ready := isReady
+	readyMutex.RUnlock()
+
+	if !ready {
+		log.Println("Service not ready yet, rejecting connection")
+		return
+	}
+
+	// 获取当前有效的数据库凭据
+	dbCredMutex.RLock()
+	creds := dbCreds
+	dbCredMutex.RUnlock()
+
+	// 连接到PostgreSQL服务器
+	dbConn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", creds.Host, creds.Port))
+	if err != nil {
+		log.Printf("Failed to connect to PostgreSQL server: %v", err)
+		return
+	}
+	defer dbConn.Close()
+
+	log.Printf("New connection established to PostgreSQL at %s:%d", creds.Host, creds.Port)
+
+	// 在两个连接之间交换数据
+	errCh := make(chan error, 2)
+	go proxy(clientConn, dbConn, errCh)
+	go proxy(dbConn, clientConn, errCh)
+
+	// 等待任一方向出错或关闭
+	<-errCh
+}
+
+// 双向代理数据传输
+func proxy(dst net.Conn, src net.Conn, errCh chan error) {
+	_, err := io.Copy(dst, src)
+	errCh <- err
+}
