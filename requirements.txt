@@ -29,6 +29,21 @@ type DBCredentials struct {
 	DBName   string `json:"dbname"`
 }
 
+// 设置数据库凭据
+func (c *DBCredentials) Set(host string, port int, username, password, dbname string) {
+	c.Host = host
+	c.Port = port
+	c.Username = username
+	c.Password = password
+	c.DBName = dbname
+}
+
+// 获取数据库连接字符串
+func (c *DBCredentials) ConnectionString() string {
+	return fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=require",
+		c.Host, c.Port, c.Username, c.Password, c.DBName)
+}
+
 // 全局状态
 var (
 	config      Config
@@ -63,7 +78,8 @@ func main() {
 
 // 启动API服务器，用于接收pgmaker的凭据更新
 func startAPIServer() {
-	http.HandleFunc("/update-credentials", handleCredentialsUpdate)
+	// 将API路径更改为 /aimarkets_pgmaker/pg-secretes
+	http.HandleFunc("/aimarkets_pgmaker/pg-secretes", handleCredentialsUpdate)
 	http.HandleFunc("/health", handleHealthCheck)
 
 	log.Printf("API server listening on port %d", config.ApiPort)
@@ -87,7 +103,13 @@ func handleCredentialsUpdate(w http.ResponseWriter, r *http.Request) {
 
 	// 更新凭据
 	dbCredMutex.Lock()
-	dbCreds = newCreds
+	dbCreds.Set(
+		newCreds.Host,
+		newCreds.Port,
+		newCreds.Username,
+		newCreds.Password,
+		newCreds.DBName,
+	)
 	dbCredMutex.Unlock()
 
 	// 标记服务就绪
@@ -121,7 +143,8 @@ func handleHealthCheck(w http.ResponseWriter, r *http.Request) {
 func registerToPGMaker() {
 	// 准备注册数据
 	registerData := map[string]interface{}{
-		"api_endpoint": fmt.Sprintf("http://localhost:%d/update-credentials", config.ApiPort),
+		// 更新API路径
+		"api_endpoint": fmt.Sprintf("http://localhost:%d/aimarkets_pgmaker/pg-secretes", config.ApiPort),
 	}
 	jsonData, err := json.Marshal(registerData)
 	if err != nil {
