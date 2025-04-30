@@ -12,9 +12,13 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 )
+
+// 设置详细日志
+var logger = log.New(os.Stdout, "[PG-PROXY] ", log.LstdFlags|log.Lshortfile)
 
 // ConnectionConfig 存储 PostgreSQL 连接参数，支持并发安全读写
 type ConnectionConfig struct {
@@ -41,7 +45,7 @@ func (cc *ConnectionConfig) SetConfig(hostname string, port int, username, passw
 	cc.username = username
 	cc.password = password
 	cc.databaseName = databaseName
-	log.Printf("Config updated: %s:%d user=%s db=%s", hostname, port, username, databaseName)
+	logger.Printf("Config updated: %s:%d user=%s db=%s", hostname, port, username, databaseName)
 }
 
 // GetConfig 返回当前连接参数
@@ -59,11 +63,13 @@ func (cc *ConnectionConfig) GetConfig() ConnParams {
 
 // Config 定义代理和 API 服务地址及连接池参数
 type Config struct {
-	ProxyListenAddr   string // 代理监听地址
-	APIListenAddr     string // API 监听地址
-	APIPasswordUpdate string // 更新配置 API 路径
-	PoolSize          int    // 连接池大小
-	ProxyAuthPassword string // 代理访问校验密码
+	ProxyListenAddr    string // 代理监听地址
+	APIListenAddr      string // API 监听地址
+	APIPasswordUpdate  string // 更新配置 API 路径
+	PoolSize           int    // 连接池大小
+	ProxyAuthPassword  string // 代理访问校验密码
+	ConnectTimeout     time.Duration // 连接超时
+	ConnectionAttempts int           // 连接尝试次数
 }
 
 // StartupMessage 表示 PostgreSQL 启动包
@@ -80,11 +86,17 @@ type ConnPool struct {
 	size     int
 	draining bool
 	mu       sync.Mutex
+	cfg      *Config
 }
 
 // newPool 创建连接池
-func newPool(cc *ConnectionConfig, size int) *ConnPool {
-	return &ConnPool{cc: cc, pool: make(chan net.Conn, size), size: size}
+func newPool(cc *ConnectionConfig, size int, cfg *Config) *ConnPool {
+	return &ConnPool{
+		cc:   cc,
+		pool: make(chan net.Conn, size),
+		size: size,
+		cfg:  cfg,
+	}
 }
 
 // Get 从池中获取连接，池空则新建
@@ -92,55 +104,91 @@ func (p *ConnPool) Get() (net.Conn, error) {
 	select {
 	case conn := <-p.pool:
 		// 检查连接是否仍然有效
-		one := []byte{1}
-		conn.SetReadDeadline(time.Now().Add(time.Millisecond * 10))
+		conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+		one := make([]byte, 1)
 		_, err := conn.Read(one)
-		conn.SetReadDeadline(time.Time{})  // 重置读取超时
-		if err == nil || err != io.EOF {
-			// 如果连接有数据或错误不是EOF，说明连接可能已经使用过，不应重用
+		conn.SetReadDeadline(time.Time{}) // 重置读取超时
+		
+		if err == nil {
+			// 连接有数据，不能重用
+			logger.Printf("Connection has data, cannot reuse")
 			conn.Close()
-		} else if err == io.EOF {
-			// 重置并尝试重用连接
+		} else if err != io.EOF && !os.IsTimeout(err) {
+			// 连接出错且不是EOF或超时，不能重用
+			logger.Printf("Connection error: %v, cannot reuse", err)
+			conn.Close() 
+		} else {
+			// 连接看起来正常，可以重用
+			logger.Printf("Reusing connection from pool")
 			return conn, nil
 		}
-		// 连接异常，需要新建
 	default:
 		// 池为空，需要新建
 	}
 	
-	cfg := p.cc.GetConfig()
-	dialer := net.Dialer{Timeout: 5 * time.Second}
-	conn, err := dialer.Dial("tcp", fmt.Sprintf("%s:%d", cfg.Hostname, cfg.Port))
-	if err != nil {
-		log.Printf("Failed to dial backend: %v", err)
+	params := p.cc.GetConfig()
+	addr := fmt.Sprintf("%s:%d", params.Hostname, params.Port)
+	logger.Printf("Dialing backend at %s", addr)
+	
+	// 尝试多次连接
+	var conn net.Conn
+	var err error
+	
+	for i := 0; i < p.cfg.ConnectionAttempts; i++ {
+		dialer := net.Dialer{Timeout: p.cfg.ConnectTimeout}
+		conn, err = dialer.Dial("tcp", addr)
+		if err == nil {
+			break
+		}
+		logger.Printf("Connection attempt %d failed: %v", i+1, err)
+		time.Sleep(100 * time.Millisecond) // 短暂延迟后重试
 	}
-	return conn, err
+	
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to backend after %d attempts: %w", 
+			p.cfg.ConnectionAttempts, err)
+	}
+	
+	logger.Printf("New connection established to %s", addr)
+	return conn, nil
 }
 
 // Put 将连接归还池中；draining 时关闭
 func (p *ConnPool) Put(conn net.Conn) {
+	if conn == nil {
+		return
+	}
+	
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	
 	if p.draining {
+		logger.Printf("Pool is draining, closing connection")
 		conn.Close()
 		return
 	}
 	
-	// 设置一小段读超时来检测连接是否可用
-	conn.SetReadDeadline(time.Now().Add(time.Millisecond * 10))
-	one := []byte{1}
+	// 设置超时以检测连接是否可用
+	conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	one := make([]byte, 1)
 	_, err := conn.Read(one)
-	conn.SetReadDeadline(time.Time{})  // 重置读取超时
+	conn.SetReadDeadline(time.Time{}) // 重置超时
 	
 	if err == io.EOF {
-		// 正常EOF，连接可能还OK
+		logger.Printf("Connection EOF, may be closed by server")
+		conn.Close()
+	} else if os.IsTimeout(err) {
+		// 超时意味着没有待读数据，连接可能仍然有效
 		select {
 		case p.pool <- conn:
+			logger.Printf("Connection returned to pool")
 		default:
+			logger.Printf("Pool full, closing connection")
 			conn.Close()
 		}
 	} else {
-		// 连接有数据或发生了其他错误，直接关闭
+		// 连接有数据或出错
+		logger.Printf("Connection has data or error: %v, closing", err)
 		conn.Close()
 	}
 }
@@ -149,11 +197,20 @@ func (p *ConnPool) Put(conn net.Conn) {
 func (p *ConnPool) Reset() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	
+	logger.Printf("Resetting connection pool")
 	p.draining = true
+	
+	// 关闭所有连接
 	close(p.pool)
+	count := 0
 	for c := range p.pool {
 		c.Close()
+		count++
 	}
+	logger.Printf("Closed %d connections from pool", count)
+	
+	// 重建池
 	p.pool = make(chan net.Conn, p.size)
 	p.draining = false
 }
@@ -161,11 +218,13 @@ func (p *ConnPool) Reset() {
 var (
 	connConfig = &ConnectionConfig{}
 	cfg        = Config{
-		ProxyListenAddr:   ":5433",
-		APIListenAddr:     ":8080",
-		APIPasswordUpdate: "/update-password",
-		PoolSize:          10,
-		ProxyAuthPassword: "pwd_postgres",
+		ProxyListenAddr:    ":5433",
+		APIListenAddr:      ":8080",
+		APIPasswordUpdate:  "/update-password",
+		PoolSize:           10,
+		ProxyAuthPassword:  "pwd_postgres",
+		ConnectTimeout:     5 * time.Second,
+		ConnectionAttempts: 3,
 	}
 	activePool *ConnPool
 	oldPool    *ConnPool
@@ -176,30 +235,57 @@ var (
 func rotatePools() {
 	poolMu.Lock()
 	defer poolMu.Unlock()
-	newP := newPool(connConfig, cfg.PoolSize)
+	
+	logger.Printf("Rotating connection pools")
+	newP := newPool(connConfig, cfg.PoolSize, &cfg)
+	
 	if activePool != nil {
 		oldPool = activePool
 		oldPool.Reset()
 	}
+	
 	activePool = newP
 }
 
 func main() {
+	// 配置文件日志
+	f, err := os.OpenFile("postgres_proxy.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err == nil {
+		multiWriter := io.MultiWriter(os.Stdout, f)
+		logger = log.New(multiWriter, "[PG-PROXY] ", log.LstdFlags|log.Lshortfile)
+	}
+	
+	// 打印启动信息
+	logger.Printf("Starting PostgreSQL Proxy")
+	logger.Printf("Proxy will listen on: %s", cfg.ProxyListenAddr)
+	logger.Printf("API will listen on: %s", cfg.APIListenAddr)
+	
 	// 初始化
 	connConfig.SetConfig("postgres", 5432, "postgres", "initial_password", "mydb")
-	activePool = newPool(connConfig, cfg.PoolSize)
+	activePool = newPool(connConfig, cfg.PoolSize, &cfg)
 
-	go startAPIServer()
-	startProxyServer()
+	// 启动API服务器
+	go func() {
+		if err := startAPIServer(); err != nil {
+			logger.Fatalf("API server failed: %v", err)
+		}
+	}()
+	
+	// 启动代理服务器
+	if err := startProxyServer(); err != nil {
+		logger.Fatalf("Proxy server failed: %v", err)
+	}
 }
 
 // startAPIServer 提供 HTTP 接口，更新配置并切换池
-func startAPIServer() {
+func startAPIServer() error {
 	http.HandleFunc(cfg.APIPasswordUpdate, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
+			logger.Printf("Received non-POST request to update endpoint")
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
+		
 		var req struct {
 			Hostname     string `json:"hostname"`
 			Port         int    `json:"port"`
@@ -207,65 +293,138 @@ func startAPIServer() {
 			Password     string `json:"password"`
 			DatabaseName string `json:"databasename"`
 		}
+		
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			logger.Printf("Failed to parse update request: %v", err)
 			http.Error(w, "Bad request: "+err.Error(), http.StatusBadRequest)
 			return
 		}
+		
 		if req.Hostname == "" || req.Port == 0 || req.Username == "" || req.Password == "" || req.DatabaseName == "" {
+			logger.Printf("Incomplete update request: %+v", req)
 			http.Error(w, "All fields required", http.StatusBadRequest)
 			return
 		}
+		
+		logger.Printf("Updating config with new parameters")
 		connConfig.SetConfig(req.Hostname, req.Port, req.Username, req.Password, req.DatabaseName)
 		rotatePools()
+		
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprint(w, "Config updated and pools rotated")
+		logger.Printf("Config update successful")
 	})
-	log.Printf("API listening on %s", cfg.APIListenAddr)
-	log.Fatal(http.ListenAndServe(cfg.APIListenAddr, nil))
+	
+	// 添加健康检查端点
+	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "OK")
+	})
+	
+	// 显示当前配置状态（敏感信息隐藏）
+	http.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
+		params := connConfig.GetConfig()
+		status := struct {
+			Hostname string `json:"hostname"`
+			Port     int    `json:"port"`
+			Username string `json:"username"`
+			Database string `json:"database"`
+		}{
+			Hostname: params.Hostname,
+			Port:     params.Port,
+			Username: params.Username,
+			Database: params.Database,
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(status)
+	})
+	
+	// 启动测试端点 - 测试到后端的连接
+	http.HandleFunc("/test-connection", func(w http.ResponseWriter, r *http.Request) {
+		poolMu.Lock()
+		p := activePool
+		poolMu.Unlock()
+		
+		conn, err := p.Get()
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Failed to connect to backend: %v", err), http.StatusInternalServerError)
+			return
+		}
+		defer p.Put(conn)
+		
+		fmt.Fprintf(w, "Successfully connected to backend PostgreSQL")
+	})
+	
+	logger.Printf("API server listening on %s", cfg.APIListenAddr)
+	return http.ListenAndServe(cfg.APIListenAddr, nil)
 }
 
 // startProxyServer 启动 TCP 代理
-func startProxyServer() {
+func startProxyServer() error {
 	ln, err := net.Listen("tcp", cfg.ProxyListenAddr)
 	if err != nil {
-		log.Fatalf("Proxy listen failed: %v", err)
+		return fmt.Errorf("proxy listen failed: %w", err)
 	}
-	log.Printf("Proxy listening on %s", cfg.ProxyListenAddr)
+	
+	logger.Printf("Proxy server listening on %s", cfg.ProxyListenAddr)
+	
 	for {
 		clientConn, err := ln.Accept()
 		if err != nil {
-			log.Printf("Accept error: %v", err)
+			logger.Printf("Accept error: %v", err)
 			continue
 		}
+		
+		clientAddr := clientConn.RemoteAddr()
+		logger.Printf("New client connection from %s", clientAddr)
+		
 		go handleClient(clientConn)
 	}
 }
 
 // handleClient 处理客户端连接：Startup/Auth 转发
 func handleClient(clientConn net.Conn) {
-	defer clientConn.Close()
+	clientAddr := clientConn.RemoteAddr()
+	logger.Printf("Handling client connection from %s", clientAddr)
+	
+	defer func() {
+		clientConn.Close()
+		logger.Printf("Client connection from %s closed", clientAddr)
+	}()
 	
 	poolMu.Lock()
 	p := activePool
 	poolMu.Unlock()
 	
+	// 获取后端连接
+	logger.Printf("Acquiring backend connection for client %s", clientAddr)
 	serverConn, err := p.Get()
 	if err != nil {
-		log.Printf("Get backend conn failed: %v", err)
+		logger.Printf("Failed to get backend connection for client %s: %v", clientAddr, err)
+		// 尝试向客户端发送错误消息
+		sendErrorToClient(clientConn, "Backend connection failed")
 		return
 	}
-	defer p.Put(serverConn)
+	
+	serverAddr := serverConn.RemoteAddr()
+	logger.Printf("Got backend connection to %s for client %s", serverAddr, clientAddr)
+	
+	defer func() {
+		logger.Printf("Closing backend connection to %s", serverAddr)
+		p.Put(serverConn)
+	}()
 
 	clientBuf := bufio.NewReader(clientConn)
 	
 	// 读取客户端的startup消息
+	logger.Printf("Reading startup message from client %s", clientAddr)
 	skb, err := readStartupMessage(clientBuf)
 	if err != nil {
-		log.Printf("readStartupMessage error: %v", err)
+		logger.Printf("Failed to read startup message from client %s: %v", clientAddr, err)
 		return
 	}
 	
-	log.Printf("Client startup message: %+v", skb.Parameters)
+	logger.Printf("Client %s startup parameters: %v", clientAddr, skb.Parameters)
 	
 	// 保存客户端提供的密码用于代理认证，然后把它从参数中移除
 	proxyPwd := skb.Parameters["password"]
@@ -276,44 +435,123 @@ func handleClient(clientConn net.Conn) {
 	skb.Parameters["user"] = params.Username
 	skb.Parameters["database"] = params.Database
 	
-	log.Printf("Modified startup message: %+v", skb.Parameters)
+	logger.Printf("Modified startup parameters for client %s: %v", clientAddr, skb.Parameters)
 	
 	// 序列化并发送到后端
+	logger.Printf("Serializing and sending startup message to backend %s", serverAddr)
 	data, err := serializeStartup(skb)
 	if err != nil {
-		log.Printf("serializeStartup error: %v", err)
+		logger.Printf("Failed to serialize startup message for client %s: %v", clientAddr, err)
 		return
 	}
 	
-	if _, err := serverConn.Write(data); err != nil {
-		log.Printf("Failed to send startup message to server: %v", err)
+	// 添加详细诊断
+	logger.Printf("Sending %d bytes of startup data to backend %s", len(data), serverAddr)
+	_, err = serverConn.Write(data)
+	if err != nil {
+		logger.Printf("Failed to send startup message to server %s: %v", serverAddr, err)
+		// 检查连接的具体状态
+		testBackendConnection(serverConn)
 		return
 	}
 
 	// 处理身份验证
+	logger.Printf("Starting authentication for client %s", clientAddr)
 	if err := handleAuth(serverConn, clientConn, params.Username, params.Password, proxyPwd); err != nil {
-		log.Printf("Authentication error: %v", err)
+		logger.Printf("Authentication error for client %s: %v", clientAddr, err)
 		return
 	}
 
-	log.Print("Authentication successful, entering relay mode")
+	logger.Printf("Authentication successful for client %s, entering relay mode", clientAddr)
 	
 	// 正向和反向复制数据
 	errCh := make(chan error, 2)
 	
 	go func() {
 		_, err := io.Copy(serverConn, clientBuf)
+		logger.Printf("Client->Server data transfer ended for %s: %v", clientAddr, err)
 		errCh <- err
 	}()
 	
 	go func() {
 		_, err := io.Copy(clientConn, serverConn)
+		logger.Printf("Server->Client data transfer ended for %s: %v", clientAddr, err)
 		errCh <- err
 	}()
 	
+	// 等待其中一个数据通道结束
 	err = <-errCh
 	if err != nil && err != io.EOF {
-		log.Printf("Data relay error: %v", err)
+		logger.Printf("Data relay error for client %s: %v", clientAddr, err)
+	} else {
+		logger.Printf("Connection closed normally for client %s", clientAddr)
+	}
+}
+
+// 发送错误消息到客户端
+func sendErrorToClient(clientConn net.Conn, message string) {
+	// PostgreSQL 错误响应格式
+	buf := new(bytes.Buffer)
+	buf.WriteByte('E') // 错误消息
+	
+	// 占位符，稍后填充长度
+	buf.Write([]byte{0, 0, 0, 0})
+	
+	// 错误字段
+	buf.WriteByte('S') // Severity
+	buf.WriteString("ERROR")
+	buf.WriteByte(0)
+	
+	buf.WriteByte('C') // Code
+	buf.WriteString("08006") // 连接失败代码
+	buf.WriteByte(0)
+	
+	buf.WriteByte('M') // Message
+	buf.WriteString(message)
+	buf.WriteByte(0)
+	
+	buf.WriteByte(0) // 终止符
+	
+	// 计算并填充消息长度
+	data := buf.Bytes()
+	binary.BigEndian.PutUint32(data[1:5], uint32(buf.Len()-1))
+	
+	// 发送错误消息
+	clientConn.Write(data)
+}
+
+// 测试后端连接
+func testBackendConnection(conn net.Conn) {
+	// 检查连接状态
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		file, err := tcpConn.File()
+		if err != nil {
+			logger.Printf("Failed to get connection file: %v", err)
+			return
+		}
+		defer file.Close()
+		
+		logger.Printf("Connection file descriptor: %v", file.Fd())
+	}
+	
+	// 尝试发送测试数据
+	conn.SetWriteDeadline(time.Now().Add(time.Second))
+	_, err := conn.Write([]byte{0})
+	conn.SetWriteDeadline(time.Time{})
+	
+	if err != nil {
+		logger.Printf("Test write failed: %v", err)
+		
+		// 检查错误类型
+		if netErr, ok := err.(net.Error); ok {
+			logger.Printf("Network error details - Timeout: %v, Temporary: %v", 
+				netErr.Timeout(), netErr.Temporary())
+		}
+		
+		// 检查特定操作系统错误
+		logger.Printf("Error type: %T", err)
+	} else {
+		logger.Printf("Test write successful")
 	}
 }
 
@@ -321,97 +559,132 @@ func handleClient(clientConn net.Conn) {
 func handleAuth(serverConn, clientConn net.Conn, user, dbPwd, proxyPwd string) error {
 	serverBuf := make([]byte, 4096)
 	clientBuf := make([]byte, 4096)
+	clientAddr := clientConn.RemoteAddr()
+	serverAddr := serverConn.RemoteAddr()
 
 	for {
+		// 设置读取超时，避免永久阻塞
+		serverConn.SetReadDeadline(time.Now().Add(30 * time.Second))
+		
 		// 读取服务器认证消息
 		msgType, msgLen, payload, err := readMessage(serverConn, serverBuf)
+		
+		// 重置读取超时
+		serverConn.SetReadDeadline(time.Time{})
+		
 		if err != nil {
 			return fmt.Errorf("failed to read server auth message: %w", err)
 		}
 
-		log.Printf("Server auth message: type=%c len=%d", msgType, msgLen)
+		logger.Printf("Server %s auth message: type=%c len=%d", serverAddr, msgType, msgLen)
 		
 		// 转发到客户端
 		header := make([]byte, 5)
 		header[0] = msgType
 		binary.BigEndian.PutUint32(header[1:], msgLen)
 		
-		if _, err := clientConn.Write(header); err != nil {
-			return fmt.Errorf("failed to forward auth header to client: %w", err)
+		_, err = clientConn.Write(header)
+		if err != nil {
+			return fmt.Errorf("failed to forward auth header to client %s: %w", clientAddr, err)
 		}
 		
 		if msgLen > 4 {
-			if _, err := clientConn.Write(payload[:msgLen-4]); err != nil {
-				return fmt.Errorf("failed to forward auth payload to client: %w", err)
+			_, err = clientConn.Write(payload[:msgLen-4])
+			if err != nil {
+				return fmt.Errorf("failed to forward auth payload to client %s: %w", clientAddr, err)
 			}
 		}
 		
 		if msgType != 'R' {
 			// 非认证消息，继续处理
+			// 如果是认证成功后的消息（如ReadyForQuery），可以继续或返回
+			if msgType == 'Z' {
+				logger.Printf("Authentication completed, server is ready for query")
+				return nil
+			}
 			continue
 		}
 		
 		// 处理不同类型的认证请求
 		authType := binary.BigEndian.Uint32(payload[:4])
-		log.Printf("Auth type: %d", authType)
+		logger.Printf("Auth type from server %s: %d", serverAddr, authType)
 		
 		switch authType {
 		case 0:
 			// 认证成功
+			logger.Printf("Authentication success message from server %s", serverAddr)
 			return nil
 			
 		case 3: // 明文密码认证
+			logger.Printf("Server %s requested cleartext password auth", serverAddr)
+			
 			// 校验代理密码
 			if proxyPwd != cfg.ProxyAuthPassword {
-				return fmt.Errorf("invalid proxy auth password")
+				return fmt.Errorf("invalid proxy auth password from client %s", clientAddr)
 			}
 			
 			// 读取客户端的密码响应
+			clientConn.SetReadDeadline(time.Now().Add(30 * time.Second))
 			msgType, msgLen, payload, err := readMessage(clientConn, clientBuf)
+			clientConn.SetReadDeadline(time.Time{})
+			
 			if err != nil {
-				return fmt.Errorf("failed to read client password response: %w", err)
+				return fmt.Errorf("failed to read client %s password response: %w", clientAddr, err)
 			}
 			
+			logger.Printf("Client %s password response: type=%c len=%d", clientAddr, msgType, msgLen)
+			
 			if msgType != 'p' {
-				return fmt.Errorf("unexpected message type from client: %c", msgType)
+				return fmt.Errorf("unexpected message type from client %s: %c", clientAddr, msgType)
 			}
 			
 			// 发送真正的数据库密码到服务器
+			logger.Printf("Sending real password to server %s", serverAddr)
 			if err := sendPasswordMsg(serverConn, dbPwd); err != nil {
-				return fmt.Errorf("failed to send password to server: %w", err)
+				return fmt.Errorf("failed to send password to server %s: %w", serverAddr, err)
 			}
 			
 		case 5: // MD5密码认证
+			logger.Printf("Server %s requested MD5 password auth", serverAddr)
+			
 			// 验证代理密码
 			if proxyPwd != cfg.ProxyAuthPassword {
-				return fmt.Errorf("invalid proxy auth password")
+				return fmt.Errorf("invalid proxy auth password from client %s", clientAddr)
 			}
 			
 			salt := payload[4:8]
+			logger.Printf("MD5 auth salt from server %s: %v", serverAddr, salt)
 			
 			// 读取客户端的密码响应
+			clientConn.SetReadDeadline(time.Now().Add(30 * time.Second))
 			msgType, msgLen, payload, err := readMessage(clientConn, clientBuf)
+			clientConn.SetReadDeadline(time.Time{})
+			
 			if err != nil {
-				return fmt.Errorf("failed to read client password response: %w", err)
+				return fmt.Errorf("failed to read client %s password response: %w", clientAddr, err)
 			}
 			
+			logger.Printf("Client %s password response: type=%c len=%d", clientAddr, msgType, msgLen)
+			
 			if msgType != 'p' {
-				return fmt.Errorf("unexpected message type from client: %c", msgType)
+				return fmt.Errorf("unexpected message type from client %s: %c", clientAddr, msgType)
 			}
 			
 			// 发送MD5散列密码到服务器
 			hashedPwd := md5Password(dbPwd, user, salt)
-			log.Printf("Sending MD5 password to server: %s", hashedPwd)
+			logger.Printf("Sending MD5 password to server %s: %s", serverAddr, hashedPwd)
+			
 			if err := sendPasswordMsg(serverConn, hashedPwd); err != nil {
-				return fmt.Errorf("failed to send MD5 password to server: %w", err)
+				return fmt.Errorf("failed to send MD5 password to server %s: %w", serverAddr, err)
 			}
 			
 		case 10: // SCRAM-SHA-256
-			// SCRAM认证需要多次交互，目前简化处理
+			logger.Printf("Server %s requested SCRAM-SHA-256 auth, passing through", serverAddr)
+			// SCRAM认证需要多次交互，简单透传
 			return nil
 			
 		default:
-			return fmt.Errorf("unsupported auth type %d", authType)
+			return fmt.Errorf("unsupported auth type %d from server %s", authType, serverAddr)
 		}
 	}
 }
@@ -421,13 +694,13 @@ func readMessage(conn net.Conn, buf []byte) (byte, uint32, []byte, error) {
 	// 读取消息类型
 	msgType := make([]byte, 1)
 	if _, err := io.ReadFull(conn, msgType); err != nil {
-		return 0, 0, nil, err
+		return 0, 0, nil, fmt.Errorf("read message type: %w", err)
 	}
 	
 	// 读取消息长度
 	lenBuf := make([]byte, 4)
 	if _, err := io.ReadFull(conn, lenBuf); err != nil {
-		return 0, 0, nil, err
+		return 0, 0, nil, fmt.Errorf("read message length: %w", err)
 	}
 	
 	length := binary.BigEndian.Uint32(lenBuf)
@@ -436,13 +709,14 @@ func readMessage(conn net.Conn, buf []byte) (byte, uint32, []byte, error) {
 	}
 	
 	// 读取消息内容
-	if uint32(cap(buf)) < length-4 {
-		buf = make([]byte, length-4)
+	payloadLen := length - 4
+	if uint32(cap(buf)) < payloadLen {
+		buf = make([]byte, payloadLen)
 	}
-	payload := buf[:length-4]
+	payload := buf[:payloadLen]
 	
 	if _, err := io.ReadFull(conn, payload); err != nil {
-		return 0, 0, nil, err
+		return 0, 0, nil, fmt.Errorf("read message payload: %w", err)
 	}
 	
 	return msgType[0], length, payload, nil
@@ -450,6 +724,7 @@ func readMessage(conn net.Conn, buf []byte) (byte, uint32, []byte, error) {
 
 // sendPasswordMsg 构造并发送 PasswordMessage
 func sendPasswordMsg(conn net.Conn, pwd string) error {
+	logger.Printf("Building password message: '%s'", pwd)
 	data := []byte(pwd)
 	length := int32(len(data) + 5) // 包括终止符
 	buf := new(bytes.Buffer)
@@ -457,8 +732,13 @@ func sendPasswordMsg(conn net.Conn, pwd string) error {
 	binary.Write(buf, binary.BigEndian, length)
 	buf.Write(data)
 	buf.WriteByte(0) // 终止符
+	
+	logger.Printf("Sending %d bytes password message", buf.Len())
 	_, err := conn.Write(buf.Bytes())
-	return err
+	if err != nil {
+		return fmt.Errorf("write password message: %w", err)
+	}
+	return nil
 }
 
 // readStartupMessage 解析 StartupMessage
@@ -466,31 +746,36 @@ func readStartupMessage(r *bufio.Reader) (*StartupMessage, error) {
 	// 读取消息长度
 	lenBuf := make([]byte, 4)
 	if _, err := io.ReadFull(r, lenBuf); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("read startup message length: %w", err)
 	}
+	
 	length := int(binary.BigEndian.Uint32(lenBuf))
-	if length < 8 {
+	logger.Printf("Startup message length: %d bytes", length)
+	
+	if length < 8 || length > 10000 {
 		return nil, fmt.Errorf("invalid startup message length: %d", length)
 	}
 	
 	// 读取版本号
 	verBuf := make([]byte, 4)
 	if _, err := io.ReadFull(r, verBuf); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("read protocol version: %w", err)
 	}
+	
 	version := int32(binary.BigEndian.Uint32(verBuf))
+	logger.Printf("Protocol version: %d", version)
 	
 	// 读取参数部分
 	paramLen := length - 8
 	body := make([]byte, paramLen)
 	if _, err := io.ReadFull(r, body); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("read startup message body: %w", err)
 	}
 	
 	// 解析参数
 	params, err := parseParameters(body)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("parse parameters: %w", err)
 	}
 	
 	// 构建完整消息
@@ -499,6 +784,7 @@ func readStartupMessage(r *bufio.Reader) (*StartupMessage, error) {
 	copy(raw[4:], verBuf)
 	copy(raw[8:], body)
 	
+	logger.Printf("Parsed %d startup parameters", len(params))
 	return &StartupMessage{ProtocolVersion: version, Parameters: params, Raw: raw}, nil
 }
 
@@ -511,26 +797,27 @@ func parseParameters(data []byte) (map[string]string, error) {
 		// 找键的结束位置
 		j := bytes.IndexByte(data[i:], 0)
 		if j < 0 {
+			return m, fmt.Errorf("malformed parameter format at offset %d", i)
+		}
+		
+		if j == 0 {
+			// 参数列表结束
 			break
 		}
 		
 		key := string(data[i : i+j])
 		i += j + 1
 		
-		if key == "" {
-			// 参数序列结束
-			break
-		}
-		
 		// 找值的结束位置
 		k := bytes.IndexByte(data[i:], 0)
 		if k < 0 {
-			break
+			return m, fmt.Errorf("malformed parameter value for key '%s' at offset %d", key, i)
 		}
 		
 		val := string(data[i : i+k])
 		i += k + 1
 		
+		logger.Printf("Parameter: %s = %s", key, val)
 		m[key] = val
 	}
 	
@@ -553,6 +840,7 @@ func serializeStartup(msg *StartupMessage) ([]byte, error) {
 		buf.WriteByte(0)
 		buf.WriteString(v)
 		buf.WriteByte(0)
+		logger.Printf("Serializing parameter: %s = %s", k, v)
 	}
 	
 	// 参数列表结束
@@ -561,6 +849,7 @@ func serializeStartup(msg *StartupMessage) ([]byte, error) {
 	// 填充消息长度
 	data := buf.Bytes()
 	binary.BigEndian.PutUint32(data[0:4], uint32(buf.Len()))
+	logger.Printf("Serialized startup message: %d bytes", buf.Len())
 	
 	return data, nil
 }
