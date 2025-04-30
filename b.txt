@@ -1,23 +1,68 @@
-// readStartupMessage 解析 StartupMessage
-func readStartupMessage(r *bufio.Reader) (*StartupMessage, error) {
-    header := make([]byte, 8)
-    if _, err := io.ReadFull(r, header); err != nil {
-        return nil, err
+func handleAuth(serverConn, clientConn net.Conn, user, dbPwd, proxyPwd string) error {
+    for {
+        // read message type
+        var t [1]byte
+        if _, err := io.ReadFull(serverConn, t[:]); err != nil {
+            return err
+        }
+        // read length
+        var lenb [4]byte
+        if _, err := io.ReadFull(serverConn, lenb[:]); err != nil {
+            return err
+        }
+        length := binary.BigEndian.Uint32(lenb[:])
+        // read payload (length includes 4 bytes of length)
+        payload := make([]byte, 0)
+        if length > 4 {
+            payload = make([]byte, length-4)
+            if _, err := io.ReadFull(serverConn, payload); err != nil {
+                return err
+            }
+        }
+        // relay full message to client
+        clientConn.Write(t[:])
+        clientConn.Write(lenb[:])
+        if len(payload) > 0 {
+            clientConn.Write(payload)
+        }
+        // if not Authentication (R), keep reading
+        if t[0] != 'R' {
+            continue
+        }
+        authType := binary.BigEndian.Uint32(payload[:4])
+        switch authType {
+        case 0:
+            // AuthenticationOk
+            return nil
+        case 3:
+            // Cleartext
+            if proxyPwd != cfg.ProxyAuthPassword {
+                return fmt.Errorf("invalid proxy auth password")
+            }
+            // read client's password message and forward only the needed response
+            var tag [1]byte
+            if _, err := io.ReadFull(clientConn, tag[:]); err != nil {
+                return err
+            }
+            var plenb2 [4]byte
+            if _, err := io.ReadFull(clientConn, plenb2[:]); err != nil {
+                return err
+            }
+            plen := binary.BigEndian.Uint32(plenb2[:])
+            pwdBytes := make([]byte, plen-4)
+            if _, err := io.ReadFull(clientConn, pwdBytes); err != nil {
+                return err
+            }
+            return sendPasswordMsg(serverConn, dbPwd)
+        case 5:
+            // MD5
+            salt := payload[4:8]
+            return sendPasswordMsg(serverConn, md5Password(dbPwd, user, salt))
+        case 10:
+            // SCRAM: continue relaying until AuthenticationOk
+            continue
+        default:
+            return fmt.Errorf("unsupported auth type %d", authType)
+        }
     }
-    length := int(binary.BigEndian.Uint32(header[:4]))
-    if length < 8 {
-        return nil, fmt.Errorf("invalid startup message length: %d", length)
-    }
-    body := make([]byte, length-8)
-    if _, err := io.ReadFull(r, body); err != nil {
-        return nil, err
-    }
-    version := int32(binary.BigEndian.Uint32(header[4:8]))
-    var params map[string]string
-    if len(body) > 4 {
-        params, _ = parseParameters(body[4:])
-    } else {
-        params = make(map[string]string)
-    }
-    return &StartupMessage{ProtocolVersion: version, Parameters: params, Raw: append(header, body...)}, nil
 }
