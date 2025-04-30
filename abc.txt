@@ -3,14 +3,18 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/hmac"
 	"crypto/md5"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net"
 	"net/http"
 	"os"
@@ -71,18 +75,20 @@ func (cc *ConnectionConfig) GetConfig() ConnParams {
 
 // Config 定义代理和 API 服务地址及连接池参数
 type Config struct {
-	ProxyListenAddr    string        // 代理监听地址
-	APIListenAddr      string        // API 监听地址
-	APIPasswordUpdate  string        // 更新配置 API 路径
-	PoolSize           int           // 连接池大小
-	ProxyAuthPassword  string        // 代理访问校验密码
-	ConnectTimeout     time.Duration // 连接超时
-	ConnectionAttempts int           // 连接尝试次数
-	EnableSSL          bool          // 是否启用SSL
-	SSLCertPath        string        // SSL证书路径
-	SSLKeyPath         string        // SSL密钥路径
-	LogProtocol        bool          // 是否记录详细协议交换
-	PasswordParamName  string        // 密码参数名称
+	ProxyListenAddr       string        // 代理监听地址
+	APIListenAddr         string        // API 监听地址
+	APIPasswordUpdate     string        // 更新配置 API 路径
+	PoolSize              int           // 连接池大小
+	ProxyAuthPassword     string        // 代理访问校验密码
+	ConnectTimeout        time.Duration // 连接超时
+	ConnectionAttempts    int           // 连接尝试次数
+	EnableSSL             bool          // 是否启用SSL
+	SSLCertPath           string        // SSL证书路径
+	SSLKeyPath            string        // SSL密钥路径
+	LogProtocol           bool          // 是否记录详细协议交换
+	PasswordParamName     string        // 密码参数名称
+	AcceptEmptyProxyPwd   bool          // 接受空密码
+	BypassProxyPwdCheck   bool          // 跳过密码检查
 }
 
 // StartupMessage 表示 PostgreSQL 启动包
@@ -232,23 +238,42 @@ func (p *ConnPool) Reset() {
 var (
 	connConfig = &ConnectionConfig{}
 	cfg        = Config{
-		ProxyListenAddr:    ":5433",
-		APIListenAddr:      ":8080",
-		APIPasswordUpdate:  "/update-password",
-		PoolSize:           10,
-		ProxyAuthPassword:  "pwd_postgres",
-		ConnectTimeout:     5 * time.Second,
-		ConnectionAttempts: 3,
-		EnableSSL:          false, // 默认不启用SSL
-		SSLCertPath:        "server.crt",
-		SSLKeyPath:         "server.key",
-		LogProtocol:        true,  // 默认记录详细协议
-		PasswordParamName:  "password", // 默认密码参数名
+		ProxyListenAddr:      ":5433",
+		APIListenAddr:        ":8080",
+		APIPasswordUpdate:    "/update-password",
+		PoolSize:             10,
+		ProxyAuthPassword:    "pwd_postgres",
+		ConnectTimeout:       5 * time.Second,
+		ConnectionAttempts:   3,
+		EnableSSL:            false,    // 默认不启用SSL
+		SSLCertPath:          "server.crt",
+		SSLKeyPath:           "server.key",
+		LogProtocol:          true,     // 默认记录详细协议
+		PasswordParamName:    "password", // 默认密码参数名
+		AcceptEmptyProxyPwd:  false,    // 默认不接受空密码
+		BypassProxyPwdCheck:  false,    // 默认不跳过密码检查
 	}
 	activePool *ConnPool
 	oldPool    *ConnPool
 	poolMu     sync.Mutex
 )
+
+// SASL/SCRAM相关常量
+const (
+	clientProof = "p" // SASL client proof attribute
+	serverSign  = "v" // SASL server signature attribute
+)
+
+// 生成随机字符串，用作client nonce
+func randomString(length int) string {
+	const charset = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+	seededRand := rand.New(rand.NewSource(time.Now().UnixNano()))
+	b := make([]byte, length)
+	for i := range b {
+		b[i] = charset[seededRand.Intn(len(charset))]
+	}
+	return string(b)
+}
 
 // rotatePools 切换到新池并重置旧池
 func rotatePools() {
@@ -280,6 +305,8 @@ func main() {
 	logger.Printf("API will listen on: %s", cfg.APIListenAddr)
 	logger.Printf("Proxy password: %s", cfg.ProxyAuthPassword)
 	logger.Printf("Password parameter name: %s", cfg.PasswordParamName)
+	logger.Printf("Accept empty proxy pwd: %v", cfg.AcceptEmptyProxyPwd)
+	logger.Printf("Bypass proxy pwd check: %v", cfg.BypassProxyPwdCheck)
 	
 	// 初始化连接配置
 	connConfig.SetConfig("postgres", 5432, "postgres", "initial_password", "mydb")
@@ -352,7 +379,7 @@ func startAPIServer() error {
 			return
 		}
 
-		if req.Password == "" {
+		if req.Password == "" && !cfg.AcceptEmptyProxyPwd {
 			http.Error(w, "Password required", http.StatusBadRequest)
 			return
 		}
@@ -363,15 +390,17 @@ func startAPIServer() error {
 		logger.Printf("Proxy password updated to: %s", req.Password)
 	})
 
-	// 密码参数名称更新
-	http.HandleFunc("/update-password-param", func(w http.ResponseWriter, r *http.Request) {
+	// 密码认证配置
+	http.HandleFunc("/update-auth-config", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 
 		var req struct {
-			ParameterName string `json:"parameter_name"`
+			PasswordParamName   string `json:"password_param_name"`
+			AcceptEmptyProxyPwd bool   `json:"accept_empty_proxy_pwd"`
+			BypassProxyPwdCheck bool   `json:"bypass_proxy_pwd_check"`
 		}
 
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -379,15 +408,16 @@ func startAPIServer() error {
 			return
 		}
 
-		if req.ParameterName == "" {
-			http.Error(w, "Parameter name required", http.StatusBadRequest)
-			return
+		if req.PasswordParamName != "" {
+			cfg.PasswordParamName = req.PasswordParamName
 		}
+		cfg.AcceptEmptyProxyPwd = req.AcceptEmptyProxyPwd
+		cfg.BypassProxyPwdCheck = req.BypassProxyPwdCheck
 
-		cfg.PasswordParamName = req.ParameterName
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, "Password parameter name updated")
-		logger.Printf("Password parameter name updated to: %s", req.ParameterName)
+		fmt.Fprintf(w, "Authentication configuration updated")
+		logger.Printf("Auth config updated: param=%s, accept_empty=%v, bypass=%v", 
+			cfg.PasswordParamName, cfg.AcceptEmptyProxyPwd, cfg.BypassProxyPwdCheck)
 	})
 
 	// SSL配置更新
@@ -451,23 +481,27 @@ func startAPIServer() error {
 	http.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
 		params := connConfig.GetConfig()
 		status := struct {
-			Hostname         string `json:"hostname"`
-			Port             int    `json:"port"`
-			Username         string `json:"username"`
-			Database         string `json:"database"`
-			SSLEnabled       bool   `json:"ssl_enabled"`
-			LogProtocol      bool   `json:"log_protocol"`
-			PasswordParamName string `json:"password_param_name"`
-			ProxyPassword    string `json:"proxy_password"`
+			Hostname           string `json:"hostname"`
+			Port               int    `json:"port"`
+			Username           string `json:"username"`
+			Database           string `json:"database"`
+			SSLEnabled         bool   `json:"ssl_enabled"`
+			LogProtocol        bool   `json:"log_protocol"`
+			PasswordParamName  string `json:"password_param_name"`
+			ProxyPassword      string `json:"proxy_password"`
+			AcceptEmptyProxyPwd bool  `json:"accept_empty_proxy_pwd"`
+			BypassProxyPwdCheck bool  `json:"bypass_proxy_pwd_check"`
 		}{
-			Hostname:         params.Hostname,
-			Port:             params.Port,
-			Username:         params.Username,
-			Database:         params.Database,
-			SSLEnabled:       cfg.EnableSSL,
-			LogProtocol:      cfg.LogProtocol,
+			Hostname:          params.Hostname,
+			Port:              params.Port,
+			Username:          params.Username,
+			Database:          params.Database,
+			SSLEnabled:        cfg.EnableSSL,
+			LogProtocol:       cfg.LogProtocol,
 			PasswordParamName: cfg.PasswordParamName,
-			ProxyPassword:    cfg.ProxyAuthPassword,
+			ProxyPassword:     cfg.ProxyAuthPassword,
+			AcceptEmptyProxyPwd: cfg.AcceptEmptyProxyPwd,
+			BypassProxyPwdCheck: cfg.BypassProxyPwdCheck,
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(status)
@@ -573,29 +607,144 @@ func handleTestAuth(conn net.Conn, username, password string) (string, error) {
 				if nullPos < 0 {
 					return "", fmt.Errorf("malformed SASL auth message")
 				}
-				mechList := strings.Split(string(payload[offset:offset+nullPos]), ",")
+				mechListStr := string(payload[offset : offset+nullPos])
+				mechList := strings.Split(mechListStr, ",")
 				logger.Printf("Test: SASL mechanisms: %v", mechList)
 				
-				// 选择第一个机制
-				mechanism := mechList[0]
+				// 选择SCRAM-SHA-256机制
+				var mechanism string
+				for _, mech := range mechList {
+					if mech == "SCRAM-SHA-256" {
+						mechanism = mech
+						break
+					}
+				}
 				
-				// 发送SASL初始响应
-				saslInitial, err := buildSaslInitialResponse(mechanism, username, password)
+				if mechanism == "" {
+					return "", fmt.Errorf("SCRAM-SHA-256 mechanism not available")
+				}
+				
+				// 执行SCRAM-SHA-256认证
+				clientNonce := randomString(18)
+				
+				// 创建客户端首消息
+				saslInitialMsg := SaslInitialMsg{
+					Mechanism: mechanism,
+					Message:   fmt.Sprintf("n,,n=%s,r=%s", username, clientNonce),
+				}
+				
+				initialData, err := saslInitialMsg.Build()
 				if err != nil {
 					return "", fmt.Errorf("build SASL initial: %w", err)
 				}
 				
-				if err := sendMessage(conn, 'p', saslInitial); err != nil {
+				if err := sendMessage(conn, 'p', initialData); err != nil {
 					return "", fmt.Errorf("send SASL initial: %w", err)
 				}
 				
-				// 处理SASL交换
-				authResult, err := handleSaslExchange(conn, mechanism, username, password)
+				// 读取服务器首次响应
+				conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+				sMsgType, sMsgLen, sPayload, err := readMessage(conn, buf)
+				conn.SetReadDeadline(time.Time{})
+				
 				if err != nil {
-					return "", fmt.Errorf("SASL exchange: %w", err)
+					return "", fmt.Errorf("read SASL first server response: %w", err)
 				}
 				
-				return authResult, nil
+				if sMsgType == 'E' {
+					errMsg := extractErrorMessage(sPayload)
+					return "", fmt.Errorf("server error: %s", errMsg)
+				}
+				
+				if sMsgType != 'R' || binary.BigEndian.Uint32(sPayload[:4]) != 11 {
+					return "", fmt.Errorf("unexpected server response to SASL initial message")
+				}
+				
+				// 解析服务器挑战
+				serverFirstMsg := string(sPayload[4:])
+				serverFirstDict := parseSaslAttributes(serverFirstMsg)
+				serverNonce := serverFirstDict["r"]
+				salt := serverFirstDict["s"]
+				iterations := serverFirstDict["i"]
+				
+				if !strings.HasPrefix(serverNonce, clientNonce) {
+					return "", fmt.Errorf("server nonce does not start with client nonce")
+				}
+				
+				// 解码salt
+				saltBytes, err := base64.StdEncoding.DecodeString(salt)
+				if err != nil {
+					return "", fmt.Errorf("decode salt: %w", err)
+				}
+				
+				// 解析迭代次数
+				iterCount, err := strconv.Atoi(iterations)
+				if err != nil {
+					return "", fmt.Errorf("parse iterations: %w", err)
+				}
+				
+				// 计算客户端和服务器证明
+				saltedPassword := hi(password, saltBytes, iterCount)
+				clientKey := hmacSha256(saltedPassword, []byte("Client Key"))
+				storedKey := sha256Sum(clientKey)
+				
+				// 认证消息
+				authMsg := fmt.Sprintf("n=%s,r=%s,%s,c=biws,r=%s", 
+					username, clientNonce, serverFirstMsg, serverNonce)
+				
+				clientSignature := hmacSha256(storedKey, []byte(authMsg))
+				clientProofBytes := xorBytes(clientKey, clientSignature)
+				clientProofStr := base64.StdEncoding.EncodeToString(clientProofBytes)
+				
+				// 计算服务器签名
+				serverKey := hmacSha256(saltedPassword, []byte("Server Key"))
+				serverSignature := hmacSha256(serverKey, []byte(authMsg))
+				
+				// 构造客户端最终消息
+				clientFinalMsg := fmt.Sprintf("c=biws,r=%s,p=%s", 
+					serverNonce, clientProofStr)
+				
+				if err := sendMessage(conn, 'p', []byte(clientFinalMsg)); err != nil {
+					return "", fmt.Errorf("send SASL final: %w", err)
+				}
+				
+				// 读取服务器最终响应
+				conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+				sMsgType, sMsgLen, sPayload, err = readMessage(conn, buf)
+				conn.SetReadDeadline(time.Time{})
+				
+				if err != nil {
+					return "", fmt.Errorf("read SASL server final: %w", err)
+				}
+				
+				if sMsgType == 'E' {
+					errMsg := extractErrorMessage(sPayload)
+					return "", fmt.Errorf("server error: %s", errMsg)
+				}
+				
+				if sMsgType != 'R' || binary.BigEndian.Uint32(sPayload[:4]) != 12 {
+					return "", fmt.Errorf("unexpected server response to SASL final message")
+				}
+				
+				// 验证服务器签名
+				serverFinalMsg := string(sPayload[4:])
+				serverFinalDict := parseSaslAttributes(serverFinalMsg)
+				serverSignBase64 := serverFinalDict["v"]
+				
+				serverSignBytes, err := base64.StdEncoding.DecodeString(serverSignBase64)
+				if err != nil {
+					return "", fmt.Errorf("decode server signature: %w", err)
+				}
+				
+				if !bytes.Equal(serverSignature, serverSignBytes) {
+					return "", fmt.Errorf("server signature verification failed")
+				}
+				
+				// 发送空消息完成SASL
+				if err := sendMessage(conn, 'p', []byte{}); err != nil {
+					return "", fmt.Errorf("send SASL completion: %w", err)
+				}
+				
 			default:
 				return "", fmt.Errorf("unsupported auth type: %d", authType)
 			}
@@ -610,49 +759,89 @@ func handleTestAuth(conn net.Conn, username, password string) (string, error) {
 	}
 }
 
-// handleSaslExchange 处理SASL认证交换
-func handleSaslExchange(conn net.Conn, mechanism, username, password string) (string, error) {
-	buf := make([]byte, 8192)
+// HMAC-SHA256计算
+func hmacSha256(key, data []byte) []byte {
+	h := hmac.New(sha256.New, key)
+	h.Write(data)
+	return h.Sum(nil)
+}
+
+// SHA256计算
+func sha256Sum(data []byte) []byte {
+	hash := sha256.Sum256(data)
+	return hash[:]
+}
+
+// XOR两个字节数组
+func xorBytes(a, b []byte) []byte {
+	result := make([]byte, len(a))
+	for i := 0; i < len(a); i++ {
+		result[i] = a[i] ^ b[i]
+	}
+	return result
+}
+
+// hi函数 (PBKDF2)
+func hi(password string, salt []byte, iterations int) []byte {
+	// 初始值为密码和盐的HMAC
+	u := hmacSha256([]byte(password), salt)
+	result := make([]byte, len(u))
+	copy(result, u)
 	
-	// SASL交换循环
-	for {
-		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-		msgType, msgLen, payload, err := readMessage(conn, buf)
-		conn.SetReadDeadline(time.Time{})
-		
-		if err != nil {
-			return "", fmt.Errorf("read SASL message: %w", err)
-		}
-		
-		if msgType == 'R' {
-			authType := binary.BigEndian.Uint32(payload[:4])
-			
-			if authType == 0 {
-				// 认证成功
-				return "SASL authentication successful", nil
-			} else if authType == 11 {
-				// SASL继续
-				// 构造客户端响应（简化处理）
-				saslResp := []byte("c=biws,r=123456,p=dHVjcw==")
-				if err := sendMessage(conn, 'p', saslResp); err != nil {
-					return "", fmt.Errorf("send SASL continue: %w", err)
-				}
-			} else if authType == 12 {
-				// SASL最终消息
-				// 发送客户端最终响应
-				if err := sendMessage(conn, 'p', []byte{}); err != nil {
-					return "", fmt.Errorf("send SASL final: %w", err)
-				}
-			}
-		} else if msgType == 'E' {
-			// 错误消息
-			errMsg := extractErrorMessage(payload)
-			return "", fmt.Errorf("SASL error: %s", errMsg)
-		} else if msgType == 'Z' {
-			// ReadyForQuery - 认证完成
-			return "SASL completed, server ready", nil
+	// 进行指定次数的迭代
+	for i := 1; i < iterations; i++ {
+		u = hmacSha256([]byte(password), u)
+		for j := 0; j < len(u); j++ {
+			result[j] ^= u[j]
 		}
 	}
+	
+	return result
+}
+
+// SaslInitialMsg SASL初始消息结构
+type SaslInitialMsg struct {
+	Mechanism string
+	Message   string
+}
+
+// Build 构造SASL初始消息
+func (s *SaslInitialMsg) Build() ([]byte, error) {
+	var buf bytes.Buffer
+	
+	// 机制名称
+	buf.WriteString(s.Mechanism)
+	buf.WriteByte(0)
+	
+	// 消息长度
+	msgLen := len(s.Message)
+	lenBytes := make([]byte, 4)
+	binary.BigEndian.PutUint32(lenBytes, uint32(msgLen))
+	buf.Write(lenBytes)
+	
+	// 消息内容
+	buf.WriteString(s.Message)
+	
+	return buf.Bytes(), nil
+}
+
+// 解析SASL属性字符串
+func parseSaslAttributes(s string) map[string]string {
+	result := make(map[string]string)
+	parts := strings.Split(s, ",")
+	
+	for _, part := range parts {
+		if len(part) < 2 || !strings.Contains(part, "=") {
+			continue
+		}
+		
+		kv := strings.SplitN(part, "=", 2)
+		if len(kv) == 2 {
+			result[kv[0]] = kv[1]
+		}
+	}
+	
+	return result
 }
 
 // 提取PostgreSQL错误消息
@@ -772,32 +961,35 @@ func handleClient(clientConn net.Conn) {
 	// 获取客户端提供的参数
 	logger.Printf("Client %s startup parameters: %v", clientAddr, skb.Parameters)
 
-	// 提取客户端提供的参数以备用
-	clientUser := skb.Parameters["user"]
-	clientDB := skb.Parameters["database"]
-	if clientDB == "" {
-		clientDB = clientUser // PostgreSQL默认以用户名作为默认数据库名
-	}
-	
 	// 查找所有可能的密码参数名称
 	proxyPwd := ""
 	possiblePwdParams := []string{cfg.PasswordParamName, "password", "pass", "pwd"}
 	for _, paramName := range possiblePwdParams {
-		if pwd, ok := skb.Parameters[paramName]; ok {
-			logger.Printf("Found password in parameter '%s'", paramName)
+		if pwd, ok := skb.Parameters[paramName]; ok && pwd != "" {
+			logger.Printf("Found password in parameter '%s': %s", paramName, pwd)
 			proxyPwd = pwd
 			delete(skb.Parameters, paramName)
 		}
 	}
 	
-	// 验证代理密码
-	if proxyPwd != cfg.ProxyAuthPassword {
-		logger.Printf("Invalid proxy password from client %s. Got '%s', expected '%s'", 
-			clientAddr, proxyPwd, cfg.ProxyAuthPassword)
-		sendErrorToClient(clientConn, "Invalid proxy authentication password")
-		return
+	// 密码验证逻辑
+	if !cfg.BypassProxyPwdCheck {
+		if proxyPwd == "" && !cfg.AcceptEmptyProxyPwd {
+			logger.Printf("Empty proxy password from client %s not allowed", clientAddr)
+			sendErrorToClient(clientConn, "Proxy authentication password required")
+			return
+		}
+		
+		if proxyPwd != cfg.ProxyAuthPassword {
+			logger.Printf("Invalid proxy password from client %s. Got '%s', expected '%s'", 
+				clientAddr, proxyPwd, cfg.ProxyAuthPassword)
+			sendErrorToClient(clientConn, "Invalid proxy authentication password")
+			return
+		}
+		logger.Printf("Proxy authentication successful for client %s", clientAddr)
+	} else {
+		logger.Printf("Bypassing proxy password check for client %s", clientAddr)
 	}
-	logger.Printf("Proxy authentication successful for client %s", clientAddr)
 
 	// 获取后端连接
 	poolMu.Lock()
@@ -1054,7 +1246,8 @@ func handleFullAuth(serverConn, clientConn net.Conn, realPassword string) error 
 				if nullPos < 0 {
 					return fmt.Errorf("malformed SASL auth message")
 				}
-				mechList := strings.Split(string(payload[offset:offset+nullPos]), ",")
+				mechListStr := string(payload[offset : offset+nullPos])
+				mechList := strings.Split(mechListStr, ",")
 				logger.Printf("SASL mechanisms: %v", mechList)
 				
 				// 转发SASL请求给客户端
@@ -1076,7 +1269,7 @@ func handleFullAuth(serverConn, clientConn net.Conn, realPassword string) error 
 				if cMsgType != 'p' {
 					return fmt.Errorf("expected SASL response, got %c", cMsgType)
 				}
-				
+
 				// 找出客户端选择的机制
 				nullPos = bytes.IndexByte(cPayload, 0)
 				if nullPos < 0 {
@@ -1087,13 +1280,21 @@ func handleFullAuth(serverConn, clientConn net.Conn, realPassword string) error 
 				
 				// 创建自己的SASL消息，使用服务器的真实凭据
 				params := connConfig.GetConfig()
-				saslInitial, err := buildSaslInitialResponse(mechanism, params.Username, realPassword)
+				clientNonce := randomString(18)
+				
+				// 创建客户端首消息
+				saslInitialMsg := SaslInitialMsg{
+					Mechanism: mechanism,
+					Message:   fmt.Sprintf("n,,n=%s,r=%s", params.Username, clientNonce),
+				}
+				
+				initialData, err := saslInitialMsg.Build()
 				if err != nil {
 					return fmt.Errorf("build SASL response: %w", err)
 				}
 				
 				// 发送自己的SASL初始响应
-				if err := sendMessage(serverConn, 'p', saslInitial); err != nil {
+				if err := sendMessage(serverConn, 'p', initialData); err != nil {
 					return fmt.Errorf("send SASL response: %w", err)
 				}
 				
@@ -1136,14 +1337,41 @@ func handleFullAuth(serverConn, clientConn net.Conn, realPassword string) error 
 							
 							logProtocol("Client->Server", string(cMsgType), int(cMsgLen), cPayload)
 							
-							// 生成服务器的SASL响应
-							saslResp, err := buildSaslContinueResponse(mechanism, sPayload, params.Username, realPassword)
+							// SASL继续消息解析
+							serverFirstMsg := string(sPayload[4:])
+							serverFirstDict := parseSaslAttributes(serverFirstMsg)
+							
+							// 提取必要的参数
+							serverNonce := serverFirstDict["r"]
+							salt := serverFirstDict["s"]
+							iterations, _ := strconv.Atoi(serverFirstDict["i"])
+							
+							// 对服务器处理
+							// 解码salt
+							saltBytes, err := base64.StdEncoding.DecodeString(salt)
 							if err != nil {
-								return fmt.Errorf("build SASL continue: %w", err)
+								return fmt.Errorf("decode salt: %w", err)
 							}
 							
+							// 计算客户端证明
+							saltedPassword := hi(realPassword, saltBytes, iterations)
+							clientKey := hmacSha256(saltedPassword, []byte("Client Key"))
+							storedKey := sha256Sum(clientKey)
+							
+							// 构造认证消息
+							authMsg := fmt.Sprintf("n=%s,r=%s,%s,c=biws,r=%s",
+								params.Username, clientNonce, serverFirstMsg, serverNonce)
+							
+							clientSignature := hmacSha256(storedKey, []byte(authMsg))
+							clientProofBytes := xorBytes(clientKey, clientSignature)
+							clientProofStr := base64.StdEncoding.EncodeToString(clientProofBytes)
+							
+							// 构造客户端最终消息
+							clientFinalMsg := fmt.Sprintf("c=biws,r=%s,p=%s",
+								serverNonce, clientProofStr)
+							
 							// 发送给服务器
-							if err := sendMessage(serverConn, cMsgType, saslResp); err != nil {
+							if err := sendMessage(serverConn, cMsgType, []byte(clientFinalMsg)); err != nil {
 								return fmt.Errorf("send SASL continue: %w", err)
 							}
 						} else if authRespType == 12 {
@@ -1159,7 +1387,7 @@ func handleFullAuth(serverConn, clientConn net.Conn, realPassword string) error 
 							logProtocol("Client->Server", string(cMsgType), int(cMsgLen), cPayload)
 							
 							// 转发给服务器
-							if err := forwardMessage(serverConn, cMsgType, cMsgLen, cPayload); err != nil {
+							if err := sendMessage(serverConn, cMsgType, []byte{}); err != nil {
 								return fmt.Errorf("forward final SASL: %w", err)
 							}
 						}
@@ -1206,37 +1434,6 @@ func handleFullAuth(serverConn, clientConn net.Conn, realPassword string) error 
 			}
 		}
 	}
-}
-
-// buildSaslInitialResponse 生成SASL初始响应
-func buildSaslInitialResponse(mechanism, username, password string) ([]byte, error) {
-	var buf bytes.Buffer
-	
-	// 写入机制名称
-	buf.WriteString(mechanism)
-	buf.WriteByte(0)
-	
-	// 为数据长度留出空间
-	buf.Write([]byte{0, 0, 0, 0})
-	
-	// 构造SCRAM初始消息
-	clientNonce := fmt.Sprintf("%d", time.Now().UnixNano())
-	data := fmt.Sprintf("n,,n=%s,r=%s", username, clientNonce)
-	buf.WriteString(data)
-	
-	// 填充数据长度
-	b := buf.Bytes()
-	binary.BigEndian.PutUint32(b[len(mechanism)+1:], uint32(len(data)))
-	
-	return b, nil
-}
-
-// buildSaslContinueResponse 生成SASL继续响应
-// 简化处理，实际上这里应该处理服务器的挑战和客户端的响应
-func buildSaslContinueResponse(mechanism string, serverPayload []byte, username, password string) ([]byte, error) {
-	// 简化处理，直接返回一个固定的响应
-	// 实际应该根据服务器挑战生成客户端证明
-	return []byte("c=biws,r=123456,p=dGVzdA=="), nil
 }
 
 // handleSSLRequest 处理SSL连接请求
