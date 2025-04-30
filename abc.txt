@@ -82,6 +82,7 @@ type Config struct {
 	SSLCertPath        string        // SSL证书路径
 	SSLKeyPath         string        // SSL密钥路径
 	LogProtocol        bool          // 是否记录详细协议交换
+	PasswordParamName  string        // 密码参数名称
 }
 
 // StartupMessage 表示 PostgreSQL 启动包
@@ -242,6 +243,7 @@ var (
 		SSLCertPath:        "server.crt",
 		SSLKeyPath:         "server.key",
 		LogProtocol:        true,  // 默认记录详细协议
+		PasswordParamName:  "password", // 默认密码参数名
 	}
 	activePool *ConnPool
 	oldPool    *ConnPool
@@ -277,6 +279,7 @@ func main() {
 	logger.Printf("Proxy will listen on: %s", cfg.ProxyListenAddr)
 	logger.Printf("API will listen on: %s", cfg.APIListenAddr)
 	logger.Printf("Proxy password: %s", cfg.ProxyAuthPassword)
+	logger.Printf("Password parameter name: %s", cfg.PasswordParamName)
 	
 	// 初始化连接配置
 	connConfig.SetConfig("postgres", 5432, "postgres", "initial_password", "mydb")
@@ -360,6 +363,33 @@ func startAPIServer() error {
 		logger.Printf("Proxy password updated to: %s", req.Password)
 	})
 
+	// 密码参数名称更新
+	http.HandleFunc("/update-password-param", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req struct {
+			ParameterName string `json:"parameter_name"`
+		}
+
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Bad request: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		if req.ParameterName == "" {
+			http.Error(w, "Parameter name required", http.StatusBadRequest)
+			return
+		}
+
+		cfg.PasswordParamName = req.ParameterName
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, "Password parameter name updated")
+		logger.Printf("Password parameter name updated to: %s", req.ParameterName)
+	})
+
 	// SSL配置更新
 	http.HandleFunc("/update-ssl", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -421,19 +451,23 @@ func startAPIServer() error {
 	http.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
 		params := connConfig.GetConfig()
 		status := struct {
-			Hostname    string `json:"hostname"`
-			Port        int    `json:"port"`
-			Username    string `json:"username"`
-			Database    string `json:"database"`
-			SSLEnabled  bool   `json:"ssl_enabled"`
-			LogProtocol bool   `json:"log_protocol"`
+			Hostname         string `json:"hostname"`
+			Port             int    `json:"port"`
+			Username         string `json:"username"`
+			Database         string `json:"database"`
+			SSLEnabled       bool   `json:"ssl_enabled"`
+			LogProtocol      bool   `json:"log_protocol"`
+			PasswordParamName string `json:"password_param_name"`
+			ProxyPassword    string `json:"proxy_password"`
 		}{
-			Hostname:    params.Hostname,
-			Port:        params.Port,
-			Username:    params.Username,
-			Database:    params.Database,
-			SSLEnabled:  cfg.EnableSSL,
-			LogProtocol: cfg.LogProtocol,
+			Hostname:         params.Hostname,
+			Port:             params.Port,
+			Username:         params.Username,
+			Database:         params.Database,
+			SSLEnabled:       cfg.EnableSSL,
+			LogProtocol:      cfg.LogProtocol,
+			PasswordParamName: cfg.PasswordParamName,
+			ProxyPassword:    cfg.ProxyAuthPassword,
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(status)
@@ -450,7 +484,9 @@ func startAPIServer() error {
 			http.Error(w, fmt.Sprintf("Failed to connect to backend: %v", err), http.StatusInternalServerError)
 			return
 		}
-		defer p.Put(conn)
+		
+		// 这里我们不使用defer p.Put(conn)，而是直接关闭连接
+		defer conn.Close()
 
 		// 测试发送一个简单的查询
 		params := connConfig.GetConfig()
@@ -474,49 +510,149 @@ func startAPIServer() error {
 			http.Error(w, fmt.Sprintf("Failed to send startup message: %v", err), http.StatusInternalServerError)
 			return
 		}
-		
-		// 读取认证请求
-		buf := make([]byte, 4096)
-		msgType, msgLen, payload, err := readMessage(conn, buf)
+
+		// 读取并处理认证流程，包括SASL认证
+		authResult, err := handleTestAuth(conn, params.Username, params.Password)
 		if err != nil {
-			http.Error(w, fmt.Sprintf("Failed to read auth request: %v", err), http.StatusInternalServerError)
+			http.Error(w, fmt.Sprintf("Authentication failed: %v", err), http.StatusInternalServerError)
 			return
 		}
-		
-		if msgType == 'E' {
-			// 错误
-			errMsg := extractErrorMessage(payload)
-			http.Error(w, fmt.Sprintf("PostgreSQL error: %s", errMsg), http.StatusInternalServerError)
-			return
-		}
-		
-		// 尝试处理认证
-		if msgType == 'R' {
-			authType := binary.BigEndian.Uint32(payload[:4])
-			if authType == 5 { // MD5 认证
-				salt := payload[4:8]
-				hashedPwd := md5Password(params.Password, params.Username, salt)
-				if err := sendPasswordMsg(conn, hashedPwd); err != nil {
-					http.Error(w, fmt.Sprintf("Failed to send password: %v", err), http.StatusInternalServerError)
-					return
-				}
-			} else if authType == 3 { // 明文认证
-				if err := sendPasswordMsg(conn, params.Password); err != nil {
-					http.Error(w, fmt.Sprintf("Failed to send password: %v", err), http.StatusInternalServerError)
-					return
-				}
-			} else if authType != 0 { // 其他认证类型
-				http.Error(w, fmt.Sprintf("Unsupported auth type: %d", authType), http.StatusInternalServerError)
-				return
-			}
-		}
-		
-		conn.Close() // 关闭连接，不重用
-		fmt.Fprintf(w, "Successfully connected to backend PostgreSQL")
+
+		fmt.Fprintf(w, "Successfully connected to backend PostgreSQL. Auth result: %s", authResult)
 	})
 
 	logger.Printf("API server listening on %s", cfg.APIListenAddr)
 	return http.ListenAndServe(cfg.APIListenAddr, nil)
+}
+
+// handleTestAuth 处理测试连接的认证流程
+func handleTestAuth(conn net.Conn, username, password string) (string, error) {
+	buf := make([]byte, 8192)
+	
+	// 认证循环
+	for {
+		// 读取服务器消息
+		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+		msgType, msgLen, payload, err := readMessage(conn, buf)
+		conn.SetReadDeadline(time.Time{})
+		
+		if err != nil {
+			return "", fmt.Errorf("read from server: %w", err)
+		}
+		
+		// 处理特定类型的消息
+		if msgType == 'R' {
+			// 认证消息
+			authType := binary.BigEndian.Uint32(payload[:4])
+			
+			switch authType {
+			case 0:
+				// 认证成功
+				return "Authentication successful", nil
+			case 3:
+				// 明文密码认证
+				logger.Printf("Test: Server requested cleartext password auth")
+				if err := sendPasswordMsg(conn, password); err != nil {
+					return "", fmt.Errorf("send password: %w", err)
+				}
+			case 5:
+				// MD5密码认证
+				logger.Printf("Test: Server requested MD5 password auth")
+				salt := payload[4:8]
+				hashedPwd := md5Password(password, username, salt)
+				if err := sendPasswordMsg(conn, hashedPwd); err != nil {
+					return "", fmt.Errorf("send MD5 password: %w", err)
+				}
+			case 10:
+				// SASL认证
+				logger.Printf("Test: Server requested SASL auth")
+				
+				// 从payload中提取SASL机制
+				offset := 4
+				nullPos := bytes.IndexByte(payload[offset:], 0)
+				if nullPos < 0 {
+					return "", fmt.Errorf("malformed SASL auth message")
+				}
+				mechList := strings.Split(string(payload[offset:offset+nullPos]), ",")
+				logger.Printf("Test: SASL mechanisms: %v", mechList)
+				
+				// 选择第一个机制
+				mechanism := mechList[0]
+				
+				// 发送SASL初始响应
+				saslInitial, err := buildSaslInitialResponse(mechanism, username, password)
+				if err != nil {
+					return "", fmt.Errorf("build SASL initial: %w", err)
+				}
+				
+				if err := sendMessage(conn, 'p', saslInitial); err != nil {
+					return "", fmt.Errorf("send SASL initial: %w", err)
+				}
+				
+				// 处理SASL交换
+				authResult, err := handleSaslExchange(conn, mechanism, username, password)
+				if err != nil {
+					return "", fmt.Errorf("SASL exchange: %w", err)
+				}
+				
+				return authResult, nil
+			default:
+				return "", fmt.Errorf("unsupported auth type: %d", authType)
+			}
+		} else if msgType == 'E' {
+			// 错误消息
+			errMsg := extractErrorMessage(payload)
+			return "", fmt.Errorf("server error: %s", errMsg)
+		} else if msgType == 'Z' {
+			// ReadyForQuery - 认证完成
+			return "Authentication complete, server ready", nil
+		}
+	}
+}
+
+// handleSaslExchange 处理SASL认证交换
+func handleSaslExchange(conn net.Conn, mechanism, username, password string) (string, error) {
+	buf := make([]byte, 8192)
+	
+	// SASL交换循环
+	for {
+		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+		msgType, msgLen, payload, err := readMessage(conn, buf)
+		conn.SetReadDeadline(time.Time{})
+		
+		if err != nil {
+			return "", fmt.Errorf("read SASL message: %w", err)
+		}
+		
+		if msgType == 'R' {
+			authType := binary.BigEndian.Uint32(payload[:4])
+			
+			if authType == 0 {
+				// 认证成功
+				return "SASL authentication successful", nil
+			} else if authType == 11 {
+				// SASL继续
+				// 构造客户端响应（简化处理）
+				saslResp := []byte("c=biws,r=123456,p=dHVjcw==")
+				if err := sendMessage(conn, 'p', saslResp); err != nil {
+					return "", fmt.Errorf("send SASL continue: %w", err)
+				}
+			} else if authType == 12 {
+				// SASL最终消息
+				// 发送客户端最终响应
+				if err := sendMessage(conn, 'p', []byte{}); err != nil {
+					return "", fmt.Errorf("send SASL final: %w", err)
+				}
+			}
+		} else if msgType == 'E' {
+			// 错误消息
+			errMsg := extractErrorMessage(payload)
+			return "", fmt.Errorf("SASL error: %s", errMsg)
+		} else if msgType == 'Z' {
+			// ReadyForQuery - 认证完成
+			return "SASL completed, server ready", nil
+		}
+	}
 }
 
 // 提取PostgreSQL错误消息
@@ -643,13 +779,21 @@ func handleClient(clientConn net.Conn) {
 		clientDB = clientUser // PostgreSQL默认以用户名作为默认数据库名
 	}
 	
-	// 保存客户端提供的密码用于代理认证
-	proxyPwd := skb.Parameters["password"]
-	delete(skb.Parameters, "password")
+	// 查找所有可能的密码参数名称
+	proxyPwd := ""
+	possiblePwdParams := []string{cfg.PasswordParamName, "password", "pass", "pwd"}
+	for _, paramName := range possiblePwdParams {
+		if pwd, ok := skb.Parameters[paramName]; ok {
+			logger.Printf("Found password in parameter '%s'", paramName)
+			proxyPwd = pwd
+			delete(skb.Parameters, paramName)
+		}
+	}
 	
 	// 验证代理密码
 	if proxyPwd != cfg.ProxyAuthPassword {
-		logger.Printf("Invalid proxy password from client %s", clientAddr)
+		logger.Printf("Invalid proxy password from client %s. Got '%s', expected '%s'", 
+			clientAddr, proxyPwd, cfg.ProxyAuthPassword)
 		sendErrorToClient(clientConn, "Invalid proxy authentication password")
 		return
 	}
