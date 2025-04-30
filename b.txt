@@ -1,68 +1,213 @@
-func handleAuth(serverConn, clientConn net.Conn, user, dbPwd, proxyPwd string) error {
+// 在handleFullAuth函数中，找到处理SASL/SCRAM的代码块（authType == 10的情况），替换为以下代码：
+
+} else if authType == 10 {
+    // SASL认证
+    logger.Printf("Server requested SASL auth")
+    
+    // 从payload中提取SASL机制
+    // 跳过auth类型(4字节)
+    offset := 4
+    nullPos := bytes.IndexByte(payload[offset:], 0)
+    if nullPos < 0 {
+        return fmt.Errorf("malformed SASL auth message")
+    }
+    mechListStr := string(payload[offset : offset+nullPos])
+    mechList := strings.Split(mechListStr, ",")
+    logger.Printf("SASL mechanisms: %v", mechList)
+    
+    // 转发SASL请求给客户端
+    if err := forwardMessage(clientConn, msgType, msgLen, payload); err != nil {
+        return fmt.Errorf("forward SASL request: %w", err)
+    }
+    
+    // 从客户端读取SASL初始响应 - 我们需要这个来获取客户端使用的机制
+    clientConn.SetReadDeadline(time.Now().Add(30 * time.Second))
+    cMsgType, cMsgLen, cPayload, err := readMessage(clientConn, clientBuf)
+    clientConn.SetReadDeadline(time.Time{})
+    
+    if err != nil {
+        return fmt.Errorf("read SASL initial response: %w", err)
+    }
+    
+    logProtocol("Client->Server", string(cMsgType), int(cMsgLen), cPayload)
+    
+    if cMsgType != 'p' {
+        return fmt.Errorf("expected SASL response, got %c", cMsgType)
+    }
+
+    // 直接使用后端凭据进行SCRAM认证
+    params := connConfig.GetConfig()
+    
+    // 查找客户端选择的机制
+    nullPos = bytes.IndexByte(cPayload, 0)
+    if nullPos < 0 {
+        return fmt.Errorf("malformed SASL response")
+    }
+    mechanism := string(cPayload[:nullPos])
+    logger.Printf("Client selected SASL mechanism: %s", mechanism)
+    
+    // 获取客户端的随机数
+    clientFirstMsg := ""
+    if len(cPayload) > nullPos+5 {
+        msgLen := binary.BigEndian.Uint32(cPayload[nullPos+1:])
+        if msgLen > 0 && nullPos+5+int(msgLen) <= len(cPayload) {
+            clientFirstMsg = string(cPayload[nullPos+5:][:msgLen])
+            logger.Printf("Client first message: %s", clientFirstMsg)
+        }
+    }
+    
+    // 创建我们自己的SASL消息
+    if mechanism != "SCRAM-SHA-256" {
+        return fmt.Errorf("unsupported SASL mechanism: %s", mechanism)
+    }
+    
+    // 使用实际的数据库凭据
+    clientNonce := randomString(18)
+    saslInitial := fmt.Sprintf("n,,n=%s,r=%s", params.Username, clientNonce)
+    
+    // 发送我们的SASL初始消息
+    saslInitialMsg := &SaslInitialMsg{
+        Mechanism: mechanism,
+        Message: saslInitial,
+    }
+    saslInitialData, err := saslInitialMsg.Build()
+    if err != nil {
+        return fmt.Errorf("build SASL initial: %w", err)
+    }
+    
+    if err := sendMessage(serverConn, 'p', saslInitialData); err != nil {
+        return fmt.Errorf("send SASL initial: %w", err)
+    }
+    
+    // 处理SASL交换
+    saslSuccess := false
+    var serverFirstMsg string
+    var serverFirstDict map[string]string
+    var saslAttrs = make(map[string]string)
+    
+    // 保存我们发送的第一个消息的属性
+    initAttrs := parseSaslAttributes(saslInitial)
+    for k, v := range initAttrs {
+        saslAttrs[k] = v
+    }
+    
+    // SASL交换循环
     for {
-        // read message type
-        var t [1]byte
-        if _, err := io.ReadFull(serverConn, t[:]); err != nil {
-            return err
+        // 从服务器读取
+        serverConn.SetReadDeadline(time.Now().Add(30 * time.Second))
+        sMsgType, sMsgLen, sPayload, err := readMessage(serverConn, serverBuf)
+        serverConn.SetReadDeadline(time.Time{})
+        
+        if err != nil {
+            return fmt.Errorf("read SASL server message: %w", err)
         }
-        // read length
-        var lenb [4]byte
-        if _, err := io.ReadFull(serverConn, lenb[:]); err != nil {
-            return err
+        
+        logProtocol("Server->Client", string(sMsgType), int(sMsgLen), sPayload)
+        
+        // 转发给客户端
+        if err := forwardMessage(clientConn, sMsgType, sMsgLen, sPayload); err != nil {
+            return fmt.Errorf("forward SASL message: %w", err)
         }
-        length := binary.BigEndian.Uint32(lenb[:])
-        // read payload (length includes 4 bytes of length)
-        payload := make([]byte, 0)
-        if length > 4 {
-            payload = make([]byte, length-4)
-            if _, err := io.ReadFull(serverConn, payload); err != nil {
-                return err
+        
+        // 处理服务器响应
+        if sMsgType == 'R' {
+            authRespType := binary.BigEndian.Uint32(sPayload[:4])
+            
+            if authRespType == 0 {
+                // 认证成功
+                logger.Printf("SASL authentication successful")
+                saslSuccess = true
+                break
+            } else if authRespType == 11 {
+                // SASL继续
+                serverFirstMsg = string(sPayload[4:])
+                serverFirstDict = parseSaslAttributes(serverFirstMsg)
+                logger.Printf("Server first message: %s", serverFirstMsg)
+                
+                // 记录服务器提供的属性
+                for k, v := range serverFirstDict {
+                    saslAttrs[k] = v
+                }
+                
+                // 从客户端读取响应 - 只为了模拟正常流程
+                clientConn.SetReadDeadline(time.Now().Add(30 * time.Second))
+                cMsgType, cMsgLen, cPayload, err = readMessage(clientConn, clientBuf)
+                clientConn.SetReadDeadline(time.Time{})
+                
+                if err != nil {
+                    return fmt.Errorf("read client SASL continue: %w", err)
+                }
+                
+                logProtocol("Client->Server", string(cMsgType), int(cMsgLen), cPayload)
+                
+                // 构造我们自己的SASL继续消息，使用之前收集的属性
+                // 生成SCRAM客户端最终消息
+                serverNonce := serverFirstDict["r"]
+                salt := serverFirstDict["s"]
+                iterStr := serverFirstDict["i"]
+                
+                if !strings.HasPrefix(serverNonce, clientNonce) {
+                    return fmt.Errorf("server nonce doesn't start with client nonce")
+                }
+                
+                iterations, err := strconv.Atoi(iterStr)
+                if err != nil {
+                    return fmt.Errorf("invalid iterations: %s", iterStr)
+                }
+                
+                saltBytes, err := base64.StdEncoding.DecodeString(salt)
+                if err != nil {
+                    return fmt.Errorf("invalid salt: %s", salt)
+                }
+                
+                // 认证消息
+                authMsg := fmt.Sprintf("n=%s,r=%s,%s,c=biws,r=%s", 
+                    params.Username, clientNonce, serverFirstMsg, serverNonce)
+                
+                // 计算客户端证明
+                saltedPassword := hi(params.Password, saltBytes, iterations)
+                clientKey := hmacSha256(saltedPassword, []byte("Client Key"))
+                storedKey := sha256Sum(clientKey)
+                clientSignature := hmacSha256(storedKey, []byte(authMsg))
+                clientProofBytes := xorBytes(clientKey, clientSignature)
+                clientProofStr := base64.StdEncoding.EncodeToString(clientProofBytes)
+                
+                // 客户端最终消息
+                clientFinalMsg := fmt.Sprintf("c=biws,r=%s,p=%s", serverNonce, clientProofStr)
+                logger.Printf("Sending client final message: %s", clientFinalMsg)
+                
+                if err := sendMessage(serverConn, 'p', []byte(clientFinalMsg)); err != nil {
+                    return fmt.Errorf("send SASL continue: %w", err)
+                }
+            } else if authRespType == 12 {
+                // SASL完成
+                clientConn.SetReadDeadline(time.Now().Add(30 * time.Second))
+                cMsgType, cMsgLen, cPayload, err = readMessage(clientConn, clientBuf)
+                clientConn.SetReadDeadline(time.Time{})
+                
+                if err != nil {
+                    return fmt.Errorf("read client SASL final: %w", err)
+                }
+                
+                logProtocol("Client->Server", string(cMsgType), int(cMsgLen), cPayload)
+                
+                // 发送空消息完成SASL
+                if err := sendMessage(serverConn, 'p', []byte{}); err != nil {
+                    return fmt.Errorf("send SASL final: %w", err)
+                }
             }
-        }
-        // relay full message to client
-        clientConn.Write(t[:])
-        clientConn.Write(lenb[:])
-        if len(payload) > 0 {
-            clientConn.Write(payload)
-        }
-        // if not Authentication (R), keep reading
-        if t[0] != 'R' {
-            continue
-        }
-        authType := binary.BigEndian.Uint32(payload[:4])
-        switch authType {
-        case 0:
-            // AuthenticationOk
+        } else if sMsgType == 'E' {
+            // 错误消息
+            errMsg := extractErrorMessage(sPayload)
+            logger.Printf("SASL error: %s", errMsg)
+            return fmt.Errorf("SASL error: %s", errMsg)
+        } else if sMsgType == 'Z' {
+            // ReadyForQuery - 认证完成 
+            logger.Printf("SASL completed, server ready")
+            if !saslSuccess {
+                logger.Printf("Warning: SASL exchange ended without explicit success")
+            }
             return nil
-        case 3:
-            // Cleartext
-            if proxyPwd != cfg.ProxyAuthPassword {
-                return fmt.Errorf("invalid proxy auth password")
-            }
-            // read client's password message and forward only the needed response
-            var tag [1]byte
-            if _, err := io.ReadFull(clientConn, tag[:]); err != nil {
-                return err
-            }
-            var plenb2 [4]byte
-            if _, err := io.ReadFull(clientConn, plenb2[:]); err != nil {
-                return err
-            }
-            plen := binary.BigEndian.Uint32(plenb2[:])
-            pwdBytes := make([]byte, plen-4)
-            if _, err := io.ReadFull(clientConn, pwdBytes); err != nil {
-                return err
-            }
-            return sendPasswordMsg(serverConn, dbPwd)
-        case 5:
-            // MD5
-            salt := payload[4:8]
-            return sendPasswordMsg(serverConn, md5Password(dbPwd, user, salt))
-        case 10:
-            // SCRAM: continue relaying until AuthenticationOk
-            continue
-        default:
-            return fmt.Errorf("unsupported auth type %d", authType)
         }
     }
 }
