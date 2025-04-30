@@ -1,1 +1,2 @@
 openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout server.key -out server.crt
+curl -X POST http://localhost:5175/update-ssl -d '{"enable_ssl":true,"ssl_cert_path":"server.crt","ssl_key_path":"server.key"}'
