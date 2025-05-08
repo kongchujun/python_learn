@@ -1,4 +1,21 @@
-Malayan Banking Bhd. is considering options including buying out Ageas SA’s minority stake in Etiqa as Malaysia’s biggest lender seeks to boost the value of the Southeast Asian insurer, according to people with knowledge of the matter.
+在 Dagster gRPC 进程的启动语句里，你传入了完整的 --instance-ref YAML：
 
-Maybank, as the Kuala Lumpur-listed lender is known, may also seek to replace Belgium insurer Ageas with another minority investor, said the people, asking not to be identified as the deliberations are private. Maybank owns 69% of Etiqa, while Ageas holds the remaining 31%.
+--instance-ref class:InstanceRef,\
+compute_logs_data:class:ConfigurableClassData,\
+class_name:LocalComputeLogManager,\
+config_yaml:base_dir:/opt/dagster_code/aimarkets-ai-flows/storage
 
+
+YAML 被序列化成单行后会出现大量 “key:value” 片段以及类似随机字符串的 --socket /var/tmptmp00_nr0cq，足以触发规则。
+如果你的 dagster.yaml 里再包含诸如 postgresql://user:***@... 之类的 URI，扫描结果就不是误报，而是真把口令暴露在了命令行。
+
+
+排查与验证：
+ps -ef | grep dagster | grep api
+
+Dagster 会在启动 gRPC 子进程时，把 dagster.yaml 解析后的 完整实例配置（InstanceRef）序列化成一段 JSON，直接塞到
+--instance-ref '<very-long-json>' 这个 CLI 参数里。
+
+解决方法：
+A. 改用 Dagster 1.11+ 的临时文件传参
+从 1.11 开始，dagster webserver / dagster dev 在本地或 Docker 环境下默认用 临时文件 传递 InstanceRef（PR #22854）。升级后 CLI 里只剩 --instance-ref-from-file /tmp/…/instance_ref.json，SCC 不再抓到口令。
