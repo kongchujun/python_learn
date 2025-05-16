@@ -1,21 +1,84 @@
-在 Dagster gRPC 进程的启动语句里，你传入了完整的 --instance-ref YAML：
+pip install langchain openai fastapi uvicorn pydantic psycopg2-binary
 
---instance-ref class:InstanceRef,\
-compute_logs_data:class:ConfigurableClassData,\
-class_name:LocalComputeLogManager,\
-config_yaml:base_dir:/opt/dagster_code/aimarkets-ai-flows/storage
+from fastapi import FastAPI
+from pydantic import BaseModel
+import uvicorn
+import psycopg2
+import os
+
+app = FastAPI()
+
+# 数据库连接配置（这里以环境变量的形式）
+conn_info = {
+    "host": os.getenv("PG_HOST", "localhost"),
+    "port": int(os.getenv("PG_PORT", 5432)),
+    "dbname": os.getenv("PG_DBNAME", "postgres"),
+    "user": os.getenv("PG_USER", "postgres"),
+    "password": os.getenv("PG_PASSWORD", "postgres"),
+}
+
+# MCP请求和响应结构定义
+class MCPRequest(BaseModel):
+    sql: str
+
+class MCPResponse(BaseModel):
+    result: str
+
+@app.post("/mcp/postgres", response_model=MCPResponse)
+async def postgres_endpoint(request: MCPRequest):
+    sql = request.sql
+    try:
+        with psycopg2.connect(**conn_info) as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql)
+                result = cur.fetchone()
+                result_str = result[0] if result else "No data found"
+                return MCPResponse(result=str(result_str))
+    except Exception as e:
+        return MCPResponse(result=f"Error: {str(e)}")
+
+if __name__ == "__main__":
+    uvicorn.run("mcp_postgres_server:app", host="127.0.0.1", port=8001)
 
 
-YAML 被序列化成单行后会出现大量 “key:value” 片段以及类似随机字符串的 --socket /var/tmptmp00_nr0cq，足以触发规则。
-如果你的 dagster.yaml 里再包含诸如 postgresql://user:***@... 之类的 URI，扫描结果就不是误报，而是真把口令暴露在了命令行。
 
+import os
+from langchain_openai import AzureChatOpenAI
+from langchain.schema import HumanMessage, SystemMessage
+import requests
 
-排查与验证：
-ps -ef | grep dagster | grep api
+# Azure OpenAI配置
+azure_llm = AzureChatOpenAI(
+    azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+    azure_deployment=os.getenv("AZURE_OPENAI_DEPLOYMENT"),
+    api_key=os.getenv("AZURE_OPENAI_KEY"),
+    api_version="2024-02-15-preview"
+)
 
-Dagster 会在启动 gRPC 子进程时，把 dagster.yaml 解析后的 完整实例配置（InstanceRef）序列化成一段 JSON，直接塞到
---instance-ref '<very-long-json>' 这个 CLI 参数里。
+# 定义自然语言请求
+user_query = "查询tablea的数据量"
 
-解决方法：
-A. 改用 Dagster 1.11+ 的临时文件传参
-从 1.11 开始，dagster webserver / dagster dev 在本地或 Docker 环境下默认用 临时文件 传递 InstanceRef（PR #22854）。升级后 CLI 里只剩 --instance-ref-from-file /tmp/…/instance_ref.json，SCC 不再抓到口令。
+# 定义SystemPrompt，让LLM知道它需要生成SQL
+system_prompt = SystemMessage(content="""
+你是一个专业的SQL助手，请根据用户的要求生成仅包含SQL语句的响应，不要添加任何额外说明。
+例如：
+用户输入："查询tablea的数据量"
+你只需返回："SELECT COUNT(*) FROM tablea;"
+""")
+
+# 调用LLM生成SQL语句
+response = azure_llm.invoke([
+    system_prompt,
+    HumanMessage(content=user_query)
+])
+
+sql_generated = response.content.strip()
+print(f"LLM生成的SQL: {sql_generated}")
+
+# 将生成的SQL发送给MCP Postgres Server执行
+mcp_response = requests.post(
+    "http://127.0.0.1:8001/mcp/postgres",
+    json={"sql": sql_generated}
+)
+
+print(f"执行结果: {mcp_response.json()['result']}")
