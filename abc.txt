@@ -1,94 +1,181 @@
-# app.py
-from fastapi import FastAPI, Depends, Request
-from fastapi.middleware.cors import CORSMiddleware
-from langchain_mcp_adapters.sse.fastapi import mcpsse_router
-from langchain_mcp import mcp
-from langchain_core.runnables import RunnableConfig
-from langchain_core.output_parsers import StrOutputParser
-from langchain_postgres import PostgresEngine
-import os
-from typing import Dict, List, Any, Optional
-from pydantic import BaseModel
+你要将新闻存入 PostgreSQL 的 pgvector 数据库中，并确保新闻内容不重复，可以采用以下策略和技术方案：
 
-app = FastAPI()
+---
 
-# Configure CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+## 📌 技术方案思路：
 
-# PostgreSQL configuration
-POSTGRES_HOST = os.getenv("POSTGRES_HOST", "localhost")
-POSTGRES_PORT = os.getenv("POSTGRES_PORT", "5432")
-POSTGRES_USER = os.getenv("POSTGRES_USER", "postgres")
-POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "postgres")
-POSTGRES_DB = os.getenv("POSTGRES_DB", "postgres")
+### 步骤一：整体思路
 
-# Initialize PostgreSQL engine
-postgres_connection_string = f"postgresql://{POSTGRES_USER}:{POSTGRES_PASSWORD}@{POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}"
-postgres_engine = PostgresEngine(postgres_connection_string)
+* **计算向量之前先检查文本本身的唯一性**，用哈希（hash）方式先快速去重。
+* 如果新闻文本不重复，再计算其嵌入向量。
+* 存储新闻文本、向量和文本哈希到 pgvector 数据库。
+* **向量相似度**检查，用于避免语义相同但文字表述稍有变化的新闻重复入库（选做）。
 
-# app.py (continued)
-class PostgresQueryInput(BaseModel):
-    query: str
-    parameters: Optional[Dict[str, Any]] = None
+---
 
-@mcp.run(transport="streamable-http")
-async def postgres_query(input_data: PostgresQueryInput, config: Optional[RunnableConfig] = None):
-    """
-    Executes a SQL query on PostgreSQL database and returns the results.
-    
-    Args:
-        input_data: PostgresQueryInput containing the query and optional parameters
-        config: Optional configuration for the runnable
-        
-    Returns:
-        Query results as a list of dictionaries or a formatted string
-    """
-    query = input_data.query
-    parameters = input_data.parameters or {}
-    
-    # Execute the query
-    results = postgres_engine.query(query, parameters=parameters)
-    
-    # Stream the results
-    if isinstance(results, list):
-        for row in results:
-            yield str(row) + "\n"
-    else:
-        yield str(results)
+## 📌 具体实现（结合 LangChain 和 PostgreSQL + pgvector）：
 
+### 1️⃣ 数据库设计
 
-# app.py (continued)
-# Add the MCP SSE router
-app.include_router(
-    mcpsse_router(
-        mcp_runnable=postgres_query,
-        path="/postgres-query",
-        name="postgres_query",
-        description="PostgreSQL query endpoint with streaming via SSE"
-    )
-)
+创建一个存储新闻文本、向量及哈希的表：
 
-# Add a simple health check endpoint
-@app.get("/health")
-async def health_check():
-    return {"status": "healthy", "service": "postgres-mcp"}
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
+CREATE TABLE news_articles (
+    id SERIAL PRIMARY KEY,
+    content TEXT UNIQUE,             -- 唯一约束防止完全相同文本
+    content_hash TEXT UNIQUE,        -- 哈希用于快速去重
+    embedding VECTOR(1536),          -- 假设使用 OpenAI embeddings 默认维度 1536
+    created_at TIMESTAMP DEFAULT NOW()
+);
 
+-- 为向量创建索引以提高向量搜索速度
+CREATE INDEX news_embedding_idx ON news_articles USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
+```
 
-# requirements.txt
-fastapi>=0.100.0
-uvicorn>=0.22.0
-langchain-mcp>=0.0.4
-langchain-mcp-adapters>=0.0.1
-langchain-postgres>=0.0.1
-langchain-core>=0.1.0
-psycopg2-binary>=2.9.6
+**解释**：
+
+* `content` 使用 `UNIQUE` 确保文本本身的唯一性。
+* `content_hash` 为快速去重提供了高效方式（文本较长时性能更佳）。
+* `embedding` 存储文本向量。
+* 向量索引 (`ivfflat`) 用于高效相似性搜索。
+
+---
+
+### 2️⃣ 使用 LangChain 计算 Embeddings 和哈希
+
+安装依赖：
+
+```bash
+pip install langchain openai psycopg[binary] pgvector
+```
+
+示例 Python 代码实现：
+
+```python
+from langchain_openai import OpenAIEmbeddings
+import psycopg
+import hashlib
+
+# 初始化Embedding
+embeddings = OpenAIEmbeddings(model="text-embedding-ada-002")
+
+# PostgreSQL数据库连接
+conn = psycopg.connect("postgresql://user:password@host:port/dbname")
+
+def hash_content(content):
+    """生成内容的哈希值"""
+    return hashlib.sha256(content.encode('utf-8')).hexdigest()
+
+def insert_news_article(content):
+    """插入新闻文章并确保不重复"""
+    content_hash = hash_content(content)
+
+    with conn.cursor() as cur:
+        # 首先快速判断哈希值是否已存在
+        cur.execute("SELECT id FROM news_articles WHERE content_hash = %s", (content_hash,))
+        if cur.fetchone():
+            print("重复的文章，跳过插入")
+            return
+
+        # 计算文本Embedding
+        embedding = embeddings.embed_query(content)
+
+        # 插入到数据库
+        cur.execute(
+            "INSERT INTO news_articles (content, content_hash, embedding) VALUES (%s, %s, %s)",
+            (content, content_hash, embedding)
+        )
+        conn.commit()
+        print("新闻文章已插入")
+
+# 测试插入文章
+sample_article = "美国总统宣布新的经济刺激计划……"
+insert_news_article(sample_article)
+```
+
+---
+
+### 3️⃣ 语义去重（选做）
+
+如果你希望避免语义相近但不完全相同文本的新闻重复入库：
+
+实现思路：
+
+* 在插入新新闻前，**先进行向量相似度搜索**，确定相似度高于某个阈值的文章不再入库。
+
+```python
+def is_similar_article(embedding, threshold=0.9):
+    """判断是否存在相似文章，阈值可调整"""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT id, content
+            FROM news_articles
+            ORDER BY embedding <=> %s
+            LIMIT 1
+        """, (embedding,))
+        result = cur.fetchone()
+        if result:
+            similar_id, similar_content = result
+            # 计算实际余弦相似度进行阈值判断
+            cur.execute("""
+                SELECT 1 - (embedding <=> %s) AS similarity
+                FROM news_articles WHERE id = %s
+            """, (embedding, similar_id))
+            similarity = cur.fetchone()[0]
+            if similarity >= threshold:
+                print(f"找到相似文章（相似度：{similarity:.4f}）")
+                return True
+    return False
+
+def insert_news_article_with_similarity_check(content, similarity_threshold=0.9):
+    content_hash = hash_content(content)
+
+    with conn.cursor() as cur:
+        # 快速哈希判断
+        cur.execute("SELECT id FROM news_articles WHERE content_hash = %s", (content_hash,))
+        if cur.fetchone():
+            print("文本重复，跳过插入")
+            return
+
+        # 计算Embedding
+        embedding = embeddings.embed_query(content)
+
+        # 向量相似性判断
+        if is_similar_article(embedding, similarity_threshold):
+            print("存在语义相似文章，跳过插入")
+            return
+
+        # 插入数据
+        cur.execute(
+            "INSERT INTO news_articles (content, content_hash, embedding) VALUES (%s, %s, %s)",
+            (content, content_hash, embedding)
+        )
+        conn.commit()
+        print("文章成功插入")
+
+# 测试语义去重
+insert_news_article_with_similarity_check("美国总统宣布最新经济政策方案……")
+```
+
+---
+
+## 📌 核心优势：
+
+* **高效去重**：
+
+  * 先通过哈希快速过滤完全相同文本。
+  * 再使用向量相似度进行语义级别的高级去重。
+
+* **高效向量存储**：
+
+  * 使用 `pgvector` 内置的高效向量搜索索引。
+
+* **易维护扩展**：
+
+  * PostgreSQL + LangChain 的技术栈可方便地扩展其他功能（如检索、聚类分析等）。
+
+---
+
+以上方案，能够满足你的新闻文本存储需求，同时通过文本哈希和语义向量结合的方式，确保新加入新闻的高效去重。
