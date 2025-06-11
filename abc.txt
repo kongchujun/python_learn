@@ -1,181 +1,613 @@
-你要将新闻存入 PostgreSQL 的 pgvector 数据库中，并确保新闻内容不重复，可以采用以下策略和技术方案：
+duckdb-mcp-sse/
+├── pyproject.toml
+├── requirements.txt
+├── src/
+│   ├── __init__.py
+│   ├── main.py
+│   ├── server.py
+│   └── duckdb_handler.py
+└── README.md
 
----
 
-## 📌 技术方案思路：
+toml
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
 
-### 步骤一：整体思路
+[project]
+name = "duckdb-mcp-sse"
+version = "1.0.0"
+description = "A Model Context Protocol (MCP) server implementation for DuckDB with SSE support"
+authors = [
+    {name = "Your Name", email = "your.email@example.com"}
+]
+license = {text = "MIT"}
+readme = "README.md"
+requires-python = ">=3.8"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "mcp>=1.0.0",
+    "duckdb>=0.9.0",
+    "fastapi>=0.100.0",
+    "uvicorn>=0.20.0",
+    "pydantic>=2.0.0",
+    "anyio>=3.0.0",
+]
 
-* **计算向量之前先检查文本本身的唯一性**，用哈希（hash）方式先快速去重。
-* 如果新闻文本不重复，再计算其嵌入向量。
-* 存储新闻文本、向量和文本哈希到 pgvector 数据库。
-* **向量相似度**检查，用于避免语义相同但文字表述稍有变化的新闻重复入库（选做）。
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+    "mypy>=1.0.0",
+]
 
----
+[project.scripts]
+duckdb-mcp-sse = "duckdb_mcp_sse.main:main"
 
-## 📌 具体实现（结合 LangChain 和 PostgreSQL + pgvector）：
+[tool.setuptools.packages.find]
+where = ["src"]
 
-### 1️⃣ 数据库设计
+[tool.setuptools.package-dir]
+"" = "src"
 
-创建一个存储新闻文本、向量及哈希的表：
+requiremen.txt
+mcp>=1.0.0
+duckdb>=0.9.0
+fastapi>=0.100.0
+uvicorn>=0.20.0
+pydantic>=2.0.0
+anyio>=3.0.0
 
-```sql
-CREATE EXTENSION IF NOT EXISTS vector;
+src/duckdb_handler.py
+import asyncio
+import logging
+from typing import Any, Dict, List, Optional, Union
+import duckdb
+from contextlib import asynccontextmanager
 
-CREATE TABLE news_articles (
-    id SERIAL PRIMARY KEY,
-    content TEXT UNIQUE,             -- 唯一约束防止完全相同文本
-    content_hash TEXT UNIQUE,        -- 哈希用于快速去重
-    embedding VECTOR(1536),          -- 假设使用 OpenAI embeddings 默认维度 1536
-    created_at TIMESTAMP DEFAULT NOW()
-);
+logger = logging.getLogger(__name__)
 
--- 为向量创建索引以提高向量搜索速度
-CREATE INDEX news_embedding_idx ON news_articles USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
-```
+class DuckDBHandler:
+    """Handler for DuckDB operations with connection management."""
+    
+    def __init__(
+        self, 
+        database_path: str = ":memory:", 
+        persist_connection: bool = False,
+        read_only: bool = False
+    ):
+        self.database_path = database_path
+        self.persist_connection = persist_connection
+        self.read_only = read_only
+        self._connection: Optional[duckdb.DuckDBPyConnection] = None
+        self._lock = asyncio.Lock()
+        
+        if self.persist_connection:
+            self._connection = self._create_connection()
+    
+    def _create_connection(self) -> duckdb.DuckDBPyConnection:
+        """Create a new DuckDB connection."""
+        return duckdb.connect(
+            database=self.database_path,
+            read_only=self.read_only
+        )
+    
+    @asynccontextmanager
+    async def get_connection(self):
+        """Get a connection with proper lifecycle management."""
+        async with self._lock:
+            if self.persist_connection and self._connection:
+                yield self._connection
+            else:
+                conn = self._create_connection()
+                try:
+                    yield conn
+                finally:
+                    if not self.persist_connection:
+                        conn.close()
+    
+    async def execute_query(
+        self, 
+        query: str, 
+        parameters: Optional[List[Any]] = None
+    ) -> Dict[str, Any]:
+        """Execute a query and return results."""
+        try:
+            async with self.get_connection() as conn:
+                if parameters:
+                    result = conn.execute(query, parameters).fetchall()
+                else:
+                    result = conn.execute(query).fetchall()
+                
+                # Get column names
+                description = conn.description
+                columns = [desc[0] for desc in description] if description else []
+                
+                # Convert to list of dictionaries
+                rows = []
+                for row in result:
+                    rows.append(dict(zip(columns, row)))
+                
+                return {
+                    "success": True,
+                    "rows": rows,
+                    "row_count": len(rows),
+                    "columns": columns
+                }
+        
+        except Exception as e:
+            logger.error(f"Query execution failed: {str(e)}")
+            return {
+                "success": False,
+                "error": str(e),
+                "rows": [],
+                "row_count": 0,
+                "columns": []
+            }
+    
+    async def get_schema_info(self, schema_name: Optional[str] = None) -> Dict[str, Any]:
+        """Get schema information."""
+        try:
+            queries = []
+            
+            if schema_name:
+                # Get tables in specific schema
+                queries.append(f"""
+                    SELECT table_name, table_type 
+                    FROM information_schema.tables 
+                    WHERE table_schema = '{schema_name}'
+                    ORDER BY table_name
+                """)
+            else:
+                # Get all schemas
+                queries.append("""
+                    SELECT DISTINCT table_schema as schema_name
+                    FROM information_schema.tables
+                    WHERE table_schema NOT IN ('information_schema', 'pg_catalog')
+                    ORDER BY schema_name
+                """)
+                
+                # Get all tables
+                queries.append("""
+                    SELECT table_schema, table_name, table_type
+                    FROM information_schema.tables
+                    WHERE table_schema NOT IN ('information_schema', 'pg_catalog')
+                    ORDER BY table_schema, table_name
+                """)
+            
+            results = {}
+            async with self.get_connection() as conn:
+                for i, query in enumerate(queries):
+                    result = conn.execute(query).fetchall()
+                    description = conn.description
+                    columns = [desc[0] for desc in description] if description else []
+                    
+                    rows = []
+                    for row in result:
+                        rows.append(dict(zip(columns, row)))
+                    
+                    results[f"query_{i}"] = {
+                        "rows": rows,
+                        "columns": columns
+                    }
+            
+            return {
+                "success": True,
+                "schema_info": results
+            }
+        
+        except Exception as e:
+            logger.error(f"Schema info retrieval failed: {str(e)}")
+            return {
+                "success": False,
+                "error": str(e),
+                "schema_info": {}
+            }
+    
+    async def get_table_info(self, table_name: str, schema_name: Optional[str] = None) -> Dict[str, Any]:
+        """Get detailed table information."""
+        try:
+            full_table_name = f"{schema_name}.{table_name}" if schema_name else table_name
+            
+            # Get column information
+            query = f"DESCRIBE {full_table_name}"
+            
+            async with self.get_connection() as conn:
+                result = conn.execute(query).fetchall()
+                description = conn.description
+                columns = [desc[0] for desc in description] if description else []
+                
+                column_info = []
+                for row in result:
+                    column_info.append(dict(zip(columns, row)))
+                
+                # Get row count
+                count_result = conn.execute(f"SELECT COUNT(*) FROM {full_table_name}").fetchone()
+                row_count = count_result[0] if count_result else 0
+                
+                return {
+                    "success": True,
+                    "table_name": table_name,
+                    "schema_name": schema_name,
+                    "columns": column_info,
+                    "row_count": row_count
+                }
+        
+        except Exception as e:
+            logger.error(f"Table info retrieval failed: {str(e)}")
+            return {
+                "success": False,
+                "error": str(e),
+                "table_name": table_name,
+                "schema_name": schema_name,
+                "columns": [],
+                "row_count": 0
+            }
+    
+    def close(self):
+        """Close the persistent connection if it exists."""
+        if self._connection:
+            self._connection.close()
+            self._connection = None
 
-**解释**：
+src/server.py
+import asyncio
+import json
+import logging
+from typing import Any, Dict, Optional
+from mcp.server.models import InitializationOptions
+from mcp.server import NotificationOptions, Server
+from mcp.types import (
+    Resource, 
+    Tool, 
+    TextContent, 
+    ImageContent, 
+    EmbeddedResource
+)
+from pydantic import AnyUrl
+from .duckdb_handler import DuckDBHandler
 
-* `content` 使用 `UNIQUE` 确保文本本身的唯一性。
-* `content_hash` 为快速去重提供了高效方式（文本较长时性能更佳）。
-* `embedding` 存储文本向量。
-* 向量索引 (`ivfflat`) 用于高效相似性搜索。
+logger = logging.getLogger(__name__)
 
----
+class DuckDBMCPServer:
+    """MCP Server for DuckDB with SSE support."""
+    
+    def __init__(
+        self, 
+        database_path: str = ":memory:",
+        persist_connection: bool = False,
+        read_only: bool = False
+    ):
+        self.db_handler = DuckDBHandler(
+            database_path=database_path,
+            persist_connection=persist_connection,
+            read_only=read_only
+        )
+        self.server = Server("duckdb-mcp-server")
+        self._setup_handlers()
+    
+    def _setup_handlers(self):
+        """Setup MCP server handlers."""
+        
+        @self.server.list_resources()
+        async def handle_list_resources() -> list[Resource]:
+            """List available database resources."""
+            return [
+                Resource(
+                    uri=AnyUrl("duckdb://schema"),
+                    name="Database Schema",
+                    description="Information about database schemas and tables",
+                    mimeType="application/json",
+                ),
+                Resource(
+                    uri=AnyUrl("duckdb://tables"),
+                    name="Database Tables",
+                    description="List of all tables in the database",
+                    mimeType="application/json",
+                ),
+            ]
+        
+        @self.server.read_resource()
+        async def handle_read_resource(uri: AnyUrl) -> str:
+            """Read a database resource."""
+            uri_str = str(uri)
+            
+            if uri_str == "duckdb://schema":
+                result = await self.db_handler.get_schema_info()
+                return json.dumps(result, indent=2)
+            
+            elif uri_str == "duckdb://tables":
+                result = await self.db_handler.get_schema_info()
+                return json.dumps(result, indent=2)
+            
+            else:
+                raise ValueError(f"Unknown resource: {uri}")
+        
+        @self.server.list_tools()
+        async def handle_list_tools() -> list[Tool]:
+            """List available tools."""
+            return [
+                Tool(
+                    name="execute_query",
+                    description="Execute a SQL query against the DuckDB database",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "SQL query to execute"
+                            },
+                            "parameters": {
+                                "type": "array",
+                                "description": "Query parameters",
+                                "items": {"type": "any"}
+                            }
+                        },
+                        "required": ["query"]
+                    }
+                ),
+                Tool(
+                    name="get_schema",
+                    description="Get database schema information",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "schema_name": {
+                                "type": "string",
+                                "description": "Optional schema name to filter results"
+                            }
+                        }
+                    }
+                ),
+                Tool(
+                    name="get_table_info",
+                    description="Get detailed information about a specific table",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "table_name": {
+                                "type": "string",
+                                "description": "Name of the table"
+                            },
+                            "schema_name": {
+                                "type": "string",
+                                "description": "Optional schema name"
+                            }
+                        },
+                        "required": ["table_name"]
+                    }
+                )
+            ]
+        
+        @self.server.call_tool()
+        async def handle_call_tool(name: str, arguments: dict) -> list[TextContent | ImageContent | EmbeddedResource]:
+            """Handle tool calls."""
+            
+            if name == "execute_query":
+                query = arguments.get("query")
+                parameters = arguments.get("parameters")
+                
+                if not query:
+                    return [TextContent(type="text", text="Error: No query provided")]
+                
+                result = await self.db_handler.execute_query(query, parameters)
+                return [TextContent(type="text", text=json.dumps(result, indent=2))]
+            
+            elif name == "get_schema":
+                schema_name = arguments.get("schema_name")
+                result = await self.db_handler.get_schema_info(schema_name)
+                return [TextContent(type="text", text=json.dumps(result, indent=2))]
+            
+            elif name == "get_table_info":
+                table_name = arguments.get("table_name")
+                schema_name = arguments.get("schema_name")
+                
+                if not table_name:
+                    return [TextContent(type="text", text="Error: No table name provided")]
+                
+                result = await self.db_handler.get_table_info(table_name, schema_name)
+                return [TextContent(type="text", text=json.dumps(result, indent=2))]
+            
+            else:
+                return [TextContent(type="text", text=f"Unknown tool: {name}")]
+    
+    async def run_sse(self, host: str = "localhost", port: int = 8000):
+        """Run the server in SSE mode."""
+        from fastapi import FastAPI, Request
+        from fastapi.responses import StreamingResponse
+        from fastapi.middleware.cors import CORSMiddleware
+        import uvicorn
+        
+        app = FastAPI(title="DuckDB MCP Server")
+        
+        # Add CORS middleware
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=["*"],
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+        
+        @app.get("/sse")
+        async def sse_endpoint(request: Request):
+            """SSE endpoint for MCP communication."""
+            
+            async def event_stream():
+                try:
+                    # Handle MCP initialization
+                    init_response = {
+                        "jsonrpc": "2.0",
+                        "result": {
+                            "protocolVersion": "2024-11-05",
+                            "capabilities": {
+                                "resources": {"subscribe": True, "listChanged": True},
+                                "tools": {},
+                                "logging": {},
+                            },
+                            "serverInfo": {
+                                "name": "duckdb-mcp-server",
+                                "version": "1.0.0",
+                            },
+                        }
+                    }
+                    
+                    yield f"data: {json.dumps(init_response)}\n\n"
+                    
+                    # Keep connection alive
+                    while True:
+                        if await request.is_disconnected():
+                            break
+                        
+                        # Send heartbeat
+                        heartbeat = {"type": "heartbeat", "timestamp": asyncio.get_event_loop().time()}
+                        yield f"data: {json.dumps(heartbeat)}\n\n"
+                        
+                        await asyncio.sleep(30)  # Heartbeat every 30 seconds
+                        
+                except Exception as e:
+                    logger.error(f"SSE stream error: {e}")
+                    error_event = {"type": "error", "message": str(e)}
+                    yield f"data: {json.dumps(error_event)}\n\n"
+            
+            return StreamingResponse(
+                event_stream(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "Access-Control-Allow-Origin": "*",
+                }
+            )
+        
+        @app.post("/mcp")
+        async def mcp_endpoint(request: Request):
+            """HTTP endpoint for MCP requests."""
+            try:
+                data = await request.json()
+                # Handle MCP requests here
+                # This is a simplified implementation
+                response = {"jsonrpc": "2.0", "id": data.get("id"), "result": {}}
+                return response
+            except Exception as e:
+                return {"jsonrpc": "2.0", "error": {"code": -1, "message": str(e)}}
+        
+        logger.info(f"Starting DuckDB MCP Server on {host}:{port}")
+        logger.info(f"SSE endpoint: http://{host}:{port}/sse")
+        logger.info(f"HTTP endpoint: http://{host}:{port}/mcp")
+        
+        config = uvicorn.Config(app, host=host, port=port, log_level="info")
+        server = uvicorn.Server(config)
+        await server.serve()
+    
+    def close(self):
+        """Clean up resources."""
+        self.db_handler.close()
 
-### 2️⃣ 使用 LangChain 计算 Embeddings 和哈希
+src/main.py
+import argparse
+import asyncio
+import logging
+import sys
+from typing import Optional
+from .server import DuckDBMCPServer
 
-安装依赖：
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+async def main():
+    """Main entry point."""
+    parser = argparse.ArgumentParser(description="DuckDB MCP Server with SSE support")
+    parser.add_argument(
+        "--database", 
+        "-d",
+        default=":memory:",
+        help="DuckDB database path (default: :memory:)"
+    )
+    parser.add_argument(
+        "--host",
+        default="localhost",
+        help="Host to bind to (default: localhost)"
+    )
+    parser.add_argument(
+        "--port",
+        "-p",
+        type=int,
+        default=8000,
+        help="Port to bind to (default: 8000)"
+    )
+    parser.add_argument(
+        "--persist-connection",
+        action="store_true",
+        help="Persist database connection for the server lifetime"
+    )
+    parser.add_argument(
+        "--read-only",
+        action="store_true",
+        help="Open database in read-only mode"
+    )
+    
+    args = parser.parse_args()
+    
+    try:
+        server = DuckDBMCPServer(
+            database_path=args.database,
+            persist_connection=args.persist_connection,
+            read_only=args.read_only
+        )
+        
+        logger.info("Starting DuckDB MCP Server...")
+        await server.run_sse(host=args.host, port=args.port)
+        
+    except KeyboardInterrupt:
+        logger.info("Shutting down...")
+    except Exception as e:
+        logger.error(f"Server error: {e}")
+        sys.exit(1)
+
+def run():
+    """Synchronous entry point for console scripts."""
+    asyncio.run(main())
+
+if __name__ == "__main__":
+    run()
+
+src/init.py
+"""DuckDB MCP Server with SSE support."""
+
+from .server import DuckDBMCPServer
+from .duckdb_handler import DuckDBHandler
+
+__version__ = "1.0.0"
+__all__ = ["DuckDBMCPServer", "DuckDBHandler"]
+
+readme
+# DuckDB MCP Server with SSE Support
+
+A Model Context Protocol (MCP) server implementation for DuckDB with Server-Sent Events (SSE) support.
+
+## Features
+
+- **DuckDB Integration**: Full support for DuckDB operations
+- **SSE Support**: Server-Sent Events for real-time communication
+- **HTTP API**: RESTful endpoints for MCP communication
+- **Connection Management**: Configurable connection persistence
+- **Schema Introspection**: Automatic database schema discovery
+- **Query Execution**: Safe parameterized query execution
+
+## Installation
 
 ```bash
-pip install langchain openai psycopg[binary] pgvector
-```
-
-示例 Python 代码实现：
-
-```python
-from langchain_openai import OpenAIEmbeddings
-import psycopg
-import hashlib
-
-# 初始化Embedding
-embeddings = OpenAIEmbeddings(model="text-embedding-ada-002")
-
-# PostgreSQL数据库连接
-conn = psycopg.connect("postgresql://user:password@host:port/dbname")
-
-def hash_content(content):
-    """生成内容的哈希值"""
-    return hashlib.sha256(content.encode('utf-8')).hexdigest()
-
-def insert_news_article(content):
-    """插入新闻文章并确保不重复"""
-    content_hash = hash_content(content)
-
-    with conn.cursor() as cur:
-        # 首先快速判断哈希值是否已存在
-        cur.execute("SELECT id FROM news_articles WHERE content_hash = %s", (content_hash,))
-        if cur.fetchone():
-            print("重复的文章，跳过插入")
-            return
-
-        # 计算文本Embedding
-        embedding = embeddings.embed_query(content)
-
-        # 插入到数据库
-        cur.execute(
-            "INSERT INTO news_articles (content, content_hash, embedding) VALUES (%s, %s, %s)",
-            (content, content_hash, embedding)
-        )
-        conn.commit()
-        print("新闻文章已插入")
-
-# 测试插入文章
-sample_article = "美国总统宣布新的经济刺激计划……"
-insert_news_article(sample_article)
-```
-
----
-
-### 3️⃣ 语义去重（选做）
-
-如果你希望避免语义相近但不完全相同文本的新闻重复入库：
-
-实现思路：
-
-* 在插入新新闻前，**先进行向量相似度搜索**，确定相似度高于某个阈值的文章不再入库。
-
-```python
-def is_similar_article(embedding, threshold=0.9):
-    """判断是否存在相似文章，阈值可调整"""
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT id, content
-            FROM news_articles
-            ORDER BY embedding <=> %s
-            LIMIT 1
-        """, (embedding,))
-        result = cur.fetchone()
-        if result:
-            similar_id, similar_content = result
-            # 计算实际余弦相似度进行阈值判断
-            cur.execute("""
-                SELECT 1 - (embedding <=> %s) AS similarity
-                FROM news_articles WHERE id = %s
-            """, (embedding, similar_id))
-            similarity = cur.fetchone()[0]
-            if similarity >= threshold:
-                print(f"找到相似文章（相似度：{similarity:.4f}）")
-                return True
-    return False
-
-def insert_news_article_with_similarity_check(content, similarity_threshold=0.9):
-    content_hash = hash_content(content)
-
-    with conn.cursor() as cur:
-        # 快速哈希判断
-        cur.execute("SELECT id FROM news_articles WHERE content_hash = %s", (content_hash,))
-        if cur.fetchone():
-            print("文本重复，跳过插入")
-            return
-
-        # 计算Embedding
-        embedding = embeddings.embed_query(content)
-
-        # 向量相似性判断
-        if is_similar_article(embedding, similarity_threshold):
-            print("存在语义相似文章，跳过插入")
-            return
-
-        # 插入数据
-        cur.execute(
-            "INSERT INTO news_articles (content, content_hash, embedding) VALUES (%s, %s, %s)",
-            (content, content_hash, embedding)
-        )
-        conn.commit()
-        print("文章成功插入")
-
-# 测试语义去重
-insert_news_article_with_similarity_check("美国总统宣布最新经济政策方案……")
-```
-
----
-
-## 📌 核心优势：
-
-* **高效去重**：
-
-  * 先通过哈希快速过滤完全相同文本。
-  * 再使用向量相似度进行语义级别的高级去重。
-
-* **高效向量存储**：
-
-  * 使用 `pgvector` 内置的高效向量搜索索引。
-
-* **易维护扩展**：
-
-  * PostgreSQL + LangChain 的技术栈可方便地扩展其他功能（如检索、聚类分析等）。
-
----
-
-以上方案，能够满足你的新闻文本存储需求，同时通过文本哈希和语义向量结合的方式，确保新加入新闻的高效去重。
+pip install -r requirements.txt
