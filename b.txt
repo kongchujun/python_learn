@@ -1,4 +1,12 @@
 <clickhouse>
+  <openSSL>
+    <client>
+      <verificationMode>none</verificationMode>
+    </client>
+  </openSSL>
+</clickhouse>
+
+<clickhouse>
   <storage_configuration>
     <disks>
       <s3>
