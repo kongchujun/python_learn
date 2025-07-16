@@ -1,41 +1,845 @@
-你说得对！我在项目结构中提到了 `FileViewer.vue` 但没有提供具体代码。这里是完整的文件预览组件：
+好的，我重新为你生成完整的前端代码：
+
+## 完整的前端项目文件
+
+### frontend/package.json
+```json
+{
+  "name": "s3-file-manager-frontend",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0 --port 5173",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "vue": "^3.3.8",
+    "axios": "^1.6.2",
+    "element-plus": "^2.4.4",
+    "@element-plus/icons-vue": "^2.1.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^4.5.0",
+    "vite": "^5.0.0"
+  }
+}
+```
+
+### frontend/vite.config.js
+```js
+import { defineConfig } from 'vite'
+import vue from '@vitejs/plugin-vue'
+
+export default defineConfig({
+  plugins: [vue()],
+  server: {
+    host: '0.0.0.0',
+    port: 5173,
+    open: true,
+    cors: true
+  }
+})
+```
+
+### frontend/index.html
+```html
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>📁</text></svg>">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>S3 File Manager</title>
+</head>
+<body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.js"></script>
+</body>
+</html>
+```
+
+### frontend/src/main.js
+```js
+import { createApp } from 'vue'
+import ElementPlus from 'element-plus'
+import 'element-plus/dist/index.css'
+import * as ElementPlusIconsVue from '@element-plus/icons-vue'
+import App from './App.vue'
+
+const app = createApp(App)
+app.use(ElementPlus)
+
+// 注册所有图标
+for (const [key, component] of Object.entries(ElementPlusIconsVue)) {
+  app.component(key, component)
+}
+
+app.mount('#app')
+```
+
+### frontend/src/services/api.js
+```js
+import axios from 'axios'
+
+const api = axios.create({
+  baseURL: 'http://localhost:8000/api',
+  timeout: 30000,
+})
+
+api.interceptors.response.use(
+  response => response.data,
+  error => {
+    const message = error.response?.data?.detail || error.message || '网络错误'
+    return Promise.reject(new Error(message))
+  }
+)
+
+export const s3Api = {
+  getBuckets() {
+    return api.get('/buckets')
+  },
+  getFiles(bucketName, prefix = '', page = 1, pageSize = 50) {
+    return api.get(`/buckets/${bucketName}/files`, {
+      params: { prefix, page, page_size: pageSize }
+    })
+  },
+  uploadFile(bucketName, file, prefix = '') {
+    const formData = new FormData()
+    formData.append('file', file)
+    formData.append('prefix', prefix)
+    return api.post(`/buckets/${bucketName}/upload`, formData)
+  },
+  deleteFile(bucketName, fileKey) {
+    return api.delete(`/buckets/${bucketName}/files/${encodeURIComponent(fileKey)}`)
+  },
+  deleteMultipleFiles(bucketName, fileKeys) {
+    return api.post(`/buckets/${bucketName}/delete-multiple`, fileKeys)
+  },
+  createFolder(bucketName, folderName, prefix = '') {
+    const formData = new FormData()
+    formData.append('folder_name', folderName)
+    formData.append('prefix', prefix)
+    return api.post(`/buckets/${bucketName}/create-folder`, formData)
+  },
+  testConnection() {
+    return axios.get('http://localhost:8000/')
+  }
+}
+
+export default api
+```
+
+### frontend/src/components/BucketSelector.vue
+```vue
+<template>
+  <div class="bucket-selector">
+    <el-select
+      v-model="selectedBucket"
+      placeholder="选择S3存储桶"
+      @change="onBucketChange"
+      style="width: 100%"
+      :loading="loading"
+      clearable
+    >
+      <el-option
+        v-for="bucket in buckets"
+        :key="bucket.name"
+        :label="bucket.name"
+        :value="bucket.name"
+      >
+        <div style="display: flex; justify-content: space-between;">
+          <span>{{ bucket.name }}</span>
+          <span style="color: #8492a6; font-size: 12px">
+            {{ formatDate(bucket.creation_date) }}
+          </span>
+        </div>
+      </el-option>
+    </el-select>
+    
+    <el-button 
+      type="primary" 
+      @click="loadBuckets"
+      :loading="loading"
+      style="margin-top: 10px; width: 100%"
+    >
+      <el-icon><Refresh /></el-icon>
+      刷新存储桶
+    </el-button>
+
+    <div v-if="error" class="error-message">
+      <el-alert
+        title="获取存储桶失败"
+        :description="error"
+        type="error"
+        show-icon
+      />
+    </div>
+  </div>
+</template>
+
+<script setup>
+import { ref, onMounted } from 'vue'
+import { Refresh } from '@element-plus/icons-vue'
+import { ElMessage } from 'element-plus'
+import { s3Api } from '../services/api'
+
+const emit = defineEmits(['bucket-changed'])
+const buckets = ref([])
+const selectedBucket = ref('')
+const loading = ref(false)
+const error = ref('')
+
+const loadBuckets = async () => {
+  loading.value = true
+  error.value = ''
+  try {
+    buckets.value = await s3Api.getBuckets()
+    ElMessage.success(`获取到 ${buckets.value.length} 个存储桶`)
+    if (buckets.value.length === 1) {
+      selectedBucket.value = buckets.value[0].name
+      emit('bucket-changed', selectedBucket.value)
+    }
+  } catch (err) {
+    error.value = err.message
+    ElMessage.error('获取存储桶失败: ' + err.message)
+  } finally {
+    loading.value = false
+  }
+}
+
+const onBucketChange = (bucketName) => {
+  emit('bucket-changed', bucketName)
+}
+
+const formatDate = (dateString) => {
+  return new Date(dateString).toLocaleDateString('zh-CN')
+}
+
+onMounted(() => {
+  loadBuckets()
+})
+</script>
+
+<style scoped>
+.error-message {
+  margin-top: 10px;
+}
+</style>
+```
+
+### frontend/src/components/FileUpload.vue
+```vue
+<template>
+  <div class="file-upload">
+    <el-upload
+      ref="uploadRef"
+      :multiple="true"
+      :auto-upload="false"
+      :on-change="onFileChange"
+      :show-file-list="false"
+      drag
+    >
+      <el-icon class="el-icon--upload"><UploadFilled /></el-icon>
+      <div class="el-upload__text">
+        拖拽文件到此处，或<em>点击上传</em>
+      </div>
+      <template #tip>
+        <div class="el-upload__tip">
+          支持多文件上传
+        </div>
+      </template>
+    </el-upload>
+
+    <div v-if="fileList.length > 0" class="file-list">
+      <h4>待上传文件 ({{ fileList.length }}):</h4>
+      <div class="file-items">
+        <div 
+          v-for="(file, index) in fileList" 
+          :key="index"
+          class="file-item"
+        >
+          <div class="file-info">
+            <el-icon><Document /></el-icon>
+            <span>{{ file.name }}</span>
+            <span class="file-size">{{ formatFileSize(file.size) }}</span>
+          </div>
+          <el-button 
+            type="danger" 
+            size="small" 
+            @click="removeFile(index)"
+            circle
+          >
+            <el-icon><Delete /></el-icon>
+          </el-button>
+        </div>
+      </div>
+
+      <div class="upload-actions">
+        <el-button 
+          type="primary" 
+          @click="uploadFiles"
+          :loading="uploading"
+          style="width: 100%"
+        >
+          上传所有文件
+        </el-button>
+        <el-button 
+          @click="clearFiles"
+          style="width: 100%; margin-top: 5px"
+        >
+          清空列表
+        </el-button>
+      </div>
+    </div>
+
+    <el-divider>创建文件夹</el-divider>
+    
+    <div class="create-folder">
+      <el-input
+        v-model="folderName"
+        placeholder="输入文件夹名称"
+        @keyup.enter="createFolder"
+      >
+        <template #append>
+          <el-button 
+            type="success" 
+            @click="createFolder"
+            :loading="creatingFolder"
+          >
+            创建
+          </el-button>
+        </template>
+      </el-input>
+    </div>
+  </div>
+</template>
+
+<script setup>
+import { ref } from 'vue'
+import { UploadFilled, Delete, Document } from '@element-plus/icons-vue'
+import { ElMessage } from 'element-plus'
+import { s3Api } from '../services/api'
+
+const props = defineProps({
+  bucketName: String,
+  currentPrefix: String
+})
+
+const emit = defineEmits(['upload-success', 'folder-created'])
+
+const uploadRef = ref()
+const fileList = ref([])
+const uploading = ref(false)
+const folderName = ref('')
+const creatingFolder = ref(false)
+
+const onFileChange = (file) => {
+  fileList.value.push(file.raw)
+}
+
+const removeFile = (index) => {
+  fileList.value.splice(index, 1)
+}
+
+const clearFiles = () => {
+  fileList.value = []
+  uploadRef.value?.clearFiles()
+}
+
+const uploadFiles = async () => {
+  if (!props.bucketName) {
+    ElMessage.warning('请先选择存储桶')
+    return
+  }
+
+  uploading.value = true
+  let successCount = 0
+
+  try {
+    for (const file of fileList.value) {
+      try {
+        await s3Api.uploadFile(props.bucketName, file, props.currentPrefix)
+        successCount++
+      } catch (error) {
+        ElMessage.error(`上传 ${file.name} 失败`)
+      }
+    }
+
+    if (successCount > 0) {
+      ElMessage.success(`成功上传 ${successCount} 个文件`)
+      emit('upload-success')
+      clearFiles()
+    }
+  } finally {
+    uploading.value = false
+  }
+}
+
+const createFolder = async () => {
+  if (!folderName.value.trim()) {
+    ElMessage.warning('请输入文件夹名称')
+    return
+  }
+
+  creatingFolder.value = true
+  try {
+    await s3Api.createFolder(props.bucketName, folderName.value.trim(), props.currentPrefix)
+    ElMessage.success('文件夹创建成功')
+    folderName.value = ''
+    emit('folder-created')
+  } catch (error) {
+    ElMessage.error('创建失败: ' + error.message)
+  } finally {
+    creatingFolder.value = false
+  }
+}
+
+const formatFileSize = (size) => {
+  if (size < 1024) return size + ' B'
+  if (size < 1024 * 1024) return (size / 1024).toFixed(1) + ' KB'
+  if (size < 1024 * 1024 * 1024) return (size / (1024 * 1024)).toFixed(1) + ' MB'
+  return (size / (1024 * 1024 * 1024)).toFixed(1) + ' GB'
+}
+</script>
+
+<style scoped>
+.file-list {
+  margin-top: 20px;
+}
+
+.file-items {
+  max-height: 200px;
+  overflow-y: auto;
+  border: 1px solid #eee;
+  border-radius: 4px;
+  padding: 10px;
+}
+
+.file-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 0;
+  border-bottom: 1px solid #f0f0f0;
+}
+
+.file-item:last-child {
+  border-bottom: none;
+}
+
+.file-info {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+}
+
+.file-size {
+  font-size: 12px;
+  color: #666;
+}
+
+.upload-actions {
+  margin-top: 15px;
+}
+
+.create-folder {
+  margin-top: 10px;
+}
+</style>
+```
+
+### frontend/src/components/FileList.vue
+```vue
+<template>
+  <div class="file-list">
+    <!-- 路径导航 -->
+    <div class="path-navigation">
+      <el-breadcrumb separator="/">
+        <el-breadcrumb-item>
+          <el-button text @click="navigateToPath('')">
+            <el-icon><House /></el-icon>
+            根目录
+          </el-button>
+        </el-breadcrumb-item>
+        <el-breadcrumb-item 
+          v-for="(segment, index) in pathSegments" 
+          :key="index"
+        >
+          <el-button text @click="navigateToPath(getPathToSegment(index))">
+            {{ segment }}
+          </el-button>
+        </el-breadcrumb-item>
+      </el-breadcrumb>
+    </div>
+
+    <!-- 工具栏 -->
+    <div class="toolbar">
+      <div class="toolbar-left">
+        <el-button 
+          type="danger" 
+          :disabled="selectedFiles.length === 0"
+          @click="deleteSelectedFiles"
+        >
+          <el-icon><Delete /></el-icon>
+          删除选中 ({{ selectedFiles.length }})
+        </el-button>
+        <el-button 
+          type="primary" 
+          @click="loadFiles"
+          :loading="loading"
+        >
+          <el-icon><Refresh /></el-icon>
+          刷新
+        </el-button>
+      </div>
+      
+      <div class="toolbar-right">
+        <el-tag v-if="folders.length > 0">{{ folders.length }} 个文件夹</el-tag>
+        <el-tag type="success">{{ files.length }} 个文件</el-tag>
+      </div>
+    </div>
+
+    <!-- 文件夹列表 -->
+    <div v-if="folders.length > 0" class="folders-section">
+      <h4>📁 文件夹</h4>
+      <el-row :gutter="10">
+        <el-col 
+          v-for="folder in folders" 
+          :key="folder" 
+          :xs="12" :sm="8" :md="6" :lg="4"
+        >
+          <el-card 
+            shadow="hover" 
+            @click="navigateToFolder(folder)"
+            class="folder-card"
+          >
+            <div class="folder-content">
+              <el-icon size="24"><Folder /></el-icon>
+              <span>{{ folder }}</span>
+            </div>
+          </el-card>
+        </el-col>
+      </el-row>
+    </div>
+
+    <!-- 文件列表 -->
+    <div class="files-section">
+      <h4 v-if="folders.length > 0">📄 文件</h4>
+      
+      <el-table
+        :data="files"
+        @selection-change="onSelectionChange"
+        v-loading="loading"
+        empty-text="暂无文件"
+        stripe
+      >
+        <el-table-column type="selection" width="55" />
+        
+        <el-table-column label="文件名" min-width="250">
+          <template #default="{ row }">
+            <div class="file-info">
+              <el-icon><Document /></el-icon>
+              <span>{{ row.name }}</span>
+            </div>
+          </template>
+        </el-table-column>
+        
+        <el-table-column label="大小" width="120">
+          <template #default="{ row }">
+            {{ formatFileSize(row.size) }}
+          </template>
+        </el-table-column>
+        
+        <el-table-column label="修改时间" width="180">
+          <template #default="{ row }">
+            {{ formatDate(row.last_modified) }}
+          </template>
+        </el-table-column>
+        
+        <el-table-column label="类型" width="120">
+          <template #default="{ row }">
+            <el-tag size="small">{{ row.storage_class }}</el-tag>
+          </template>
+        </el-table-column>
+        
+        <el-table-column label="操作" width="240">
+          <template #default="{ row }">
+            <el-button 
+              size="small" 
+              type="success"
+              @click="previewFile(row)"
+            >
+              预览
+            </el-button>
+            <el-button 
+              size="small" 
+              type="primary"
+              @click="downloadFile(row)"
+            >
+              下载
+            </el-button>
+            <el-button 
+              size="small" 
+              type="danger"
+              @click="deleteFile(row)"
+            >
+              删除
+            </el-button>
+          </template>
+        </el-table-column>
+      </el-table>
+
+      <!-- 分页 -->
+      <div class="pagination" v-if="totalCount > pageSize">
+        <el-pagination
+          v-model:current-page="currentPage"
+          v-model:page-size="pageSize"
+          :total="totalCount"
+          layout="total, sizes, prev, pager, next"
+          :page-sizes="[20, 50, 100]"
+          @current-change="loadFiles"
+          @size-change="loadFiles"
+        />
+      </div>
+    </div>
+
+    <!-- 文件预览 -->
+    <FileViewer
+      v-model="showPreview"
+      :file="previewFileData"
+      @close="showPreview = false"
+    />
+  </div>
+</template>
+
+<script setup>
+import { ref, computed, watch } from 'vue'
+import { House, Folder, Document, Delete, Refresh } from '@element-plus/icons-vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { s3Api } from '../services/api'
+import FileViewer from './FileViewer.vue'
+
+const props = defineProps({
+  bucketName: String,
+  refreshTrigger: Number
+})
+
+const emit = defineEmits(['path-changed'])
+
+const files = ref([])
+const folders = ref([])
+const selectedFiles = ref([])
+const loading = ref(false)
+const currentPrefix = ref('')
+const currentPage = ref(1)
+const pageSize = ref(50)
+const totalCount = ref(0)
+const showPreview = ref(false)
+const previewFileData = ref(null)
+
+const pathSegments = computed(() => {
+  if (!currentPrefix.value) return []
+  return currentPrefix.value.split('/').filter(segment => segment)
+})
+
+const loadFiles = async () => {
+  if (!props.bucketName) return
+
+  loading.value = true
+  try {
+    const response = await s3Api.getFiles(
+      props.bucketName, 
+      currentPrefix.value, 
+      currentPage.value, 
+      pageSize.value
+    )
+    
+    files.value = response.files || []
+    folders.value = response.folders || []
+    totalCount.value = response.total_count || 0
+    
+  } catch (error) {
+    ElMessage.error('获取文件列表失败: ' + error.message)
+  } finally {
+    loading.value = false
+  }
+}
+
+const navigateToFolder = (folderName) => {
+  const newPrefix = currentPrefix.value ? 
+    `${currentPrefix.value}${folderName}/` : 
+    `${folderName}/`
+  navigateToPath(newPrefix)
+}
+
+const navigateToPath = (path) => {
+  currentPrefix.value = path
+  currentPage.value = 1
+  emit('path-changed', path)
+  loadFiles()
+}
+
+const getPathToSegment = (index) => {
+  return pathSegments.value.slice(0, index + 1).join('/') + '/'
+}
+
+const onSelectionChange = (selection) => {
+  selectedFiles.value = selection
+}
+
+const previewFile = (file) => {
+  previewFileData.value = file
+  showPreview.value = true
+}
+
+const downloadFile = (file) => {
+  if (file.download_url) {
+    const link = document.createElement('a')
+    link.href = file.download_url
+    link.download = file.name
+    document.body.appendChild(link)
+    link.click()
+    document.body.removeChild(link)
+  }
+}
+
+const deleteFile = async (file) => {
+  try {
+    await ElMessageBox.confirm(`确定删除 "${file.name}"？`, '确认删除', { type: 'warning' })
+    await s3Api.deleteFile(props.bucketName, file.key)
+    ElMessage.success('删除成功')
+    loadFiles()
+  } catch (error) {
+    if (error !== 'cancel') {
+      ElMessage.error('删除失败')
+    }
+  }
+}
+
+const deleteSelectedFiles = async () => {
+  if (selectedFiles.value.length === 0) return
+
+  try {
+    await ElMessageBox.confirm(`确定删除选中的 ${selectedFiles.value.length} 个文件？`, '批量删除')
+    const fileKeys = selectedFiles.value.map(file => file.key)
+    await s3Api.deleteMultipleFiles(props.bucketName, fileKeys)
+    ElMessage.success('批量删除成功')
+    loadFiles()
+  } catch (error) {
+    if (error !== 'cancel') {
+      ElMessage.error('批量删除失败')
+    }
+  }
+}
+
+const formatFileSize = (size) => {
+  if (size < 1024) return size + ' B'
+  if (size < 1024 * 1024) return (size / 1024).toFixed(1) + ' KB'
+  if (size < 1024 * 1024 * 1024) return (size / (1024 * 1024)).toFixed(1) + ' MB'
+  return (size / (1024 * 1024 * 1024)).toFixed(1) + ' GB'
+}
+
+const formatDate = (dateString) => {
+  return new Date(dateString).toLocaleString('zh-CN')
+}
+
+watch([() => props.bucketName, () => props.refreshTrigger], () => {
+  if (props.bucketName) {
+    currentPrefix.value = ''
+    currentPage.value = 1
+    loadFiles()
+  }
+}, { immediate: true })
+</script>
+
+<style scoped>
+.path-navigation {
+  margin-bottom: 15px;
+  padding: 15px;
+  background: #f8f9fa;
+  border-radius: 6px;
+}
+
+.toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 20px;
+  padding: 15px 0;
+}
+
+.toolbar-left {
+  display: flex;
+  gap: 10px;
+}
+
+.toolbar-right {
+  display: flex;
+  gap: 10px;
+}
+
+.folders-section {
+  margin-bottom: 30px;
+}
+
+.folders-section h4, .files-section h4 {
+  margin-bottom: 15px;
+  color: #333;
+}
+
+.folder-card {
+  cursor: pointer;
+  transition: all 0.3s;
+}
+
+.folder-card:hover {
+  transform: translateY(-2px);
+}
+
+.folder-content {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 15px;
+}
+
+.file-info {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.pagination {
+  margin-top: 30px;
+  display: flex;
+  justify-content: center;
+}
+</style>
+```
 
 ### frontend/src/components/FileViewer.vue
-
 ```vue
 <template>
   <el-dialog
     v-model="visible"
     :title="file?.name || '文件预览'"
     width="80%"
-    :before-close="handleClose"
     destroy-on-close
   >
-    <div v-loading="loading" class="file-viewer">
+    <div class="file-viewer">
       <div v-if="file" class="file-info">
         <el-descriptions title="文件信息" :column="2" border>
-          <el-descriptions-item label="文件名">
-            {{ file.name }}
-          </el-descriptions-item>
-          <el-descriptions-item label="大小">
-            {{ formatFileSize(file.size) }}
-          </el-descriptions-item>
-          <el-descriptions-item label="修改时间">
-            {{ formatDate(file.last_modified) }}
-          </el-descriptions-item>
+          <el-descriptions-item label="文件名">{{ file.name }}</el-descriptions-item>
+          <el-descriptions-item label="大小">{{ formatFileSize(file.size) }}</el-descriptions-item>
+          <el-descriptions-item label="修改时间">{{ formatDate(file.last_modified) }}</el-descriptions-item>
           <el-descriptions-item label="存储类型">
-            <el-tag size="small">{{ file.storage_class }}</el-tag>
-          </el-descriptions-item>
-          <el-descriptions-item label="文件类型">
-            {{ file.content_type || '未知' }}
-          </el-descriptions-item>
-          <el-descriptions-item label="ETag">
-            {{ file.etag }}
+            <el-tag>{{ file.storage_class }}</el-tag>
           </el-descriptions-item>
         </el-descriptions>
       </div>
 
-      <!-- 文件预览区域 -->
       <div class="preview-area" v-if="file">
         <!-- 图片预览 -->
         <div v-if="isImage" class="image-preview">
@@ -43,48 +847,8 @@
             :src="file.download_url"
             :alt="file.name"
             fit="contain"
-            style="max-width: 100%; max-height: 500px;"
-            :preview-src-list="[file.download_url]"
-            preview-teleported
-            loading="lazy"
-          >
-            <template #error>
-              <div class="image-error">
-                <el-icon><Picture /></el-icon>
-                <p>图片加载失败</p>
-              </div>
-            </template>
-          </el-image>
-        </div>
-
-        <!-- 文本文件预览 -->
-        <div v-else-if="isText" class="text-preview">
-          <el-card>
-            <template #header>
-              <div class="text-header">
-                <span>文本内容预览</span>
-                <el-button 
-                  size="small" 
-                  @click="downloadTextContent"
-                  :icon="Download"
-                >
-                  下载原文件
-                </el-button>
-              </div>
-            </template>
-            <div v-if="textContent" class="text-content">
-              <pre v-if="isCode" class="code-content">{{ textContent }}</pre>
-              <div v-else class="plain-text">{{ textContent }}</div>
-            </div>
-            <div v-else-if="textError" class="text-error">
-              <el-alert
-                title="无法预览文本内容"
-                :description="textError"
-                type="warning"
-                show-icon
-              />
-            </div>
-          </el-card>
+            style="max-width: 100%; max-height: 400px;"
+          />
         </div>
 
         <!-- 视频预览 -->
@@ -92,258 +856,64 @@
           <video
             :src="file.download_url"
             controls
-            style="max-width: 100%; max-height: 500px;"
-            preload="metadata"
-          >
-            您的浏览器不支持视频播放。
-          </video>
+            style="max-width: 100%; max-height: 400px;"
+          />
         </div>
 
         <!-- 音频预览 -->
         <div v-else-if="isAudio" class="audio-preview">
-          <div class="audio-player">
-            <el-icon size="48"><Headphone /></el-icon>
-            <h3>{{ file.name }}</h3>
-            <audio
-              :src="file.download_url"
-              controls
-              style="width: 100%; margin-top: 10px;"
-              preload="metadata"
-            >
-              您的浏览器不支持音频播放。
-            </audio>
-          </div>
+          <audio :src="file.download_url" controls style="width: 100%;" />
         </div>
 
-        <!-- PDF预览 -->
-        <div v-else-if="isPDF" class="pdf-preview">
-          <iframe
-            :src="file.download_url"
-            style="width: 100%; height: 600px; border: none;"
-            title="PDF预览"
-          >
-            <p>您的浏览器不支持PDF预览。
-              <a :href="file.download_url" target="_blank">点击下载</a>
-            </p>
-          </iframe>
-        </div>
-
-        <!-- Office文档预览 -->
-        <div v-else-if="isOffice" class="office-preview">
-          <div class="office-viewer">
-            <iframe
-              :src="getOfficeViewerUrl()"
-              style="width: 100%; height: 600px; border: none;"
-              title="Office文档预览"
-            >
-              <p>无法预览此Office文档。
-                <a :href="file.download_url" target="_blank">点击下载</a>
-              </p>
-            </iframe>
-          </div>
-        </div>
-
-        <!-- 不支持预览的文件 -->
+        <!-- 不支持预览 -->
         <div v-else class="unsupported-preview">
           <el-empty description="此文件类型不支持预览">
-            <template #image>
-              <el-icon size="100"><DocumentCopy /></el-icon>
-            </template>
-            <el-button 
-              type="primary" 
-              @click="downloadFile"
-              :icon="Download"
-            >
-              下载文件
-            </el-button>
+            <el-button type="primary" @click="downloadFile">下载文件</el-button>
           </el-empty>
         </div>
       </div>
     </div>
 
     <template #footer>
-      <div class="dialog-footer">
-        <el-button @click="handleClose">关闭</el-button>
-        <el-button 
-          type="primary" 
-          @click="downloadFile"
-          :icon="Download"
-        >
-          下载文件
-        </el-button>
-        <el-button 
-          v-if="file?.download_url" 
-          @click="openInNewTab"
-          :icon="View"
-        >
-          新窗口打开
-        </el-button>
-      </div>
+      <el-button @click="visible = false">关闭</el-button>
+      <el-button type="primary" @click="downloadFile">下载文件</el-button>
     </template>
   </el-dialog>
 </template>
 
 <script setup>
-import { ref, computed, watch } from 'vue'
-import { 
-  Picture, Download, View, Headphone, DocumentCopy 
-} from '@element-plus/icons-vue'
-import { ElMessage } from 'element-plus'
-import { s3Api } from '../services/api'
+import { ref, computed } from 'vue'
 
 const props = defineProps({
   modelValue: Boolean,
-  file: Object,
-  bucketName: String
+  file: Object
 })
 
 const emit = defineEmits(['update:modelValue', 'close'])
 
 const visible = computed({
   get: () => props.modelValue,
-  set: (value) => emit('update:modelValue', value)
-})
-
-const loading = ref(false)
-const textContent = ref('')
-const textError = ref('')
-
-// 文件类型判断
-const isImage = computed(() => {
-  if (!props.file?.content_type) return false
-  return props.file.content_type.startsWith('image/')
-})
-
-const isText = computed(() => {
-  if (!props.file?.content_type && !props.file?.name) return false
-  
-  const textTypes = [
-    'text/',
-    'application/json',
-    'application/xml',
-    'application/javascript',
-    'application/x-javascript'
-  ]
-  
-  const textExtensions = [
-    '.txt', '.log', '.md', '.json', '.xml', '.csv', 
-    '.js', '.ts', '.vue', '.html', '.css', '.scss',
-    '.py', '.java', '.cpp', '.c', '.h', '.php',
-    '.rb', '.go', '.rs', '.sql', '.yml', '.yaml',
-    '.ini', '.conf', '.config', '.env'
-  ]
-  
-  // 检查MIME类型
-  if (props.file.content_type) {
-    if (textTypes.some(type => props.file.content_type.startsWith(type))) {
-      return true
-    }
+  set: (value) => {
+    emit('update:modelValue', value)
+    if (!value) emit('close')
   }
-  
-  // 检查文件扩展名
-  const fileName = props.file.name.toLowerCase()
-  return textExtensions.some(ext => fileName.endsWith(ext))
 })
 
-const isCode = computed(() => {
-  if (!props.file?.name) return false
-  
-  const codeExtensions = [
-    '.js', '.ts', '.vue', '.html', '.css', '.scss',
-    '.py', '.java', '.cpp', '.c', '.h', '.php',
-    '.rb', '.go', '.rs', '.sql', '.json', '.xml'
-  ]
-  
-  const fileName = props.file.name.toLowerCase()
-  return codeExtensions.some(ext => fileName.endsWith(ext))
+const isImage = computed(() => {
+  return props.file?.content_type?.startsWith('image/') || 
+         /\.(jpg|jpeg|png|gif|bmp|webp)$/i.test(props.file?.name)
 })
 
 const isVideo = computed(() => {
-  if (!props.file?.content_type) return false
-  return props.file.content_type.startsWith('video/')
+  return props.file?.content_type?.startsWith('video/') || 
+         /\.(mp4|avi|mov|wmv|flv|webm)$/i.test(props.file?.name)
 })
 
 const isAudio = computed(() => {
-  if (!props.file?.content_type) return false
-  return props.file.content_type.startsWith('audio/')
+  return props.file?.content_type?.startsWith('audio/') || 
+         /\.(mp3|wav|ogg|aac|flac)$/i.test(props.file?.name)
 })
 
-const isPDF = computed(() => {
-  if (!props.file?.content_type && !props.file?.name) return false
-  return props.file.content_type === 'application/pdf' || 
-         props.file.name.toLowerCase().endsWith('.pdf')
-})
-
-const isOffice = computed(() => {
-  if (!props.file?.content_type && !props.file?.name) return false
-  
-  const officeTypes = [
-    'application/msword',
-    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-    'application/vnd.ms-excel',
-    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-    'application/vnd.ms-powerpoint',
-    'application/vnd.openxmlformats-officedocument.presentationml.presentation'
-  ]
-  
-  const officeExtensions = [
-    '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx'
-  ]
-  
-  if (props.file.content_type && officeTypes.includes(props.file.content_type)) {
-    return true
-  }
-  
-  if (props.file.name) {
-    const fileName = props.file.name.toLowerCase()
-    return officeExtensions.some(ext => fileName.endsWith(ext))
-  }
-  
-  return false
-})
-
-// 加载文本内容
-const loadTextContent = async () => {
-  if (!props.file?.download_url) return
-  
-  loading.value = true
-  textContent.value = ''
-  textError.value = ''
-  
-  try {
-    // 检查文件大小，避免加载过大的文件
-    if (props.file.size > 1024 * 1024) { // 1MB
-      textError.value = '文件过大，无法预览（超过1MB）'
-      return
-    }
-    
-    const response = await fetch(props.file.download_url)
-    
-    if (!response.ok) {
-      throw new Error('无法获取文件内容')
-    }
-    
-    const content = await response.text()
-    textContent.value = content
-    
-  } catch (error) {
-    console.error('加载文本内容失败:', error)
-    textError.value = error.message || '加载文件内容失败'
-  } finally {
-    loading.value = false
-  }
-}
-
-// 获取Office文档预览URL（使用Office Online）
-const getOfficeViewerUrl = () => {
-  if (!props.file?.download_url) return ''
-  
-  // 使用Microsoft Office Online查看器
-  const encodedUrl = encodeURIComponent(props.file.download_url)
-  return `https://view.officeapps.live.com/op/embed.aspx?src=${encodedUrl}`
-}
-
-// 下载文件
 const downloadFile = () => {
   if (props.file?.download_url) {
     const link = document.createElement('a')
@@ -352,30 +922,9 @@ const downloadFile = () => {
     document.body.appendChild(link)
     link.click()
     document.body.removeChild(link)
-  } else {
-    ElMessage.error('无法获取下载链接')
   }
 }
 
-// 下载文本内容（用于文本预览时的原文件下载）
-const downloadTextContent = () => {
-  downloadFile()
-}
-
-// 在新窗口打开
-const openInNewTab = () => {
-  if (props.file?.download_url) {
-    window.open(props.file.download_url, '_blank')
-  }
-}
-
-// 关闭对话框
-const handleClose = () => {
-  visible.value = false
-  emit('close')
-}
-
-// 格式化文件大小
 const formatFileSize = (size) => {
   if (size < 1024) return size + ' B'
   if (size < 1024 * 1024) return (size / 1024).toFixed(1) + ' KB'
@@ -383,265 +932,236 @@ const formatFileSize = (size) => {
   return (size / (1024 * 1024 * 1024)).toFixed(1) + ' GB'
 }
 
-// 格式化日期
 const formatDate = (dateString) => {
-  return new Date(dateString).toLocaleString()
+  return new Date(dateString).toLocaleString('zh-CN')
 }
-
-// 监听文件变化，加载文本内容
-watch([() => props.file, () => props.modelValue], () => {
-  if (props.modelValue && props.file && isText.value) {
-    loadTextContent()
-  }
-}, { immediate: true })
 </script>
 
 <style scoped>
-.file-viewer {
-  min-height: 400px;
-}
-
 .file-info {
   margin-bottom: 20px;
 }
 
 .preview-area {
   margin-top: 20px;
-}
-
-.image-preview {
-  text-align: center;
-  padding: 20px;
-}
-
-.image-error {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  color: #999;
-  padding: 40px;
-}
-
-.image-error .el-icon {
-  font-size: 48px;
-  margin-bottom: 10px;
-}
-
-.text-preview {
-  margin-top: 20px;
-}
-
-.text-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-}
-
-.text-content {
-  max-height: 500px;
-  overflow-y: auto;
-  background-color: #f8f9fa;
-  border-radius: 4px;
-  padding: 15px;
-}
-
-.code-content {
-  font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
-  font-size: 14px;
-  line-height: 1.5;
-  white-space: pre-wrap;
-  word-wrap: break-word;
-  margin: 0;
-  background-color: #f6f8fa;
-  border: 1px solid #e1e4e8;
-  border-radius: 6px;
-  padding: 16px;
-}
-
-.plain-text {
-  font-family: inherit;
-  line-height: 1.6;
-  white-space: pre-wrap;
-  word-wrap: break-word;
-}
-
-.text-error {
-  padding: 20px;
-}
-
-.video-preview {
-  text-align: center;
-  padding: 20px;
-}
-
-.audio-preview {
-  padding: 40px;
   text-align: center;
 }
 
-.audio-player {
-  max-width: 400px;
-  margin: 0 auto;
-}
-
-.audio-player h3 {
-  margin: 10px 0;
-  color: #333;
-}
-
-.pdf-preview {
-  margin-top: 20px;
-}
-
-.office-preview {
-  margin-top: 20px;
-}
-
-.office-viewer {
-  border-radius: 4px;
-  overflow: hidden;
-  border: 1px solid #ddd;
+.image-preview, .video-preview, .audio-preview {
+  padding: 20px;
 }
 
 .unsupported-preview {
   padding: 40px;
-  text-align: center;
-}
-
-.dialog-footer {
-  text-align: right;
-}
-
-.dialog-footer .el-button {
-  margin-left: 10px;
-}
-
-/* 响应式设计 */
-@media (max-width: 768px) {
-  .text-content {
-    font-size: 12px;
-  }
-  
-  .code-content {
-    font-size: 12px;
-    padding: 10px;
-  }
-  
-  .audio-player {
-    max-width: 100%;
-  }
 }
 </style>
 ```
 
-然后你需要在 `FileList.vue` 中集成这个预览组件。更新 `FileList.vue` 的操作列：
-
-### 更新 frontend/src/components/FileList.vue
-
-在操作列中添加预览按钮：
-
-```vue
-<!-- 在操作列中添加 -->
-<el-table-column label="操作" width="250">
-  <template #default="{ row }">
-    <el-button 
-      size="small" 
-      type="success"
-      @click="previewFile(row)"
-      :icon="View"
-    >
-      预览
-    </el-button>
-    <el-button 
-      size="small" 
-      type="primary"
-      @click="downloadFile(row)"
-      :icon="Download"
-    >
-      下载
-    </el-button>
-    <el-button 
-      size="small" 
-      type="danger"
-      @click="deleteFile(row)"
-      :icon="Delete"
-    >
-      删除
-    </el-button>
-  </template>
-</el-table-column>
-```
-
-在 script 部分添加：
-
-```vue
-<script setup>
-// 导入 FileViewer 组件
-import FileViewer from './FileViewer.vue'
-import { View } from '@element-plus/icons-vue' // 添加 View 图标
-
-// 添加预览相关的响应式数据
-const showPreview = ref(false)
-const previewFile = ref(null)
-
-// 预览文件方法
-const previewFile = (file) => {
-  previewFile.value = file
-  showPreview.value = true
-}
-
-// 关闭预览
-const closePreview = () => {
-  showPreview.value = false
-  previewFile.value = null
-}
-</script>
-```
-
-在模板中添加 FileViewer 组件：
-
+### frontend/src/App.vue
 ```vue
 <template>
-  <div class="file-list">
-    <!-- 现有内容... -->
-    
-    <!-- 文件预览组件 -->
-    <FileViewer
-      v-model="showPreview"
-      :file="previewFile"
-      :bucket-name="props.bucketName"
-      @close="closePreview"
-    />
+  <div id="app">
+    <el-container style="height: 100vh">
+      <!-- 头部 -->
+      <el-header style="background: #409EFF; color: white">
+        <div class="header-content">
+          <h1>S3 文件管理器</h1>
+          <div class="header-info">
+            <span v-if="selectedBucket">当前桶: {{ selectedBucket }}</span>
+            <el-button 
+              v-else
+              type="success" 
+              size="small"
+              @click="testConnection"
+              :loading="testing"
+            >
+              测试连接
+            </el-button>
+          </div>
+        </div>
+      </el-header>
+
+      <el-container>
+        <!-- 侧边栏 -->
+        <el-aside width="400px" style="border-right: 1px solid #eee; background: #fafafa">
+          <div class="aside-content">
+            <!-- 连接状态 -->
+            <el-card v-if="!connectionSuccess" shadow="never" style="margin-bottom: 20px">
+              <template #header>连接状态</template>
+              <el-button 
+                type="primary" 
+                @click="testConnection"
+                :loading="testing"
+                style="width: 100%"
+              >
+                测试后端连接
+              </el-button>
+              <p v-if="connectionStatus" :style="{ color: connectionSuccess ? 'green' : 'red', marginTop: '10px' }">
+                {{ connectionStatus }}
+              </p>
+            </el-card>
+
+            <!-- 桶选择器 -->
+            <el-card v-if="connectionSuccess" shadow="never" style="margin-bottom: 20px">
+              <template #header>选择存储桶</template>
+              <BucketSelector @bucket-changed="onBucketChanged" />
+            </el-card>
+
+            <!-- 文件上传 -->
+            <el-card v-if="selectedBucket" shadow="never">
+              <template #header>文件上传</template>
+              <FileUpload 
+                :bucket-name="selectedBucket"
+                :current-prefix="currentPrefix"
+                @upload-success="onUploadSuccess"
+                @folder-created="onFolderCreated"
+              />
+            </el-card>
+          </div>
+        </el-aside>
+
+        <!-- 主内容区 -->
+        <el-main>
+          <div v-if="!connectionSuccess" class="empty-state">
+            <el-empty description="请先测试后端连接" />
+          </div>
+          <div v-else-if="!selectedBucket" class="empty-state">
+            <el-empty description="请选择一个S3存储桶" />
+          </div>
+          <FileList 
+            v-else
+            :bucket-name="selectedBucket"
+            :refresh-trigger="refreshTrigger"
+            @path-changed="onPathChanged"
+          />
+        </el-main>
+      </el-container>
+    </el-container>
   </div>
 </template>
+
+<script setup>
+import { ref, onMounted } from 'vue'
+import { ElMessage } from 'element-plus'
+import BucketSelector from './components/BucketSelector.vue'
+import FileUpload from './components/FileUpload.vue'
+import FileList from './components/FileList.vue'
+import { s3Api } from './services/api'
+
+const selectedBucket = ref('')
+const currentPrefix = ref('')
+const refreshTrigger = ref(0)
+const testing = ref(false)
+const connectionStatus = ref('')
+const connectionSuccess = ref(false)
+
+const testConnection = async () => {
+  testing.value = true
+  try {
+    await s3Api.testConnection()
+    connectionStatus.value = '连接成功'
+    connectionSuccess.value = true
+    ElMessage.success('后端连接成功')
+  } catch (error) {
+    connectionStatus.value = '连接失败: ' + error.message
+    connectionSuccess.value = false
+    ElMessage.error('后端连接失败')
+  } finally {
+    testing.value = false
+  }
+}
+
+const onBucketChanged = (bucketName) => {
+  selectedBucket.value = bucketName
+  currentPrefix.value = ''
+  refreshTrigger.value++
+}
+
+const onPathChanged = (path) => {
+  currentPrefix.value = path
+}
+
+const onUploadSuccess = () => {
+  refreshTrigger.value++
+}
+
+const onFolderCreated = () => {
+  refreshTrigger.value++
+}
+
+onMounted(() => {
+  testConnection()
+})
+</script>
+
+<style>
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+#app {
+  font-family: 'Helvetica Neue', Arial, sans-serif;
+}
+
+.header-content {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  height: 100%;
+  padding: 0 20px;
+}
+
+.header-content h1 {
+  margin: 0;
+  font-size: 24px;
+}
+
+.aside-content {
+  padding: 20px;
+  height: 100%;
+  overflow-y: auto;
+}
+
+.empty-state {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  height: 100%;
+}
+
+.el-main {
+  padding: 20px;
+}
+</style>
 ```
 
-这个 `FileViewer.vue` 组件提供了以下功能：
+## 启动说明
 
-1. **多种文件类型预览**：
-   - 图片：使用 el-image 组件预览
-   - 文本文件：显示文本内容，支持代码高亮
-   - 视频：HTML5 video 播放器
-   - 音频：HTML5 audio 播放器
-   - PDF：iframe 嵌入预览
-   - Office文档：使用 Office Online 查看器
+1. **安装依赖**:
+```bash
+cd frontend
+npm install
+```
 
-2. **文件信息显示**：
-   - 文件名、大小、修改时间
-   - 存储类型、文件类型、ETag
+2. **启动开发服务器**:
+```bash
+npm run dev
+```
 
-3. **交互功能**：
-   - 下载文件
-   - 在新窗口打开
-   - 关闭预览
+3. **访问应用**:
+打开浏览器访问 `http://localhost:5173`
 
-4. **错误处理**：
-   - 图片加载失败提示
-   - 文本文件过大提示
-   - 不支持预览的文件类型处理
+这个前端应用包含了所有必要的功能：
+- 🔗 后端连接测试
+- 📦 S3桶选择
+- 📁 文件夹导航
+- ⬆️ 文件上传（拖拽支持）
+- 📄 文件列表（分页）
+- 👁️ 文件预览
+- ⬇️ 文件下载
+- 🗑️ 文件删除（单个和批量）
+- ➕ 文件夹创建
 
-5. **响应式设计**：
-   - 适配移动端显示
-   - 自适应不同屏幕尺寸
-
-现在你的S3文件管理器就有了完整的文件预览功能！
+确保后端服务在 `http://localhost:8000` 运行，然后启动前端即可使用完整的S3文件管理系统。
