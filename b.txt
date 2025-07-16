@@ -1,52 +1,1588 @@
-<clickhouse>
-  <openSSL>
-    <client>
-      <verificationMode>none</verificationMode>
-    </client>
-  </openSSL>
-</clickhouse>
+我来为你创建一个完整的S3文件管理项目。
 
-<clickhouse>
-  <storage_configuration>
-    <disks>
-      <s3>
-        <type>object_storage</type>
-        <object_storage_type>s3</object_storage_type>
-        <endpoint>https://s3.<region>.amazonaws.com/your-bucket/path/</endpoint>
-        <access_key_id>YOUR_ACCESS_KEY</access_key_id>
-        <secret_access_key>YOUR_SECRET_KEY</secret_access_key>
-        <metadata_type>local</metadata_type>
-      </s3>
-    </disks>
-    <policies>
-      <s3_policy>
-        <volumes>
-          <main>
-            <disk>s3</disk>
-          </main>
-        </volumes>
-      </s3_policy>
-    </policies>
-  </storage_configuration>
-  <merge_tree>
-    <storage_policy>s3_policy</storage_policy>
-  </merge_tree>
-</clickhouse>
+## 项目结构
 
+```
+s3-file-manager/
+├── backend/
+│   ├── app/
+│   │   ├── __init__.py
+│   │   ├── main.py
+│   │   ├── models.py
+│   │   ├── s3_service.py
+│   │   └── config.py
+│   ├── requirements.txt
+│   └── .env.example
+├── frontend/
+│   ├── public/
+│   │   └── index.html
+│   ├── src/
+│   │   ├── components/
+│   │   │   ├── BucketSelector.vue
+│   │   │   ├── FileList.vue
+│   │   │   ├── FileUpload.vue
+│   │   │   └── FileViewer.vue
+│   │   ├── services/
+│   │   │   └── api.js
+│   │   ├── App.vue
+│   │   └── main.js
+│   ├── package.json
+│   └── vite.config.js
+└── README.md
+```
 
-version: "3.8"
-services:
-  clickhouse:
-    image: clickhouse/clickhouse-server:latest
-    container_name: clickhouse
-    user: "101:101"
-    volumes:
-      - ./config.d/s3disk.xml:/etc/clickhouse-server/config.d/s3disk.xml:ro
-      - clickhouse_data:/var/lib/clickhouse
-    ports:
-      - "8123:8123"
-      - "9000:9000"
+## 后端代码
 
-volumes:
-  clickhouse_data:
-    driver: local
+### backend/requirements.txt
+```txt
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+boto3==1.34.0
+python-multipart==0.0.6
+python-dotenv==1.0.0
+pydantic==2.5.0
+pydantic-settings==2.1.0
+python-magic==0.4.27
+```
+
+### backend/.env.example
+```env
+AWS_ACCESS_KEY_ID=your_access_key_here
+AWS_SECRET_ACCESS_KEY=your_secret_key_here
+AWS_REGION=us-east-1
+CORS_ORIGINS=["http://localhost:5173", "http://localhost:3000"]
+```
+
+### backend/app/config.py
+```python
+from pydantic_settings import BaseSettings
+from typing import List
+
+class Settings(BaseSettings):
+    aws_access_key_id: str
+    aws_secret_access_key: str
+    aws_region: str = "us-east-1"
+    cors_origins: List[str] = ["http://localhost:5173", "http://localhost:3000"]
+    
+    class Config:
+        env_file = ".env"
+
+settings = Settings()
+```
+
+### backend/app/models.py
+```python
+from pydantic import BaseModel
+from typing import Optional, List
+from datetime import datetime
+
+class FileInfo(BaseModel):
+    key: str
+    name: str
+    size: int
+    last_modified: datetime
+    etag: str
+    storage_class: str
+    content_type: Optional[str] = None
+    download_url: Optional[str] = None
+    is_folder: bool = False
+
+class BucketInfo(BaseModel):
+    name: str
+    creation_date: datetime
+    region: Optional[str] = None
+
+class UploadResponse(BaseModel):
+    success: bool
+    message: str
+    file_key: Optional[str] = None
+    size: Optional[int] = None
+
+class DeleteResponse(BaseModel):
+    success: bool
+    message: str
+    deleted_count: int = 0
+
+class ListFilesResponse(BaseModel):
+    files: List[FileInfo]
+    folders: List[str]
+    total_count: int
+    page: int
+    page_size: int
+    has_next: bool
+    current_prefix: str
+
+class FileUploadRequest(BaseModel):
+    bucket_name: str
+    prefix: str = ""
+```
+
+### backend/app/s3_service.py
+```python
+import boto3
+from botocore.exceptions import ClientError, NoCredentialsError
+from typing import List, Optional, Tuple, Dict, Any
+from datetime import datetime
+import logging
+import mimetypes
+import os
+from .config import settings
+
+logger = logging.getLogger(__name__)
+
+class S3Service:
+    def __init__(self):
+        try:
+            self.s3_client = boto3.client(
+                's3',
+                aws_access_key_id=settings.aws_access_key_id,
+                aws_secret_access_key=settings.aws_secret_access_key,
+                region_name=settings.aws_region
+            )
+            self.s3_resource = boto3.resource(
+                's3',
+                aws_access_key_id=settings.aws_access_key_id,
+                aws_secret_access_key=settings.aws_secret_access_key,
+                region_name=settings.aws_region
+            )
+        except NoCredentialsError:
+            logger.error("AWS credentials not found")
+            raise
+
+    def list_buckets(self) -> List[Dict[str, Any]]:
+        """获取所有桶列表"""
+        try:
+            response = self.s3_client.list_buckets()
+            buckets = []
+            
+            for bucket in response["Buckets"]:
+                # 获取桶的区域信息
+                try:
+                    region_response = self.s3_client.get_bucket_location(Bucket=bucket["Name"])
+                    region = region_response.get('LocationConstraint') or 'us-east-1'
+                except ClientError:
+                    region = None
+                
+                buckets.append({
+                    "name": bucket["Name"],
+                    "creation_date": bucket["CreationDate"],
+                    "region": region
+                })
+            
+            return buckets
+        except ClientError as e:
+            logger.error(f"Error listing buckets: {e}")
+            return []
+
+    def list_objects(self, bucket_name: str, prefix: str = "", 
+                    page: int = 1, page_size: int = 50) -> Tuple[List[Dict], List[str], bool]:
+        """获取对象列表，支持分页和文件夹分离"""
+        try:
+            # 使用 / 作为分隔符来模拟文件夹结构
+            delimiter = '/'
+            
+            kwargs = {
+                'Bucket': bucket_name,
+                'Prefix': prefix,
+                'Delimiter': delimiter,
+                'MaxKeys': 1000  # 先获取更多数据用于分页
+            }
+
+            response = self.s3_client.list_objects_v2(**kwargs)
+            
+            # 处理文件夹（CommonPrefixes）
+            folders = []
+            if 'CommonPrefixes' in response:
+                folders = [
+                    prefix_info['Prefix'].rstrip('/').split('/')[-1] 
+                    for prefix_info in response['CommonPrefixes']
+                ]
+
+            # 处理文件
+            files = []
+            if 'Contents' in response:
+                for obj in response['Contents']:
+                    # 跳过文件夹标记（以/结尾的空对象）
+                    if obj['Key'].endswith('/'):
+                        continue
+                        
+                    # 获取文件名（去掉前缀路径）
+                    file_name = obj['Key']
+                    if prefix:
+                        file_name = obj['Key'][len(prefix):]
+                    
+                    # 跳过包含/的文件（这些属于子文件夹）
+                    if '/' in file_name:
+                        continue
+
+                    # 生成下载URL
+                    download_url = None
+                    try:
+                        download_url = self.s3_client.generate_presigned_url(
+                            'get_object',
+                            Params={'Bucket': bucket_name, 'Key': obj['Key']},
+                            ExpiresIn=3600
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to generate presigned URL for {obj['Key']}: {e}")
+
+                    # 推测内容类型
+                    content_type, _ = mimetypes.guess_type(obj['Key'])
+
+                    files.append({
+                        "key": obj['Key'],
+                        "name": file_name,
+                        "size": obj['Size'],
+                        "last_modified": obj['LastModified'],
+                        "etag": obj['ETag'].strip('"'),
+                        "storage_class": obj.get('StorageClass', 'STANDARD'),
+                        "content_type": content_type,
+                        "download_url": download_url,
+                        "is_folder": False
+                    })
+
+            # 简单分页处理
+            total_files = len(files)
+            start_idx = (page - 1) * page_size
+            end_idx = start_idx + page_size
+            
+            paginated_files = files[start_idx:end_idx]
+            has_next = end_idx < total_files
+
+            return paginated_files, folders, has_next
+
+        except ClientError as e:
+            logger.error(f"Error listing objects: {e}")
+            return [], [], False
+
+    def upload_file(self, bucket_name: str, file_obj, file_key: str, content_type: str = None) -> Tuple[bool, str, int]:
+        """上传文件"""
+        try:
+            # 读取文件大小
+            file_obj.seek(0, 2)  # 移动到文件末尾
+            file_size = file_obj.tell()
+            file_obj.seek(0)  # 重置到文件开头
+
+            extra_args = {}
+            if content_type:
+                extra_args['ContentType'] = content_type
+
+            self.s3_client.upload_fileobj(file_obj, bucket_name, file_key, ExtraArgs=extra_args)
+            return True, "File uploaded successfully", file_size
+        except ClientError as e:
+            logger.error(f"Error uploading file: {e}")
+            return False, f"Upload failed: {str(e)}", 0
+
+    def delete_object(self, bucket_name: str, file_key: str) -> Tuple[bool, str]:
+        """删除单个对象"""
+        try:
+            self.s3_client.delete_object(Bucket=bucket_name, Key=file_key)
+            return True, "File deleted successfully"
+        except ClientError as e:
+            logger.error(f"Error deleting object: {e}")
+            return False, f"Delete failed: {str(e)}"
+
+    def delete_objects(self, bucket_name: str, file_keys: List[str]) -> Tuple[bool, str, int]:
+        """批量删除对象"""
+        try:
+            if not file_keys:
+                return True, "No files to delete", 0
+
+            delete_dict = {
+                'Objects': [{'Key': key} for key in file_keys],
+                'Quiet': False
+            }
+            
+            response = self.s3_client.delete_objects(
+                Bucket=bucket_name,
+                Delete=delete_dict
+            )
+            
+            deleted_count = len(response.get('Deleted', []))
+            errors = response.get('Errors', [])
+            
+            if errors:
+                error_msg = f"Some files failed to delete: {errors}"
+                return False, error_msg, deleted_count
+            
+            return True, f"Successfully deleted {deleted_count} files", deleted_count
+            
+        except ClientError as e:
+            logger.error(f"Error batch deleting objects: {e}")
+            return False, f"Batch delete failed: {str(e)}", 0
+
+    def get_object_info(self, bucket_name: str, file_key: str) -> Optional[Dict]:
+        """获取对象详细信息"""
+        try:
+            response = self.s3_client.head_object(Bucket=bucket_name, Key=file_key)
+            
+            # 生成下载URL
+            download_url = self.s3_client.generate_presigned_url(
+                'get_object',
+                Params={'Bucket': bucket_name, 'Key': file_key},
+                ExpiresIn=3600
+            )
+            
+            return {
+                "key": file_key,
+                "name": os.path.basename(file_key),
+                "size": response['ContentLength'],
+                "last_modified": response['LastModified'],
+                "etag": response['ETag'].strip('"'),
+                "content_type": response.get('ContentType', 'application/octet-stream'),
+                "storage_class": response.get('StorageClass', 'STANDARD'),
+                "download_url": download_url,
+                "metadata": response.get('Metadata', {}),
+                "is_folder": False
+            }
+        except ClientError as e:
+            logger.error(f"Error getting object info: {e}")
+            return None
+
+    def create_folder(self, bucket_name: str, folder_path: str) -> Tuple[bool, str]:
+        """创建文件夹（实际上是创建一个以/结尾的空对象）"""
+        try:
+            if not folder_path.endswith('/'):
+                folder_path += '/'
+            
+            self.s3_client.put_object(
+                Bucket=bucket_name,
+                Key=folder_path,
+                Body=b''
+            )
+            return True, "Folder created successfully"
+        except ClientError as e:
+            logger.error(f"Error creating folder: {e}")
+            return False, f"Failed to create folder: {str(e)}"
+
+# 全局S3服务实例
+s3_service = S3Service()
+```
+
+### backend/app/main.py
+```python
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Form
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from typing import List, Optional
+import logging
+import os
+from .models import *
+from .s3_service import s3_service
+from .config import settings
+
+# 配置日志
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI(
+    title="S3 File Manager API",
+    description="A simple S3 file management API",
+    version="1.0.0"
+)
+
+# CORS配置
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.get("/")
+async def root():
+    return {"message": "S3 File Manager API", "version": "1.0.0"}
+
+@app.get("/api/buckets", response_model=List[BucketInfo])
+async def list_buckets():
+    """获取所有S3桶列表"""
+    try:
+        buckets = s3_service.list_buckets()
+        return buckets
+    except Exception as e:
+        logger.error(f"Failed to list buckets: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/buckets/{bucket_name}/files", response_model=ListFilesResponse)
+async def list_files(
+    bucket_name: str,
+    prefix: str = Query("", description="文件前缀/路径"),
+    page: int = Query(1, ge=1, description="页码"),
+    page_size: int = Query(50, ge=1, le=1000, description="每页大小")
+):
+    """获取桶中的文件列表"""
+    try:
+        files, folders, has_next = s3_service.list_objects(
+            bucket_name, prefix, page, page_size
+        )
+        
+        return ListFilesResponse(
+            files=files,
+            folders=folders,
+            total_count=len(files),
+            page=page,
+            page_size=page_size,
+            has_next=has_next,
+            current_prefix=prefix
+        )
+    except Exception as e:
+        logger.error(f"Failed to list files: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/buckets/{bucket_name}/upload", response_model=UploadResponse)
+async def upload_file(
+    bucket_name: str,
+    file: UploadFile = File(...),
+    prefix: str = Form("", description="上传路径前缀")
+):
+    """上传文件到S3桶"""
+    try:
+        # 构建完整的文件键
+        file_key = os.path.join(prefix, file.filename).replace("\\", "/")
+        if file_key.startswith("/"):
+            file_key = file_key[1:]
+        
+        # 获取内容类型
+        content_type = file.content_type
+        
+        success, message, file_size = s3_service.upload_file(
+            bucket_name, file.file, file_key, content_type
+        )
+        
+        if success:
+            return UploadResponse(
+                success=True,
+                message=message,
+                file_key=file_key,
+                size=file_size
+            )
+        else:
+            raise HTTPException(status_code=500, detail=message)
+            
+    except Exception as e:
+        logger.error(f"Failed to upload file: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/api/buckets/{bucket_name}/files/{file_key:path}", response_model=DeleteResponse)
+async def delete_file(bucket_name: str, file_key: str):
+    """删除单个文件"""
+    try:
+        success, message = s3_service.delete_object(bucket_name, file_key)
+        
+        if success:
+            return DeleteResponse(
+                success=True,
+                message=message,
+                deleted_count=1
+            )
+        else:
+            raise HTTPException(status_code=500, detail=message)
+            
+    except Exception as e:
+        logger.error(f"Failed to delete file: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/buckets/{bucket_name}/delete-multiple", response_model=DeleteResponse)
+async def delete_multiple_files(
+    bucket_name: str,
+    file_keys: List[str]
+):
+    """批量删除文件"""
+    try:
+        success, message, deleted_count = s3_service.delete_objects(bucket_name, file_keys)
+        
+        return DeleteResponse(
+            success=success,
+            message=message,
+            deleted_count=deleted_count
+        )
+        
+    except Exception as e:
+        logger.error(f"Failed to delete multiple files: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/buckets/{bucket_name}/files/{file_key:path}/info", response_model=FileInfo)
+async def get_file_info(bucket_name: str, file_key: str):
+    """获取文件详细信息"""
+    try:
+        file_info = s3_service.get_object_info(bucket_name, file_key)
+        
+        if file_info:
+            return file_info
+        else:
+            raise HTTPException(status_code=404, detail="File not found")
+            
+    except Exception as e:
+        logger.error(f"Failed to get file info: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/buckets/{bucket_name}/create-folder")
+async def create_folder(
+    bucket_name: str,
+    folder_name: str = Form(...),
+    prefix: str = Form("", description="父路径前缀")
+):
+    """创建文件夹"""
+    try:
+        folder_path = os.path.join(prefix, folder_name).replace("\\", "/")
+        if folder_path.startswith("/"):
+            folder_path = folder_path[1:]
+        
+        success, message = s3_service.create_folder(bucket_name, folder_path)
+        
+        if success:
+            return {"success": True, "message": message}
+        else:
+            raise HTTPException(status_code=500, detail=message)
+            
+    except Exception as e:
+        logger.error(f"Failed to create folder: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/health")
+async def health_check():
+    """健康检查端点"""
+    return {"status": "healthy", "service": "s3-file-manager"}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+```
+
+## 前端代码
+
+### frontend/package.json
+```json
+{
+  "name": "s3-file-manager-frontend",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "vue": "^3.3.4",
+    "axios": "^1.6.0",
+    "element-plus": "^2.4.4",
+    "@element-plus/icons-vue": "^2.1.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^4.4.0",
+    "vite": "^4.4.5"
+  }
+}
+```
+
+### frontend/vite.config.js
+```js
+import { defineConfig } from 'vite'
+import vue from '@vitejs/plugin-vue'
+
+export default defineConfig({
+  plugins: [vue()],
+  server: {
+    port: 5173,
+    cors: true
+  }
+})
+```
+
+### frontend/public/index.html
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>S3 File Manager</title>
+</head>
+<body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.js"></script>
+</body>
+</html>
+```
+
+### frontend/src/main.js
+```js
+import { createApp } from 'vue'
+import ElementPlus from 'element-plus'
+import 'element-plus/dist/index.css'
+import * as ElementPlusIconsVue from '@element-plus/icons-vue'
+import App from './App.vue'
+
+const app = createApp(App)
+
+app.use(ElementPlus)
+
+// 注册所有图标
+for (const [key, component] of Object.entries(ElementPlusIconsVue)) {
+  app.component(key, component)
+}
+
+app.mount('#app')
+```
+
+### frontend/src/services/api.js
+```js
+import axios from 'axios'
+
+const api = axios.create({
+  baseURL: 'http://localhost:8000/api',
+  timeout: 30000,
+})
+
+// 请求拦截器
+api.interceptors.request.use(
+  config => {
+    return config
+  },
+  error => {
+    return Promise.reject(error)
+  }
+)
+
+// 响应拦截器
+api.interceptors.response.use(
+  response => {
+    return response.data
+  },
+  error => {
+    console.error('API Error:', error)
+    return Promise.reject(error)
+  }
+)
+
+export const s3Api = {
+  // 获取桶列表
+  getBuckets() {
+    return api.get('/buckets')
+  },
+
+  // 获取文件列表
+  getFiles(bucketName, prefix = '', page = 1, pageSize = 50) {
+    return api.get(`/buckets/${bucketName}/files`, {
+      params: { prefix, page, page_size: pageSize }
+    })
+  },
+
+  // 上传文件
+  uploadFile(bucketName, file, prefix = '') {
+    const formData = new FormData()
+    formData.append('file', file)
+    formData.append('prefix', prefix)
+    
+    return api.post(`/buckets/${bucketName}/upload`, formData, {
+      headers: {
+        'Content-Type': 'multipart/form-data'
+      }
+    })
+  },
+
+  // 删除文件
+  deleteFile(bucketName, fileKey) {
+    return api.delete(`/buckets/${bucketName}/files/${encodeURIComponent(fileKey)}`)
+  },
+
+  // 批量删除文件
+  deleteMultipleFiles(bucketName, fileKeys) {
+    return api.post(`/buckets/${bucketName}/delete-multiple`, fileKeys)
+  },
+
+  // 获取文件信息
+  getFileInfo(bucketName, fileKey) {
+    return api.get(`/buckets/${bucketName}/files/${encodeURIComponent(fileKey)}/info`)
+  },
+
+  // 创建文件夹
+  createFolder(bucketName, folderName, prefix = '') {
+    const formData = new FormData()
+    formData.append('folder_name', folderName)
+    formData.append('prefix', prefix)
+    
+    return api.post(`/buckets/${bucketName}/create-folder`, formData)
+  }
+}
+
+export default api
+```
+
+### frontend/src/components/BucketSelector.vue
+```vue
+<template>
+  <div class="bucket-selector">
+    <el-select
+      v-model="selectedBucket"
+      placeholder="选择S3存储桶"
+      @change="onBucketChange"
+      style="width: 300px"
+      :loading="loading"
+    >
+      <el-option
+        v-for="bucket in buckets"
+        :key="bucket.name"
+        :label="bucket.name"
+        :value="bucket.name"
+      >
+        <span>{{ bucket.name }}</span>
+        <span style="float: right; color: #8492a6; font-size: 12px">
+          {{ formatDate(bucket.creation_date) }}
+        </span>
+      </el-option>
+    </el-select>
+    
+    <el-button 
+      type="primary" 
+      :icon="Refresh" 
+      @click="loadBuckets"
+      :loading="loading"
+      style="margin-left: 10px"
+    >
+      刷新
+    </el-button>
+  </div>
+</template>
+
+<script setup>
+import { ref, onMounted } from 'vue'
+import { Refresh } from '@element-plus/icons-vue'
+import { ElMessage } from 'element-plus'
+import { s3Api } from '../services/api'
+
+const emit = defineEmits(['bucket-changed'])
+
+const buckets = ref([])
+const selectedBucket = ref('')
+const loading = ref(false)
+
+const loadBuckets = async () => {
+  loading.value = true
+  try {
+    buckets.value = await s3Api.getBuckets()
+    if (buckets.value.length > 0 && !selectedBucket.value) {
+      selectedBucket.value = buckets.value[0].name
+      emit('bucket-changed', selectedBucket.value)
+    }
+  } catch (error) {
+    ElMessage.error('获取存储桶列表失败: ' + error.message)
+  } finally {
+    loading.value = false
+  }
+}
+
+const onBucketChange = (bucketName) => {
+  emit('bucket-changed', bucketName)
+}
+
+const formatDate = (dateString) => {
+  return new Date(dateString).toLocaleDateString()
+}
+
+onMounted(() => {
+  loadBuckets()
+})
+</script>
+
+<style scoped>
+.bucket-selector {
+  display: flex;
+  align-items: center;
+  margin-bottom: 20px;
+}
+</style>
+```
+
+### frontend/src/components/FileUpload.vue
+```vue
+<template>
+  <div class="file-upload">
+    <el-upload
+      ref="uploadRef"
+      :action="uploadUrl"
+      :multiple="true"
+      :auto-upload="false"
+      :on-change="onFileChange"
+      :show-file-list="false"
+      drag
+    >
+      <el-icon class="el-icon--upload"><upload-filled /></el-icon>
+      <div class="el-upload__text">
+        将文件拖拽到此处，或<em>点击上传</em>
+      </div>
+      <template #tip>
+        <div class="el-upload__tip">
+          支持多文件上传，文件大小不超过500MB
+        </div>
+      </template>
+    </el-upload>
+
+    <div v-if="fileList.length > 0" class="file-list">
+      <h4>待上传文件:</h4>
+      <el-table :data="fileList" style="width: 100%">
+        <el-table-column prop="name" label="文件名" />
+        <el-table-column prop="size" label="大小" :formatter="formatFileSize" />
+        <el-table-column label="操作" width="100">
+          <template #default="{ $index }">
+            <el-button 
+              type="danger" 
+              size="small" 
+              @click="removeFile($index)"
+              :icon="Delete"
+            />
+          </template>
+        </el-table-column>
+      </el-table>
+
+      <div class="upload-actions">
+        <el-button 
+          type="primary" 
+          @click="uploadFiles"
+          :loading="uploading"
+          :disabled="fileList.length === 0"
+        >
+          上传所有文件
+        </el-button>
+        <el-button @click="clearFiles">清空列表</el-button>
+      </div>
+    </div>
+
+    <!-- 创建文件夹 -->
+    <el-divider />
+    <div class="create-folder">
+      <h4>创建文件夹:</h4>
+      <el-input
+        v-model="folderName"
+        placeholder="输入文件夹名称"
+        style="width: 200px; margin-right: 10px"
+        @keyup.enter="createFolder"
+      />
+      <el-button 
+        type="success" 
+        @click="createFolder"
+        :loading="creatingFolder"
+        :icon="FolderAdd"
+      >
+        创建文件夹
+      </el-button>
+    </div>
+  </div>
+</template>
+
+<script setup>
+import { ref } from 'vue'
+import { UploadFilled, Delete, FolderAdd } from '@element-plus/icons-vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { s3Api } from '../services/api'
+
+const props = defineProps({
+  bucketName: String,
+  currentPrefix: String
+})
+
+const emit = defineEmits(['upload-success', 'folder-created'])
+
+const uploadRef = ref()
+const fileList = ref([])
+const uploading = ref(false)
+const folderName = ref('')
+const creatingFolder = ref(false)
+
+const uploadUrl = ref('')
+
+const onFileChange = (file) => {
+  fileList.value.push(file.raw)
+}
+
+const removeFile = (index) => {
+  fileList.value.splice(index, 1)
+}
+
+const clearFiles = () => {
+  fileList.value = []
+  uploadRef.value.clearFiles()
+}
+
+const uploadFiles = async () => {
+  if (!props.bucketName) {
+    ElMessage.warning('请先选择存储桶')
+    return
+  }
+
+  uploading.value = true
+  let successCount = 0
+  let failCount = 0
+
+  try {
+    for (const file of fileList.value) {
+      try {
+        await s3Api.uploadFile(props.bucketName, file, props.currentPrefix)
+        successCount++
+      } catch (error) {
+        console.error(`上传文件 ${file.name} 失败:`, error)
+        failCount++
+      }
+    }
+
+    if (successCount > 0) {
+      ElMessage.success(`成功上传 ${successCount} 个文件`)
+      emit('upload-success')
+      clearFiles()
+    }
+    
+    if (failCount > 0) {
+      ElMessage.error(`${failCount} 个文件上传失败`)
+    }
+  } catch (error) {
+    ElMessage.error('上传过程中发生错误')
+  } finally {
+    uploading.value = false
+  }
+}
+
+const createFolder = async () => {
+  if (!folderName.value.trim()) {
+    ElMessage.warning('请输入文件夹名称')
+    return
+  }
+
+  if (!props.bucketName) {
+    ElMessage.warning('请先选择存储桶')
+    return
+  }
+
+  creatingFolder.value = true
+  try {
+    await s3Api.createFolder(props.bucketName, folderName.value.trim(), props.currentPrefix)
+    ElMessage.success('文件夹创建成功')
+    folderName.value = ''
+    emit('folder-created')
+  } catch (error) {
+    ElMessage.error('创建文件夹失败: ' + error.message)
+  } finally {
+    creatingFolder.value = false
+  }
+}
+
+const formatFileSize = (row) => {
+  const size = row.size
+  if (size < 1024) return size + ' B'
+  if (size < 1024 * 1024) return (size / 1024).toFixed(1) + ' KB'
+  if (size < 1024 * 1024 * 1024) return (size / (1024 * 1024)).toFixed(1) + ' MB'
+  return (size / (1024 * 1024 * 1024)).toFixed(1) + ' GB'
+}
+</script>
+
+<style scoped>
+.file-upload {
+  margin-bottom: 20px;
+}
+
+.file-list {
+  margin-top: 20px;
+}
+
+.upload-actions {
+  margin-top: 10px;
+  text-align: right;
+}
+
+.create-folder {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.create-folder h4 {
+  margin: 0;
+  margin-right: 10px;
+}
+</style>
+```
+
+### frontend/src/components/FileList.vue
+```vue
+<template>
+  <div class="file-list">
+    <!-- 路径导航 -->
+    <div class="path-navigation">
+      <el-breadcrumb separator="/">
+        <el-breadcrumb-item @click="navigateToPath('')" style="cursor: pointer">
+          <el-icon><House /></el-icon>
+        </el-breadcrumb-item>
+        <el-breadcrumb-item 
+          v-for="(segment, index) in pathSegments" 
+          :key="index"
+          @click="navigateToPath(getPathToSegment(index))"
+          style="cursor: pointer"
+        >
+          {{ segment }}
+        </el-breadcrumb-item>
+      </el-breadcrumb>
+    </div>
+
+    <!-- 工具栏 -->
+    <div class="toolbar">
+      <div class="toolbar-left">
+        <el-button 
+          type="danger" 
+          :disabled="selectedFiles.length === 0"
+          @click="deleteSelectedFiles"
+          :icon="Delete"
+        >
+          删除选中 ({{ selectedFiles.length }})
+        </el-button>
+        <el-button 
+          type="primary" 
+          @click="loadFiles"
+          :loading="loading"
+          :icon="Refresh"
+        >
+          刷新
+        </el-button>
+      </div>
+      
+      <div class="toolbar-right">
+        <span>共 {{ totalCount }} 项</span>
+      </div>
+    </div>
+
+    <!-- 文件夹列表 -->
+    <div v-if="folders.length > 0" class="folders-section">
+      <h4><el-icon><Folder /></el-icon> 文件夹</h4>
+      <el-row :gutter="10">
+        <el-col 
+          v-for="folder in folders" 
+          :key="folder" 
+          :span="6"
+          class="folder-item"
+        >
+          <el-card 
+            shadow="hover" 
+            @click="navigateToFolder(folder)"
+            style="cursor: pointer"
+          >
+            <div class="folder-content">
+              <el-icon size="24"><Folder /></el-icon>
+              <span>{{ folder }}</span>
+            </div>
+          </el-card>
+        </el-col>
+      </el-row>
+    </div>
+
+    <!-- 文件列表 -->
+    <div class="files-section">
+      <h4 v-if="folders.length > 0"><el-icon><Document /></el-icon> 文件</h4>
+      
+      <el-table
+        :data="files"
+        @selection-change="onSelectionChange"
+        v-loading="loading"
+        empty-text="暂无文件"
+      >
+        <el-table-column type="selection" width="55" />
+        
+        <el-table-column label="文件名" min-width="300">
+          <template #default="{ row }">
+            <div class="file-info">
+              <el-icon><Document /></el-icon>
+              <span>{{ row.name }}</span>
+            </div>
+          </template>
+        </el-table-column>
+        
+        <el-table-column label="大小" width="120" :formatter="formatFileSize" />
+        
+        <el-table-column label="修改时间" width="180">
+          <template #default="{ row }">
+            {{ formatDate(row.last_modified) }}
+          </template>
+        </el-table-column>
+        
+        <el-table-column label="类型" width="150">
+          <template #default="{ row }">
+            <el-tag size="small">{{ row.storage_class }}</el-tag>
+          </template>
+        </el-table-column>
+        
+        <el-table-column label="操作" width="200">
+          <template #default="{ row }">
+            <el-button 
+              size="small" 
+              type="primary"
+              @click="downloadFile(row)"
+              :icon="Download"
+            >
+              下载
+            </el-button>
+            <el-button 
+              size="small" 
+              type="danger"
+              @click="deleteFile(row)"
+              :icon="Delete"
+            >
+              删除
+            </el-button>
+          </template>
+        </el-table-column>
+      </el-table>
+
+      <!-- 分页 -->
+      <div class="pagination" v-if="totalCount > pageSize">
+        <el-pagination
+          v-model:current-page="currentPage"
+          :page-size="pageSize"
+          :total="totalCount"
+          layout="prev, pager, next, sizes, total"
+          :page-sizes="[20, 50, 100, 200]"
+          @current-change="onPageChange"
+          @size-change="onPageSizeChange"
+        />
+      </div>
+    </div>
+  </div>
+</template>
+
+<script setup>
+import { ref, computed, watch } from 'vue'
+import { 
+  House, Folder, Document, Delete, Refresh, Download 
+} from '@element-plus/icons-vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { s3Api } from '../services/api'
+
+const props = defineProps({
+  bucketName: String,
+  refreshTrigger: Number
+})
+
+const emit = defineEmits(['path-changed'])
+
+const files = ref([])
+const folders = ref([])
+const selectedFiles = ref([])
+const loading = ref(false)
+const currentPrefix = ref('')
+const currentPage = ref(1)
+const pageSize = ref(50)
+const totalCount = ref(0)
+const hasNext = ref(false)
+
+// 计算路径片段
+const pathSegments = computed(() => {
+  if (!currentPrefix.value) return []
+  return currentPrefix.value.split('/').filter(segment => segment)
+})
+
+const loadFiles = async () => {
+  if (!props.bucketName) return
+
+  loading.value = true
+  try {
+    const response = await s3Api.getFiles(
+      props.bucketName, 
+      currentPrefix.value, 
+      currentPage.value, 
+      pageSize.value
+    )
+    
+    files.value = response.files || []
+    folders.value = response.folders || []
+    totalCount.value = response.total_count || 0
+    hasNext.value = response.has_next || false
+    
+  } catch (error) {
+    ElMessage.error('获取文件列表失败: ' + error.message)
+  } finally {
+    loading.value = false
+  }
+}
+
+const navigateToFolder = (folderName) => {
+  const newPrefix = currentPrefix.value ? 
+    `${currentPrefix.value}${folderName}/` : 
+    `${folderName}/`
+  navigateToPath(newPrefix)
+}
+
+const navigateToPath = (path) => {
+  currentPrefix.value = path
+  currentPage.value = 1
+  emit('path-changed', path)
+  loadFiles()
+}
+
+const getPathToSegment = (index) => {
+  return pathSegments.value.slice(0, index + 1).join('/') + '/'
+}
+
+const onSelectionChange = (selection) => {
+  selectedFiles.value = selection
+}
+
+const onPageChange = (page) => {
+  currentPage.value = page
+  loadFiles()
+}
+
+const onPageSizeChange = (size) => {
+  pageSize.value = size
+  currentPage.value = 1
+  loadFiles()
+}
+
+const downloadFile = (file) => {
+  if (file.download_url) {
+    const link = document.createElement('a')
+    link.href = file.download_url
+    link.download = file.name
+    document.body.appendChild(link)
+    link.click()
+    document.body.removeChild(link)
+  } else {
+    ElMessage.error('无法获取下载链接')
+  }
+}
+
+const deleteFile = async (file) => {
+  try {
+    await ElMessageBox.confirm(
+      `确定要删除文件 "${file.name}" 吗？`,
+      '确认删除',
+      { type: 'warning' }
+    )
+    
+    await s3Api.deleteFile(props.bucketName, file.key)
+    ElMessage.success('文件删除成功')
+    loadFiles()
+  } catch (error) {
+    if (error !== 'cancel') {
+      ElMessage.error('删除文件失败: ' + error.message)
+    }
+  }
+}
+
+const deleteSelectedFiles = async () => {
+  if (selectedFiles.value.length === 0) return
+
+  try {
+    await ElMessageBox.confirm(
+      `确定要删除选中的 ${selectedFiles.value.length} 个文件吗？`,
+      '确认批量删除',
+      { type: 'warning' }
+    )
+    
+    const fileKeys = selectedFiles.value.map(file => file.key)
+    const response = await s3Api.deleteMultipleFiles(props.bucketName, fileKeys)
+    
+    if (response.success) {
+      ElMessage.success(`成功删除 ${response.deleted_count} 个文件`)
+      loadFiles()
+    } else {
+      ElMessage.error('批量删除失败: ' + response.message)
+    }
+  } catch (error) {
+    if (error !== 'cancel') {
+      ElMessage.error('批量删除失败: ' + error.message)
+    }
+  }
+}
+
+const formatFileSize = (row) => {
+  const size = row.size
+  if (size < 1024) return size + ' B'
+  if (size < 1024 * 1024) return (size / 1024).toFixed(1) + ' KB'
+  if (size < 1024 * 1024 * 1024) return (size / (1024 * 1024)).toFixed(1) + ' MB'
+  return (size / (1024 * 1024 * 1024)).toFixed(1) + ' GB'
+}
+
+const formatDate = (dateString) => {
+  return new Date(dateString).toLocaleString()
+}
+
+// 监听桶变化和刷新触发器
+watch([() => props.bucketName, () => props.refreshTrigger], () => {
+  if (props.bucketName) {
+    currentPrefix.value = ''
+    currentPage.value = 1
+    loadFiles()
+  }
+}, { immediate: true })
+
+defineExpose({
+  getCurrentPrefix: () => currentPrefix.value,
+  refresh: loadFiles
+})
+</script>
+
+<style scoped>
+.file-list {
+  height: 100%;
+}
+
+.path-navigation {
+  margin-bottom: 15px;
+  padding: 10px;
+  background-color: #f5f5f5;
+  border-radius: 4px;
+}
+
+.toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 15px;
+  padding: 10px 0;
+}
+
+.toolbar-left {
+  display: flex;
+  gap: 10px;
+}
+
+.toolbar-right {
+  color: #666;
+  font-size: 14px;
+}
+
+.folders-section {
+  margin-bottom: 20px;
+}
+
+.folders-section h4 {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-bottom: 10px;
+}
+
+.folder-item {
+  margin-bottom: 10px;
+}
+
+.folder-content {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px;
+}
+
+.files-section h4 {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-bottom: 10px;
+}
+
+.file-info {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.pagination {
+  margin-top: 20px;
+  text-align: center;
+}
+</style>
+```
+
+### frontend/src/App.vue
+```vue
+<template>
+  <div id="app">
+    <el-container style="height: 100vh">
+      <!-- 头部 -->
+      <el-header style="background: #409EFF; color: white">
+        <div class="header-content">
+          <h1>S3 文件管理器</h1>
+          <div class="header-info">
+            <span v-if="selectedBucket">当前桶: {{ selectedBucket }}</span>
+          </div>
+        </div>
+      </el-header>
+
+      <el-container>
+        <!-- 侧边栏 -->
+        <el-aside width="400px" style="border-right: 1px solid #eee">
+          <div class="aside-content">
+            <!-- 桶选择器 -->
+            <el-card shadow="never" style="margin-bottom: 20px">
+              <template #header>
+                <span>选择存储桶</span>
+              </template>
+              <BucketSelector @bucket-changed="onBucketChanged" />
+            </el-card>
+
+            <!-- 文件上传 -->
+            <el-card shadow="never" v-if="selectedBucket">
+              <template #header>
+                <span>文件上传</span>
+              </template>
+              <FileUpload 
+                :bucket-name="selectedBucket"
+                :current-prefix="currentPrefix"
+                @upload-success="onUploadSuccess"
+                @folder-created="onFolderCreated"
+              />
+            </el-card>
+          </div>
+        </el-aside>
+
+        <!-- 主内容区 -->
+        <el-main>
+          <div v-if="!selectedBucket" class="empty-state">
+            <el-empty description="请先选择一个S3存储桶" />
+          </div>
+          
+          <FileList 
+            v-else
+            ref="fileListRef"
+            :bucket-name="selectedBucket"
+            :refresh-trigger="refreshTrigger"
+            @path-changed="onPathChanged"
+          />
+        </el-main>
+      </el-container>
+    </el-container>
+  </div>
+</template>
+
+<script setup>
+import { ref } from 'vue'
+import BucketSelector from './components/BucketSelector.vue'
+import FileUpload from './components/FileUpload.vue'
+import FileList from './components/FileList.vue'
+
+const selectedBucket = ref('')
+const currentPrefix = ref('')
+const refreshTrigger = ref(0)
+const fileListRef = ref()
+
+const onBucketChanged = (bucketName) => {
+  selectedBucket.value = bucketName
+  currentPrefix.value = ''
+  refreshTrigger.value++
+}
+
+const onPathChanged = (path) => {
+  currentPrefix.value = path
+}
+
+const onUploadSuccess = () => {
+  refreshTrigger.value++
+}
+
+const onFolderCreated = () => {
+  refreshTrigger.value++
+}
+</script>
+
+<style>
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+#app {
+  font-family: 'Helvetica Neue', Arial, sans-serif;
+}
+
+.header-content {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  height: 100%;
+  padding: 0 20px;
+}
+
+.header-content h1 {
+  margin: 0;
+  font-size: 24px;
+  font-weight: 500;
+}
+
+.header-info {
+  font-size: 14px;
+}
+
+.aside-content {
+  padding: 20px;
+  height: 100%;
+  overflow-y: auto;
+}
+
+.empty-state {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  height: 100%;
+}
+
+.el-main {
+  padding: 20px;
+}
+
+.el-aside {
+  background-color: #fafafa;
+}
+</style>
+```
+
+## 运行说明
+
+### 后端启动
+
+1. 创建并配置环境：
+```bash
+cd backend
+pip install -r requirements.txt
+cp .env.example .env
+# 编辑 .env 文件，填入你的 AWS 凭证
+```
+
+2. 启动服务：
+```bash
+cd backend
+python -m app.main
+# 或者
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+```
+
+### 前端启动
+
+1. 安装依赖：
+```bash
+cd frontend
+npm install
+```
+
+2. 启动开发服务器：
+```bash
+npm run dev
+```
+
+## 功能特性
+
+### 已实现功能：
+1. ✅ S3桶列表查看和选择
+2. ✅ 文件列表查看（支持分页）
+3. ✅ 文件夹导航和创建
+4. ✅ 文件上传（支持多文件、拖拽上传）
+5. ✅ 文件下载（预签名URL）
+6. ✅ 文件删除（单个和批量）
+7. ✅ 路径导航面包屑
+8. ✅ 文件大小和时间格式化显示
+9. ✅ 响应式界面设计
+
+### 技术特点：
+- **后端**: FastAPI + boto3 + pydantic
+- **前端**: Vue 3 + Element Plus + Vite
+- **功能**: RESTful API + 现代化UI组件
+- **安全**: 预签名URL + CORS配置
+
+这个项目提供了完整的S3文件管理功能，界面友好，易于扩展。你可以根据需要添加更多功能，如文件预览、权限管理等。
