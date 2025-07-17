@@ -1,5 +1,610 @@
-openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout server.key -out server.crt
-curl -X POST http://localhost:5175/update-ssl -d '{"enable_ssl":true,"ssl_cert_path":"server.crt","ssl_key_path":"server.key"}'
+我来为你创建一个完整的文件管理系统。以下是后端和前端的完整代码：
 
-# 更新认证配置，允许空密码并绕过检查
-curl -X POST http://localhost:5175/update-auth-config -d '{"bypass_proxy_pwd_check":true,"accept_empty_proxy_pwd":true}'
+## 后端 (FastAPI)
+
+### 1. 依赖安装
+```bash
+pip install fastapi uvicorn boto3 python-multipart python-dotenv
+```
+
+### 2. 环境配置文件 (.env)
+```env
+AWS_ACCESS_KEY_ID=your_access_key
+AWS_SECRET_ACCESS_KEY=your_secret_key
+AWS_REGION=us-east-1
+S3_BUCKET_NAME=your-bucket-name
+```
+
+### 3. 后端主文件 (main.py)
+```python
+from fastapi import FastAPI, File, UploadFile, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+import boto3
+from botocore.exceptions import ClientError
+import os
+from typing import Optional, List
+from pydantic import BaseModel
+import logging
+from datetime import datetime
+import io
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# 配置日志
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title="S3 File Manager", version="1.0.0")
+
+# CORS配置
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://localhost:8080"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# S3 配置
+AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
+AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME")
+
+# 初始化S3客户端
+s3_client = boto3.client(
+    's3',
+    aws_access_key_id=AWS_ACCESS_KEY_ID,
+    aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+    region_name=AWS_REGION
+)
+
+# 数据模型
+class FileInfo(BaseModel):
+    key: str
+    name: str
+    size: int
+    last_modified: str
+    url: str
+
+class FileListResponse(BaseModel):
+    files: List[FileInfo]
+    total: int
+    page: int
+    page_size: int
+    total_pages: int
+
+class DeleteResponse(BaseModel):
+    success: bool
+    message: str
+
+# API 路由
+@app.get("/")
+async def root():
+    return {"message": "S3 File Manager API"}
+
+@app.get("/api/files", response_model=FileListResponse)
+async def list_files(
+    page: int = Query(1, ge=1, description="页码"),
+    page_size: int = Query(10, ge=1, le=100, description="每页大小"),
+    prefix: Optional[str] = Query(None, description="文件前缀过滤")
+):
+    try:
+        # 构建查询参数
+        list_params = {
+            'Bucket': S3_BUCKET_NAME,
+            'MaxKeys': 1000  # 先获取更多数据用于分页
+        }
+        
+        if prefix:
+            list_params['Prefix'] = prefix
+
+        response = s3_client.list_objects_v2(**list_params)
+        
+        if 'Contents' not in response:
+            return FileListResponse(
+                files=[],
+                total=0,
+                page=page,
+                page_size=page_size,
+                total_pages=0
+            )
+
+        # 处理文件列表
+        all_files = []
+        for obj in response['Contents']:
+            # 生成预签名URL
+            url = s3_client.generate_presigned_url(
+                'get_object',
+                Params={'Bucket': S3_BUCKET_NAME, 'Key': obj['Key']},
+                ExpiresIn=3600
+            )
+            
+            file_info = FileInfo(
+                key=obj['Key'],
+                name=obj['Key'].split('/')[-1],
+                size=obj['Size'],
+                last_modified=obj['LastModified'].isoformat(),
+                url=url
+            )
+            all_files.append(file_info)
+
+        # 分页处理
+        total = len(all_files)
+        total_pages = (total + page_size - 1) // page_size
+        start_idx = (page - 1) * page_size
+        end_idx = start_idx + page_size
+        
+        paginated_files = all_files[start_idx:end_idx]
+
+        return FileListResponse(
+            files=paginated_files,
+            total=total,
+            page=page,
+            page_size=page_size,
+            total_pages=total_pages
+        )
+
+    except ClientError as e:
+        logger.error(f"S3 error: {e}")
+        raise HTTPException(status_code=500, detail=f"S3 error: {str(e)}")
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+@app.post("/api/upload")
+async def upload_file(file: UploadFile = File(...)):
+    try:
+        # 读取文件内容
+        file_content = await file.read()
+        
+        # 生成文件key（可以包含时间戳避免重名）
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        file_key = f"{timestamp}_{file.filename}"
+        
+        # 上传到S3
+        s3_client.put_object(
+            Bucket=S3_BUCKET_NAME,
+            Key=file_key,
+            Body=file_content,
+            ContentType=file.content_type or 'application/octet-stream'
+        )
+        
+        logger.info(f"File uploaded successfully: {file_key}")
+        
+        return {
+            "success": True,
+            "message": "File uploaded successfully",
+            "file_key": file_key,
+            "file_name": file.filename,
+            "file_size": len(file_content)
+        }
+
+    except ClientError as e:
+        logger.error(f"S3 upload error: {e}")
+        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
+    except Exception as e:
+        logger.error(f"Upload error: {e}")
+        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
+
+@app.delete("/api/files/{file_key:path}", response_model=DeleteResponse)
+async def delete_file(file_key: str):
+    try:
+        # 删除S3文件
+        s3_client.delete_object(Bucket=S3_BUCKET_NAME, Key=file_key)
+        
+        logger.info(f"File deleted successfully: {file_key}")
+        
+        return DeleteResponse(
+            success=True,
+            message=f"File '{file_key}' deleted successfully"
+        )
+
+    except ClientError as e:
+        logger.error(f"S3 delete error: {e}")
+        raise HTTPException(status_code=500, detail=f"Delete failed: {str(e)}")
+    except Exception as e:
+        logger.error(f"Delete error: {e}")
+        raise HTTPException(status_code=500, detail=f"Delete failed: {str(e)}")
+
+@app.get("/api/download/{file_key:path}")
+async def download_file(file_key: str):
+    try:
+        # 从S3获取文件
+        response = s3_client.get_object(Bucket=S3_BUCKET_NAME, Key=file_key)
+        
+        # 创建流式响应
+        def iterfile():
+            yield response['Body'].read()
+
+        filename = file_key.split('/')[-1]
+        
+        return StreamingResponse(
+            iterfile(),
+            media_type='application/octet-stream',
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
+
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'NoSuchKey':
+            raise HTTPException(status_code=404, detail="File not found")
+        logger.error(f"S3 download error: {e}")
+        raise HTTPException(status_code=500, detail=f"Download failed: {str(e)}")
+    except Exception as e:
+        logger.error(f"Download error: {e}")
+        raise HTTPException(status_code=500, detail=f"Download failed: {str(e)}")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+```
+
+## 前端 (Vue.js)
+
+### 1. 创建Vue项目并安装依赖
+```bash
+npm create vue@latest s3-file-manager
+cd s3-file-manager
+npm install
+npm install axios element-plus
+```
+
+### 2. 主组件 (src/App.vue)
+```vue
+<template>
+  <div id="app">
+    <el-container>
+      <el-header>
+        <h1>S3 文件管理器</h1>
+      </el-header>
+      
+      <el-main>
+        <!-- 上传区域 -->
+        <el-card class="upload-card" style="margin-bottom: 20px;">
+          <el-upload
+            class="upload-demo"
+            :action="uploadUrl"
+            :on-success="handleUploadSuccess"
+            :on-error="handleUploadError"
+            :before-upload="beforeUpload"
+            drag
+            multiple
+          >
+            <el-icon class="el-icon--upload"><Upload /></el-icon>
+            <div class="el-upload__text">
+              将文件拖到此处，或<em>点击上传</em>
+            </div>
+          </el-upload>
+        </el-card>
+
+        <!-- 搜索区域 -->
+        <el-card style="margin-bottom: 20px;">
+          <el-row :gutter="20">
+            <el-col :span="12">
+              <el-input
+                v-model="searchPrefix"
+                placeholder="输入文件名前缀搜索"
+                @input="searchFiles"
+                clearable
+              >
+                <template #prefix>
+                  <el-icon><Search /></el-icon>
+                </template>
+              </el-input>
+            </el-col>
+            <el-col :span="6">
+              <el-button type="primary" @click="loadFiles">刷新</el-button>
+            </el-col>
+          </el-row>
+        </el-card>
+
+        <!-- 文件列表 -->
+        <el-card>
+          <el-table 
+            :data="files" 
+            v-loading="loading"
+            style="width: 100%"
+          >
+            <el-table-column prop="name" label="文件名" min-width="200">
+              <template #default="scope">
+                <el-link :href="scope.row.url" target="_blank">
+                  {{ scope.row.name }}
+                </el-link>
+              </template>
+            </el-table-column>
+            
+            <el-table-column prop="size" label="大小" width="120">
+              <template #default="scope">
+                {{ formatFileSize(scope.row.size) }}
+              </template>
+            </el-table-column>
+            
+            <el-table-column prop="last_modified" label="修改时间" width="180">
+              <template #default="scope">
+                {{ formatDate(scope.row.last_modified) }}
+              </template>
+            </el-table-column>
+            
+            <el-table-column label="操作" width="200">
+              <template #default="scope">
+                <el-button 
+                  size="small" 
+                  @click="downloadFile(scope.row)"
+                  type="primary"
+                >
+                  下载
+                </el-button>
+                <el-button 
+                  size="small" 
+                  type="danger" 
+                  @click="deleteFile(scope.row)"
+                >
+                  删除
+                </el-button>
+              </template>
+            </el-table-column>
+          </el-table>
+
+          <!-- 分页 -->
+          <div style="margin-top: 20px; text-align: center;">
+            <el-pagination
+              v-model:current-page="currentPage"
+              v-model:page-size="pageSize"
+              :page-sizes="[10, 20, 50, 100]"
+              :total="total"
+              layout="total, sizes, prev, pager, next, jumper"
+              @size-change="handleSizeChange"
+              @current-change="handleCurrentChange"
+            />
+          </div>
+        </el-card>
+      </el-main>
+    </el-container>
+  </div>
+</template>
+
+<script>
+import { ref, onMounted, reactive } from 'vue'
+import axios from 'axios'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { Upload, Search } from '@element-plus/icons-vue'
+
+export default {
+  name: 'App',
+  components: {
+    Upload,
+    Search
+  },
+  setup() {
+    // 响应式数据
+    const files = ref([])
+    const loading = ref(false)
+    const currentPage = ref(1)
+    const pageSize = ref(10)
+    const total = ref(0)
+    const searchPrefix = ref('')
+    
+    // API基础URL
+    const baseURL = 'http://localhost:8000'
+    const uploadUrl = `${baseURL}/api/upload`
+
+    // 防抖搜索
+    let searchTimeout = null
+
+    // 加载文件列表
+    const loadFiles = async () => {
+      loading.value = true
+      try {
+        const params = {
+          page: currentPage.value,
+          page_size: pageSize.value
+        }
+        
+        if (searchPrefix.value) {
+          params.prefix = searchPrefix.value
+        }
+
+        const response = await axios.get(`${baseURL}/api/files`, { params })
+        
+        files.value = response.data.files
+        total.value = response.data.total
+        
+      } catch (error) {
+        console.error('加载文件失败:', error)
+        ElMessage.error('加载文件失败')
+      } finally {
+        loading.value = false
+      }
+    }
+
+    // 搜索文件
+    const searchFiles = () => {
+      if (searchTimeout) {
+        clearTimeout(searchTimeout)
+      }
+      
+      searchTimeout = setTimeout(() => {
+        currentPage.value = 1
+        loadFiles()
+      }, 300)
+    }
+
+    // 文件上传成功
+    const handleUploadSuccess = (response) => {
+      ElMessage.success('文件上传成功')
+      loadFiles()
+    }
+
+    // 文件上传失败
+    const handleUploadError = (error) => {
+      console.error('上传失败:', error)
+      ElMessage.error('文件上传失败')
+    }
+
+    // 上传前验证
+    const beforeUpload = (file) => {
+      const isLt100M = file.size / 1024 / 1024 < 100
+      if (!isLt100M) {
+        ElMessage.error('文件大小不能超过 100MB!')
+        return false
+      }
+      return true
+    }
+
+    // 删除文件
+    const deleteFile = async (file) => {
+      try {
+        await ElMessageBox.confirm(
+          `确定要删除文件 "${file.name}" 吗？`,
+          '确认删除',
+          {
+            confirmButtonText: '确定',
+            cancelButtonText: '取消',
+            type: 'warning',
+          }
+        )
+
+        await axios.delete(`${baseURL}/api/files/${file.key}`)
+        ElMessage.success('文件删除成功')
+        loadFiles()
+        
+      } catch (error) {
+        if (error !== 'cancel') {
+          console.error('删除失败:', error)
+          ElMessage.error('文件删除失败')
+        }
+      }
+    }
+
+    // 下载文件
+    const downloadFile = (file) => {
+      window.open(`${baseURL}/api/download/${file.key}`, '_blank')
+    }
+
+    // 分页大小改变
+    const handleSizeChange = (val) => {
+      pageSize.value = val
+      currentPage.value = 1
+      loadFiles()
+    }
+
+    // 当前页改变
+    const handleCurrentChange = (val) => {
+      currentPage.value = val
+      loadFiles()
+    }
+
+    // 格式化文件大小
+    const formatFileSize = (bytes) => {
+      if (bytes === 0) return '0 Bytes'
+      const k = 1024
+      const sizes = ['Bytes', 'KB', 'MB', 'GB']
+      const i = Math.floor(Math.log(bytes) / Math.log(k))
+      return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i]
+    }
+
+    // 格式化日期
+    const formatDate = (dateString) => {
+      return new Date(dateString).toLocaleString('zh-CN')
+    }
+
+    // 组件挂载时加载数据
+    onMounted(() => {
+      loadFiles()
+    })
+
+    return {
+      files,
+      loading,
+      currentPage,
+      pageSize,
+      total,
+      searchPrefix,
+      uploadUrl,
+      loadFiles,
+      searchFiles,
+      handleUploadSuccess,
+      handleUploadError,
+      beforeUpload,
+      deleteFile,
+      downloadFile,
+      handleSizeChange,
+      handleCurrentChange,
+      formatFileSize,
+      formatDate
+    }
+  }
+}
+</script>
+
+<style>
+#app {
+  font-family: Avenir, Helvetica, Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+.el-header {
+  background-color: #409EFF;
+  color: white;
+  display: flex;
+  align-items: center;
+}
+
+.el-header h1 {
+  margin: 0;
+}
+
+.upload-card .el-upload-dragger {
+  width: 100%;
+}
+</style>
+```
+
+### 3. 入口文件 (src/main.js)
+```javascript
+import { createApp } from 'vue'
+import ElementPlus from 'element-plus'
+import 'element-plus/dist/index.css'
+import App from './App.vue'
+
+const app = createApp(App)
+app.use(ElementPlus)
+app.mount('#app')
+```
+
+## 运行说明
+
+### 后端启动
+```bash
+# 确保已配置好 .env 文件
+python main.py
+# 或者
+uvicorn main:app --reload --host 0.0.0.0 --port 8000
+```
+
+### 前端启动
+```bash
+npm run dev
+```
+
+## 主要功能
+
+1. **文件上传**: 支持拖拽上传和点击上传，多文件上传
+2. **文件列表**: 分页显示文件，显示文件名、大小、修改时间
+3. **文件搜索**: 支持按文件名前缀搜索
+4. **文件下载**: 点击文件名或下载按钮下载文件
+5. **文件删除**: 删除前确认，防止误删
+6. **响应式设计**: 使用Element Plus组件库
+
+## 注意事项
+
+1. 确保AWS S3配置正确，包括访问密钥、区域和存储桶名称
+2. 存储桶需要适当的权限配置
+3. 生产环境中应该使用环境变量管理敏感信息
+4. 可以根据需要调整文件上传大小限制
+5. 预签名URL的过期时间可以根据需要调整
+
+这个系统提供了完整的S3文件管理功能，可以根据你的具体需求进行进一步定制。
