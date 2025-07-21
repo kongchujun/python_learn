@@ -1,7 +1,1 @@
-export DB_HOST=localhost
-export DB_PORT=5432
-export DB_USER=postgres
-export DB_PASSWORD=你的密码
-export DB_NAME=你的数据库名
-
-uvicorn postgrep_mcp_service:app --host 0.0.0.0 --port 8000 --reload
+pip install fastapi uvicorn boto3 python-multipart python-dotenv
