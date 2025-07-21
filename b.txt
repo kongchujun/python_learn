@@ -1,260 +1,1032 @@
-我明白问题了！文件上传成功但文件夹列表没有更新。让我帮你调试和修复这个问题。
+以下是完整的 `App.vue` 代码，包含所有功能和调试修复：
 
-## 问题排查和修复
-
-### 1. 首先检查后端API是否正常工作
-
-在浏览器中直接访问：`http://localhost:8000/api/folders`
-
-看看返回的数据是否包含新上传的文件夹。
-
-### 2. 修复后端 folders API
-
-后端的 `list_folders` 方法可能有缓存或逻辑问题，让我优化一下：
-
-```python
-# 在 main.py 中修改 list_folders 方法
-@app.get("/api/folders", response_model=FoldersResponse)
-async def list_folders():
-    try:
-        # 使用更大的MaxKeys确保获取所有文件
-        all_objects = []
-        continuation_token = None
-        
-        while True:
-            list_params = {
-                'Bucket': S3_BUCKET_NAME,
-                'MaxKeys': 1000
-            }
-            
-            if continuation_token:
-                list_params['ContinuationToken'] = continuation_token
-            
-            response = s3_client.list_objects_v2(**list_params)
-            
-            if 'Contents' in response:
-                all_objects.extend(response['Contents'])
-            
-            # 检查是否有更多数据
-            if not response.get('IsTruncated', False):
-                break
-                
-            continuation_token = response.get('NextContinuationToken')
-        
-        if not all_objects:
-            return FoldersResponse(folders=[])
-
-        # 统计文件夹和文件数量
-        folder_counts = {}
-        
-        for obj in all_objects:
-            key = obj['Key']
-            # 获取第一层路径
-            if '/' in key:
-                folder_name = key.split('/')[0]
-                folder_counts[folder_name] = folder_counts.get(folder_name, 0) + 1
-            else:
-                # 根目录文件
-                folder_counts['根目录'] = folder_counts.get('根目录', 0) + 1
-
-        # 转换为列表并排序
-        folders = [
-            FolderInfo(name=name, count=count) 
-            for name, count in sorted(folder_counts.items())
-        ]
-
-        logger.info(f"Found {len(folders)} folders: {[f.name for f in folders]}")
-        return FoldersResponse(folders=folders)
-
-    except ClientError as e:
-        logger.error(f"S3 error: {e}")
-        raise HTTPException(status_code=500, detail=f"S3 error: {str(e)}")
-    except Exception as e:
-        logger.error(f"Unexpected error: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
-```
-
-### 3. 修复前端的文件夹加载逻辑
-
-修改前端 `App.vue` 中的相关方法：
-
-```javascript
-// 在 setup() 函数中修改以下方法
-
-const loadFolders = async () => {
-  try {
-    console.log('开始加载文件夹列表...')
-    const response = await axios.get(`${baseURL}/api/folders`)
-    console.log('文件夹数据:', response.data)
-    folders.value = response.data.folders
-    console.log('更新后的文件夹列表:', folders.value)
-  } catch (error) {
-    console.error('加载文件夹失败:', error)
-    ElMessage.error('加载文件夹失败')
-  }
-}
-
-// 修改上传成功处理
-const submitUpload = async () => {
-  if (fileList.value.length === 0) {
-    ElMessage.warning('请先选择文件')
-    return
-  }
-
-  uploading.value = true
-  
-  try {
-    const formData = new FormData()
-    
-    // 添加文件
-    fileList.value.forEach(file => {
-      formData.append('files', file.raw)
-    })
-    
-    // 添加参数
-    if (uploadFolder.value) {
-      formData.append('folder', uploadFolder.value)
-    }
-    formData.append('keep_original_name', keepOriginalName.value)
-
-    console.log('开始上传文件...')
-    const response = await axios.post(`${baseURL}/api/upload/batch`, formData, {
-      headers: {
-        'Content-Type': 'multipart/form-data'
-      }
-    })
-
-    console.log('上传响应:', response.data)
-
-    if (response.data.success) {
-      ElMessage.success(response.data.message)
-    } else {
-      ElMessage.warning(response.data.message)
-      if (response.data.failed_files.length > 0) {
-        console.error('Failed files:', response.data.failed_files)
-      }
-    }
-
-    // 清空文件列表
-    clearFiles()
-    
-    // 延迟一下再刷新，确保S3数据同步
-    console.log('开始刷新数据...')
-    setTimeout(async () => {
-      await loadFolders()
-      await loadFiles()
+```vue
+<template>
+  <div id="app">
+    <el-container>
+      <el-header>
+        <h1>S3 文件管理器</h1>
+      </el-header>
       
-      // 如果上传到了新文件夹，自动选择该文件夹
-      if (uploadFolder.value && !selectedFolder.value) {
-        const targetFolder = uploadFolder.value.split('/')[0]
-        console.log('自动选择文件夹:', targetFolder)
-        selectedFolder.value = targetFolder
-        await loadFiles()
-      }
-    }, 1000) // 延迟1秒
+      <el-main>
+        <!-- 上传区域 -->
+        <el-card class="upload-card" style="margin-bottom: 20px;">
+          <template #header>
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+              <span>文件上传</span>
+              <el-button 
+                type="text" 
+                @click="showUploadSettings = !showUploadSettings"
+              >
+                {{ showUploadSettings ? '隐藏设置' : '显示设置' }}
+              </el-button>
+            </div>
+          </template>
+          
+          <!-- 上传设置 -->
+          <div v-show="showUploadSettings" style="margin-bottom: 20px; padding: 16px; background-color: #f9f9f9; border-radius: 4px;">
+            <el-row :gutter="20">
+              <el-col :span="12">
+                <el-form-item label="上传到文件夹：">
+                  <el-select
+                    v-model="uploadFolder"
+                    placeholder="选择文件夹或输入新路径"
+                    filterable
+                    allow-create
+                    clearable
+                    style="width: 100%"
+                  >
+                    <el-option label="根目录" value="" />
+                    <el-option
+                      v-for="folder in folders"
+                      :key="folder.name"
+                      :label="folder.name === '根目录' ? '根目录' : folder.name"
+                      :value="folder.name === '根目录' ? '' : folder.name"
+                    />
+                  </el-select>
+                  <div style="margin-top: 4px; font-size: 12px; color: #999;">
+                    可选择现有文件夹或输入新的路径，如：images/2024
+                  </div>
+                </el-form-item>
+              </el-col>
+              <el-col :span="12">
+                <el-form-item label="文件名设置：">
+                  <el-radio-group v-model="keepOriginalName">
+                    <el-radio :label="true">保留原文件名</el-radio>
+                    <el-radio :label="false">添加时间戳</el-radio>
+                  </el-radio-group>
+                  <div style="margin-top: 4px; font-size: 12px; color: #999;">
+                    添加时间戳可避免文件名冲突
+                  </div>
+                </el-form-item>
+              </el-col>
+            </el-row>
+          </div>
 
-  } catch (error) {
-    console.error('上传失败:', error)
-    ElMessage.error('文件上传失败')
-  } finally {
-    uploading.value = false
+          <!-- 上传组件 -->
+          <el-upload
+            ref="uploadRef"
+            class="upload-demo"
+            :action="uploadUrl"
+            :data="uploadData"
+            :on-success="handleUploadSuccess"
+            :on-error="handleUploadError"
+            :before-upload="beforeUpload"
+            :on-change="handleFileChange"
+            drag
+            multiple
+            :auto-upload="false"
+          >
+            <el-icon class="el-icon--upload"><Upload /></el-icon>
+            <div class="el-upload__text">
+              将文件拖到此处，或<em>点击选择文件</em>
+            </div>
+            <template #tip>
+              <div class="el-upload__tip">
+                <div>支持多文件上传，单个文件大小限制100MB</div>
+                <div v-if="uploadFolder" style="color: #409EFF;">
+                  将上传到：{{ uploadFolder || '根目录' }}
+                </div>
+              </div>
+            </template>
+          </el-upload>
+          
+          <!-- 上传操作按钮 -->
+          <div v-if="fileList.length > 0" style="margin-top: 16px;">
+            <el-button type="primary" @click="submitUpload" :loading="uploading">
+              <el-icon><Upload /></el-icon>
+              上传文件 ({{ fileList.length }}个)
+            </el-button>
+            <el-button @click="clearFiles">清空列表</el-button>
+          </div>
+          
+          <!-- 文件列表 -->
+          <div v-if="fileList.length > 0" style="margin-top: 16px;">
+            <el-divider content-position="left">待上传文件</el-divider>
+            <el-table :data="fileList" size="small">
+              <el-table-column prop="name" label="文件名" />
+              <el-table-column prop="size" label="大小" width="100">
+                <template #default="scope">
+                  {{ formatFileSize(scope.row.size) }}
+                </template>
+              </el-table-column>
+              <el-table-column label="预览路径" min-width="200">
+                <template #default="scope">
+                  <el-text type="info" style="font-size: 12px;">
+                    {{ getUploadPath(scope.row.name) }}
+                  </el-text>
+                </template>
+              </el-table-column>
+              <el-table-column label="操作" width="80">
+                <template #default="scope">
+                  <el-button 
+                    type="danger" 
+                    size="small" 
+                    @click="removeFile(scope.$index)"
+                    text
+                  >
+                    移除
+                  </el-button>
+                </template>
+              </el-table-column>
+            </el-table>
+          </div>
+        </el-card>
+
+        <!-- 搜索和过滤区域 -->
+        <el-card style="margin-bottom: 20px;">
+          <el-row :gutter="20">
+            <el-col :span="8">
+              <el-select
+                v-model="selectedFolder"
+                placeholder="选择文件夹"
+                clearable
+                @change="handleFolderChange"
+                style="width: 100%"
+              >
+                <el-option
+                  label="全部文件夹"
+                  value=""
+                >
+                  <span style="float: left">全部文件夹</span>
+                  <span style="float: right; color: #8492a6; font-size: 13px">
+                    {{ totalFiles }}
+                  </span>
+                </el-option>
+                <el-option
+                  v-for="folder in folders"
+                  :key="folder.name"
+                  :label="folder.name"
+                  :value="folder.name"
+                >
+                  <span style="float: left">{{ folder.name }}</span>
+                  <span style="float: right; color: #8492a6; font-size: 13px">
+                    {{ folder.count }}
+                  </span>
+                </el-option>
+              </el-select>
+              
+              <!-- 调试信息 -->
+              <div style="margin-top: 4px; font-size: 12px; color: #999;">
+                当前文件夹数量: {{ folders.length }}
+                <el-button type="text" size="small" @click="logFolderData">
+                  查看详情
+                </el-button>
+              </div>
+            </el-col>
+            <el-col :span="8">
+              <el-input
+                v-model="searchPrefix"
+                placeholder="输入文件名前缀搜索"
+                @input="searchFiles"
+                clearable
+              >
+                <template #prefix>
+                  <el-icon><Search /></el-icon>
+                </template>
+              </el-input>
+            </el-col>
+            <el-col :span="8">
+              <el-button type="primary" @click="loadFiles">刷新文件</el-button>
+              <el-button type="success" @click="refreshFolders">刷新文件夹</el-button>
+              <el-button @click="clearFilters">清空过滤</el-button>
+            </el-col>
+          </el-row>
+          
+          <!-- 当前过滤状态显示 -->
+          <div v-if="selectedFolder || searchPrefix" style="margin-top: 10px;">
+            <el-tag
+              v-if="selectedFolder"
+              closable
+              @close="clearFolderFilter"
+              type="info"
+              style="margin-right: 8px;"
+            >
+              文件夹: {{ selectedFolder }}
+            </el-tag>
+            <el-tag
+              v-if="searchPrefix"
+              closable
+              @close="clearSearchFilter"
+              type="success"
+            >
+              搜索: {{ searchPrefix }}
+            </el-tag>
+          </div>
+        </el-card>
+
+        <!-- 文件列表 -->
+        <el-card>
+          <div style="margin-bottom: 16px;">
+            <el-text type="info">
+              共 {{ total }} 个文件
+              <span v-if="selectedFolder || searchPrefix">
+                （已过滤）
+              </span>
+            </el-text>
+          </div>
+          
+          <el-table 
+            :data="files" 
+            v-loading="loading"
+            style="width: 100%"
+          >
+            <el-table-column prop="name" label="文件名" min-width="200">
+              <template #default="scope">
+                <el-link 
+                  @click="showFileDetail(scope.row)"
+                  :underline="false"
+                  type="primary"
+                  style="cursor: pointer;"
+                >
+                  {{ scope.row.name }}
+                </el-link>
+              </template>
+            </el-table-column>
+            
+            <el-table-column prop="key" label="文件路径" min-width="250">
+              <template #default="scope">
+                <el-text type="info" style="font-size: 12px;">
+                  {{ scope.row.key }}
+                </el-text>
+              </template>
+            </el-table-column>
+            
+            <el-table-column prop="size" label="大小" width="120">
+              <template #default="scope">
+                {{ formatFileSize(scope.row.size) }}
+              </template>
+            </el-table-column>
+            
+            <el-table-column prop="last_modified" label="修改时间" width="180">
+              <template #default="scope">
+                {{ formatDate(scope.row.last_modified) }}
+              </template>
+            </el-table-column>
+            
+            <el-table-column label="操作" width="200">
+              <template #default="scope">
+                <el-button 
+                  size="small" 
+                  @click="downloadFile(scope.row)"
+                  type="primary"
+                >
+                  下载
+                </el-button>
+                <el-button 
+                  size="small" 
+                  type="danger" 
+                  @click="deleteFile(scope.row)"
+                >
+                  删除
+                </el-button>
+              </template>
+            </el-table-column>
+          </el-table>
+
+          <!-- 分页 -->
+          <div style="margin-top: 20px; text-align: center;">
+            <el-pagination
+              v-model:current-page="currentPage"
+              v-model:page-size="pageSize"
+              :page-sizes="[10, 20, 50, 100]"
+              :total="total"
+              layout="total, sizes, prev, pager, next, jumper"
+              @size-change="handleSizeChange"
+              @current-change="handleCurrentChange"
+            />
+          </div>
+        </el-card>
+      </el-main>
+    </el-container>
+
+    <!-- 文件详情弹窗 -->
+    <el-dialog
+      v-model="fileDetailVisible"
+      :title="'文件详情 - ' + (fileDetail?.name || '')"
+      width="70%"
+      :close-on-click-modal="false"
+    >
+      <div v-if="fileDetail" v-loading="fileDetailLoading">
+        <el-row :gutter="20">
+          <!-- 左侧：文件预览 -->
+          <el-col :span="12">
+            <el-card header="文件预览" style="height: 400px;">
+              <div class="preview-container">
+                <!-- 图片预览 -->
+                <div v-if="isImage(fileDetail.content_type)" class="image-preview">
+                  <el-image
+                    :src="fileDetail.url"
+                    fit="contain"
+                    style="max-width: 100%; max-height: 350px;"
+                    :preview-src-list="[fileDetail.url]"
+                  >
+                    <template #error>
+                      <div class="image-slot">
+                        <el-icon><Picture /></el-icon>
+                        <div>加载失败</div>
+                      </div>
+                    </template>
+                  </el-image>
+                </div>
+                
+                <!-- 文本文件预览 -->
+                <div v-else-if="isText(fileDetail.content_type)" class="text-preview">
+                  <el-input
+                    v-model="fileContent"
+                    type="textarea"
+                    :rows="15"
+                    readonly
+                    placeholder="加载中..."
+                  />
+                </div>
+                
+                <!-- 其他文件类型 -->
+                <div v-else class="file-icon">
+                  <el-icon size="80"><Document /></el-icon>
+                  <div style="margin-top: 10px; color: #999;">
+                    {{ getFileTypeText(fileDetail.content_type) }}
+                  </div>
+                </div>
+              </div>
+            </el-card>
+          </el-col>
+          
+          <!-- 右侧：文件信息 -->
+          <el-col :span="12">
+            <el-card header="文件信息" style="height: 400px; overflow-y: auto;">
+              <el-descriptions :column="1" border>
+                <el-descriptions-item label="文件名">
+                  <el-text>{{ fileDetail.name }}</el-text>
+                </el-descriptions-item>
+                
+                <el-descriptions-item label="文件路径">
+                  <el-text type="info">{{ fileDetail.key }}</el-text>
+                </el-descriptions-item>
+                
+                <el-descriptions-item label="所在文件夹">
+                  <el-tag type="warning">
+                    {{ getFileFolder(fileDetail.key) }}
+                  </el-tag>
+                </el-descriptions-item>
+                
+                <el-descriptions-item label="文件大小">
+                  <el-tag>{{ formatFileSize(fileDetail.size) }}</el-tag>
+                </el-descriptions-item>
+                
+                <el-descriptions-item label="文件类型">
+                  <el-tag type="success">{{ fileDetail.content_type }}</el-tag>
+                </el-descriptions-item>
+                
+                <el-descriptions-item label="最后修改">
+                  <el-text>{{ formatDate(fileDetail.last_modified) }}</el-text>
+                </el-descriptions-item>
+                
+                <el-descriptions-item label="ETag">
+                  <el-text type="info" style="font-family: monospace; font-size: 12px;">
+                    {{ fileDetail.etag }}
+                  </el-text>
+                </el-descriptions-item>
+                
+                <el-descriptions-item label="存储类型">
+                  <el-tag :type="getStorageClassType(fileDetail.storage_class)">
+                    {{ fileDetail.storage_class }}
+                  </el-tag>
+                </el-descriptions-item>
+                
+                <el-descriptions-item 
+                  v-if="fileDetail.server_side_encryption" 
+                  label="加密方式"
+                >
+                  <el-tag type="warning">{{ fileDetail.server_side_encryption }}</el-tag>
+                </el-descriptions-item>
+              </el-descriptions>
+
+              <!-- 元数据 -->
+              <div v-if="Object.keys(fileDetail.metadata).length > 0" style="margin-top: 20px;">
+                <el-divider content-position="left">元数据</el-divider>
+                <el-descriptions :column="1" border size="small">
+                  <el-descriptions-item 
+                    v-for="(value, key) in fileDetail.metadata" 
+                    :key="key" 
+                    :label="key"
+                  >
+                    <el-text>{{ value }}</el-text>
+                  </el-descriptions-item>
+                </el-descriptions>
+              </div>
+            </el-card>
+          </el-col>
+        </el-row>
+      </div>
+      
+      <template #footer>
+        <span class="dialog-footer">
+          <el-button @click="fileDetailVisible = false">关闭</el-button>
+          <el-button type="primary" @click="downloadFileFromDetail">
+            <el-icon><Download /></el-icon>
+            下载文件
+          </el-button>
+          <el-button 
+            type="success" 
+            @click="copyFileUrl"
+            v-if="fileDetail"
+          >
+            <el-icon><CopyDocument /></el-icon>
+            复制链接
+          </el-button>
+        </span>
+      </template>
+    </el-dialog>
+  </div>
+</template>
+
+<script>
+import { ref, onMounted, computed } from 'vue'
+import axios from 'axios'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { 
+  Upload, 
+  Search, 
+  Picture, 
+  Document, 
+  Download, 
+  CopyDocument 
+} from '@element-plus/icons-vue'
+
+export default {
+  name: 'App',
+  components: {
+    Upload,
+    Search,
+    Picture,
+    Document,
+    Download,
+    CopyDocument
+  },
+  setup() {
+    // 原有的响应式数据
+    const files = ref([])
+    const loading = ref(false)
+    const currentPage = ref(1)
+    const pageSize = ref(10)
+    const total = ref(0)
+    const searchPrefix = ref('')
+    const folders = ref([])
+    const selectedFolder = ref('')
+    
+    // 文件详情相关
+    const fileDetailVisible = ref(false)
+    const fileDetail = ref(null)
+    const fileDetailLoading = ref(false)
+    const fileContent = ref('')
+    
+    // 上传相关数据
+    const showUploadSettings = ref(false)
+    const uploadFolder = ref('')
+    const keepOriginalName = ref(false)
+    const fileList = ref([])
+    const uploading = ref(false)
+    const uploadRef = ref(null)
+    
+    const baseURL = 'http://localhost:8000'
+    const uploadUrl = `${baseURL}/api/upload/batch`
+
+    let searchTimeout = null
+
+    // 计算属性
+    const totalFiles = computed(() => {
+      return folders.value.reduce((sum, folder) => sum + folder.count, 0)
+    })
+
+    const uploadData = computed(() => ({
+      folder: uploadFolder.value,
+      keep_original_name: keepOriginalName.value
+    }))
+
+    // 获取上传路径预览
+    const getUploadPath = (filename) => {
+      const folder = uploadFolder.value
+      if (folder) {
+        return `${folder}/${filename}`
+      }
+      return filename
+    }
+
+    // 调试方法
+    const logFolderData = () => {
+      console.log('当前文件夹列表:', folders.value)
+      console.log('总文件数:', totalFiles.value)
+      console.log('选中的文件夹:', selectedFolder.value)
+    }
+
+    // 加载文件夹列表
+    const loadFolders = async () => {
+      try {
+        console.log('开始加载文件夹列表...')
+        const response = await axios.get(`${baseURL}/api/folders`)
+        console.log('文件夹API响应:', response.data)
+        folders.value = response.data.folders
+        console.log('更新后的文件夹列表:', folders.value)
+      } catch (error) {
+        console.error('加载文件夹失败:', error)
+        ElMessage.error('加载文件夹失败')
+      }
+    }
+
+    // 手动刷新文件夹
+    const refreshFolders = async () => {
+      console.log('手动刷新文件夹列表')
+      await loadFolders()
+      ElMessage.success('文件夹列表已刷新')
+    }
+
+    // 加载文件列表
+    const loadFiles = async () => {
+      loading.value = true
+      try {
+        const params = {
+          page: currentPage.value,
+          page_size: pageSize.value
+        }
+        
+        if (searchPrefix.value) {
+          params.prefix = searchPrefix.value
+        }
+        
+        if (selectedFolder.value) {
+          params.folder = selectedFolder.value
+        }
+
+        console.log('加载文件，参数:', params)
+        const response = await axios.get(`${baseURL}/api/files`, { params })
+        
+        files.value = response.data.files
+        total.value = response.data.total
+        console.log(`加载了 ${response.data.files.length} 个文件，总计 ${response.data.total} 个`)
+        
+      } catch (error) {
+        console.error('加载文件失败:', error)
+        ElMessage.error('加载文件失败')
+      } finally {
+        loading.value = false
+      }
+    }
+
+    // 搜索文件
+    const searchFiles = () => {
+      if (searchTimeout) {
+        clearTimeout(searchTimeout)
+      }
+      
+      searchTimeout = setTimeout(() => {
+        currentPage.value = 1
+        loadFiles()
+      }, 300)
+    }
+
+    // 文件夹改变处理
+    const handleFolderChange = () => {
+      currentPage.value = 1
+      loadFiles()
+    }
+
+    // 清空过滤器
+    const clearFilters = () => {
+      selectedFolder.value = ''
+      searchPrefix.value = ''
+      currentPage.value = 1
+      loadFiles()
+    }
+
+    // 清空文件夹过滤
+    const clearFolderFilter = () => {
+      selectedFolder.value = ''
+      currentPage.value = 1
+      loadFiles()
+    }
+
+    // 清空搜索过滤
+    const clearSearchFilter = () => {
+      searchPrefix.value = ''
+      currentPage.value = 1
+      loadFiles()
+    }
+
+    // 获取文件所在文件夹
+    const getFileFolder = (filePath) => {
+      if (filePath.includes('/')) {
+        return filePath.split('/')[0]
+      }
+      return '根目录'
+    }
+
+    // 上传相关方法
+    const handleFileChange = (file, fileListData) => {
+      fileList.value = fileListData
+      console.log('文件列表更新:', fileList.value.length)
+    }
+
+    const beforeUpload = (file) => {
+      const isLt100M = file.size / 1024 / 1024 < 100
+      if (!isLt100M) {
+        ElMessage.error('文件大小不能超过 100MB!')
+        return false
+      }
+      return false // 阻止自动上传
+    }
+
+    const submitUpload = async () => {
+      if (fileList.value.length === 0) {
+        ElMessage.warning('请先选择文件')
+        return
+      }
+
+      uploading.value = true
+      
+      try {
+        const formData = new FormData()
+        
+        // 添加文件
+        fileList.value.forEach(file => {
+          formData.append('files', file.raw)
+        })
+        
+        // 添加参数
+        if (uploadFolder.value) {
+          formData.append('folder', uploadFolder.value)
+        }
+        formData.append('keep_original_name', keepOriginalName.value)
+
+        console.log('开始上传文件到文件夹:', uploadFolder.value || '根目录')
+        console.log('文件数量:', fileList.value.length)
+        
+        const response = await axios.post(`${baseURL}/api/upload/batch`, formData, {
+          headers: {
+            'Content-Type': 'multipart/form-data'
+          }
+        })
+
+        console.log('上传响应:', response.data)
+
+        if (response.data.success) {
+          ElMessage.success(response.data.message)
+        } else {
+          ElMessage.warning(response.data.message)
+          if (response.data.failed_files.length > 0) {
+            console.error('上传失败的文件:', response.data.failed_files)
+          }
+        }
+
+        // 清空文件列表
+        clearFiles()
+        
+        // 延迟刷新确保S3数据同步
+        console.log('开始刷新数据...')
+        setTimeout(async () => {
+          await loadFolders()
+          await loadFiles()
+          
+          // 如果上传到了新文件夹，自动选择该文件夹
+          if (uploadFolder.value && !selectedFolder.value) {
+            const targetFolder = uploadFolder.value.split('/')[0]
+            console.log('自动选择文件夹:', targetFolder)
+            selectedFolder.value = targetFolder
+            setTimeout(() => {
+              loadFiles()
+            }, 500)
+          }
+        }, 1500) // 延迟1.5秒
+
+      } catch (error) {
+        console.error('上传失败:', error)
+        ElMessage.error('文件上传失败')
+      } finally {
+        uploading.value = false
+      }
+    }
+
+    const clearFiles = () => {
+      fileList.value = []
+      if (uploadRef.value) {
+        uploadRef.value.clearFiles()
+      }
+    }
+
+    const removeFile = (index) => {
+      fileList.value.splice(index, 1)
+    }
+
+    const handleUploadSuccess = (response) => {
+      // 这个方法现在不会被调用，因为我们使用手动上传
+    }
+
+    const handleUploadError = (error) => {
+      console.error('上传失败:', error)
+      ElMessage.error('文件上传失败')
+    }
+
+    // 文件操作方法
+    const deleteFile = async (file) => {
+      try {
+        await ElMessageBox.confirm(
+          `确定要删除文件 "${file.name}" 吗？`,
+          '确认删除',
+          {
+            confirmButtonText: '确定',
+            cancelButtonText: '取消',
+            type: 'warning',
+          }
+        )
+
+        await axios.delete(`${baseURL}/api/files/${file.key}`)
+        ElMessage.success('文件删除成功')
+        
+        // 刷新数据
+        await loadFiles()
+        await loadFolders()
+        
+      } catch (error) {
+        if (error !== 'cancel') {
+          console.error('删除失败:', error)
+          ElMessage.error('文件删除失败')
+        }
+      }
+    }
+
+    const downloadFile = (file) => {
+      window.open(`${baseURL}/api/download/${file.key}`, '_blank')
+    }
+
+    const handleSizeChange = (val) => {
+      pageSize.value = val
+      currentPage.value = 1
+      loadFiles()
+    }
+
+    const handleCurrentChange = (val) => {
+      currentPage.value = val
+      loadFiles()
+    }
+
+    // 工具方法
+    const formatFileSize = (bytes) => {
+      if (bytes === 0) return '0 Bytes'
+      const k = 1024
+      const sizes = ['Bytes', 'KB', 'MB', 'GB']
+      const i = Math.floor(Math.log(bytes) / Math.log(k))
+      return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i]
+    }
+
+    const formatDate = (dateString) => {
+      return new Date(dateString).toLocaleString('zh-CN')
+    }
+
+    // 文件详情相关方法
+    const showFileDetail = async (file) => {
+      fileDetailVisible.value = true
+      fileDetailLoading.value = true
+      fileContent.value = ''
+      
+      try {
+        const response = await axios.get(`${baseURL}/api/files/${file.key}/detail`)
+        fileDetail.value = response.data
+        
+        if (isText(response.data.content_type) && response.data.size < 1024 * 1024) {
+          try {
+            const contentResponse = await axios.get(response.data.url)
+            fileContent.value = contentResponse.data
+          } catch (error) {
+            fileContent.value = '无法加载文件内容'
+          }
+        }
+        
+      } catch (error) {
+        console.error('获取文件详情失败:', error)
+        ElMessage.error('获取文件详情失败')
+        fileDetailVisible.value = false
+      } finally {
+        fileDetailLoading.value = false
+      }
+    }
+
+    const isImage = (contentType) => {
+      return contentType && contentType.startsWith('image/')
+    }
+
+    const isText = (contentType) => {
+      return contentType && (
+        contentType.startsWith('text/') ||
+        contentType.includes('json') ||
+        contentType.includes('xml') ||
+        contentType.includes('javascript') ||
+        contentType.includes('css')
+      )
+    }
+
+    const getFileTypeText = (contentType) => {
+      if (contentType.includes('pdf')) return 'PDF 文档'
+      if (contentType.includes('word')) return 'Word 文档'
+      if (contentType.includes('excel')) return 'Excel 表格'
+      if (contentType.includes('powerpoint')) return 'PowerPoint 演示文稿'
+      if (contentType.includes('zip')) return '压缩文件'
+      if (contentType.includes('video')) return '视频文件'
+      if (contentType.includes('audio')) return '音频文件'
+      return '其他文件'
+    }
+
+    const getStorageClassType = (storageClass) => {
+      const typeMap = {
+        'STANDARD': '',
+        'STANDARD_IA': 'info',
+        'ONEZONE_IA': 'warning',
+        'GLACIER': 'success',
+        'DEEP_ARCHIVE': 'danger'
+      }
+      return typeMap[storageClass] || 'info'
+    }
+
+    const downloadFileFromDetail = () => {
+      if (fileDetail.value) {
+        window.open(fileDetail.value.download_url, '_blank')
+      }
+    }
+
+    const copyFileUrl = async () => {
+      if (fileDetail.value) {
+        try {
+          await navigator.clipboard.writeText(fileDetail.value.url)
+          ElMessage.success('链接已复制到剪贴板')
+        } catch (error) {
+          const textArea = document.createElement('textarea')
+          textArea.value = fileDetail.value.url
+          document.body.appendChild(textArea)
+          textArea.select()
+          document.execCommand('copy')
+          document.body.removeChild(textArea)
+          ElMessage.success('链接已复制到剪贴板')
+        }
+      }
+    }
+
+    // 组件挂载
+    onMounted(() => {
+      console.log('组件已挂载，开始初始化数据')
+      loadFolders()
+      loadFiles()
+    })
+
+    return {
+      // 数据
+      files,
+      loading,
+      currentPage,
+      pageSize,
+      total,
+      searchPrefix,
+      folders,
+      selectedFolder,
+      totalFiles,
+      
+      // 文件详情
+      fileDetailVisible,
+      fileDetail,
+      fileDetailLoading,
+      fileContent,
+      
+      // 上传相关
+      showUploadSettings,
+      uploadFolder,
+      keepOriginalName,
+      fileList,
+      uploading,
+      uploadRef,
+      uploadUrl,
+      uploadData,
+      
+      // 方法
+      loadFolders,
+      refreshFolders,
+      loadFiles,
+      searchFiles,
+      handleFolderChange,
+      clearFilters,
+      clearFolderFilter,
+      clearSearchFilter,
+      getFileFolder,
+      deleteFile,
+      downloadFile,
+      handleSizeChange,
+      handleCurrentChange,
+      formatFileSize,
+      formatDate,
+      showFileDetail,
+      isImage,
+      isText,
+      getFileTypeText,
+      getStorageClassType,
+      downloadFileFromDetail,
+      copyFileUrl,
+      
+      // 上传方法
+      getUploadPath,
+      handleFileChange,
+      beforeUpload,
+      submitUpload,
+      clearFiles,
+      removeFile,
+      handleUploadSuccess,
+      handleUploadError,
+      
+      // 调试方法
+      logFolderData
+    }
   }
 }
+</script>
 
-// 添加一个手动刷新文件夹的方法
-const refreshFolders = async () => {
-  console.log('手动刷新文件夹列表')
-  await loadFolders()
-  ElMessage.success('文件夹列表已刷新')
+<style>
+#app {
+  font-family: Avenir, Helvetica, Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
+
+.el-header {
+  background-color: #409EFF;
+  color: white;
+  display: flex;
+  align-items: center;
+}
+
+.el-header h1 {
+  margin: 0;
+}
+
+.upload-card .el-upload-dragger {
+  width: 100%;
+}
+
+.preview-container {
+  height: 350px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+}
+
+.image-preview {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.image-slot {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  color: #999;
+}
+
+.text-preview {
+  width: 100%;
+  height: 100%;
+}
+
+.file-icon {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  color: #999;
+}
+
+.dialog-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+</style>
 ```
 
-### 4. 在模板中添加调试按钮
+这个完整的代码包含了以下功能和修复：
 
-在搜索区域添加一个调试按钮：
+1. **完整的文件上传功能** - 支持指定路径上传
+2. **文件夹过滤和搜索** - 动态加载文件夹列表
+3. **文件详情查看** - 支持图片和文本预览
+4. **调试功能** - 包含控制台日志和手动刷新按钮
+5. **错误处理** - 完善的错误提示和处理机制
+6. **延迟刷新机制** - 确保S3数据同步后再刷新页面
+7. **自动文件夹选择** - 上传后自动跳转到目标文件夹
 
-```vue
-<!-- 在搜索和过滤区域的按钮组中添加 -->
-<el-col :span="6">
-  <el-button type="primary" @click="loadFiles">刷新文件</el-button>
-  <el-button type="success" @click="refreshFolders">刷新文件夹</el-button>
-  <el-button @click="clearFilters">清空过滤</el-button>
-</el-col>
-```
+调试建议：
+1. 打开浏览器开发者工具查看控制台输出
+2. 上传文件后观察控制台的日志信息
+3. 使用"刷新文件夹"按钮手动测试文件夹列表更新
+4. 点击"查看详情"按钮查看当前文件夹数据状态
 
-### 5. 添加调试信息显示
-
-在文件夹选择器下方添加调试信息：
-
-```vue
-<!-- 在文件夹选择器后添加调试信息 -->
-<el-col :span="8">
-  <el-select
-    v-model="selectedFolder"
-    placeholder="选择文件夹"
-    clearable
-    @change="handleFolderChange"
-    style="width: 100%"
-  >
-    <el-option label="全部文件夹" value="">
-      <span style="float: left">全部文件夹</span>
-      <span style="float: right; color: #8492a6; font-size: 13px">
-        {{ totalFiles }}
-      </span>
-    </el-option>
-    <el-option
-      v-for="folder in folders"
-      :key="folder.name"
-      :label="folder.name"
-      :value="folder.name"
-    >
-      <span style="float: left">{{ folder.name }}</span>
-      <span style="float: right; color: #8492a6; font-size: 13px">
-        {{ folder.count }}
-      </span>
-    </el-option>
-  </el-select>
-  
-  <!-- 调试信息 -->
-  <div style="margin-top: 4px; font-size: 12px; color: #999;">
-    当前文件夹数量: {{ folders.length }}
-    <el-button type="text" size="small" @click="console.log('文件夹列表:', folders)">
-      查看详情
-    </el-button>
-  </div>
-</el-col>
-```
-
-### 6. 完整的调试步骤
-
-1. **检查浏览器控制台**：
-   - 打开开发者工具
-   - 查看上传时的console.log输出
-   - 检查是否有API请求错误
-
-2. **手动测试API**：
-   ```bash
-   # 直接访问文件夹API
-   curl http://localhost:8000/api/folders
-   ```
-
-3. **检查S3存储桶**：
-   - 直接登录AWS控制台查看文件是否真的上传到了指定路径
-
-4. **测试步骤**：
-   - 上传文件到新文件夹（如 "test-folder"）
-   - 点击"刷新文件夹"按钮
-   - 查看控制台输出
-   - 检查下拉列表是否更新
-
-### 7. 如果问题仍然存在
-
-如果上述修复不起作用，请提供：
-
-1. **浏览器控制台的完整输出**
-2. **直接访问 `http://localhost:8000/api/folders` 的返回结果**
-3. **上传文件时的网络请求详情**
-
-这样我可以更准确地定位问题所在。
-
-尝试这些修复后，文件夹列表应该能正确更新了。记住点击"刷新文件夹"按钮来手动测试功能是否正常。
+如果问题仍然存在，请提供控制台的具体输出信息。
