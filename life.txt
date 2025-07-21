@@ -1,168 +1,38 @@
-我来为你创建一个完整的文件管理系统。以下是后端和前端的完整代码：
+当然可以！我来为你添加指定上传路径的功能。
 
-## 后端 (FastAPI)
+## 后端修改 (main.py)
 
-### 1. 依赖安装
-```bash
-pip install fastapi uvicorn boto3 python-multipart python-dotenv
-```
+修改上传API以支持路径参数：
 
-### 2. 环境配置文件 (.env)
-```env
-AWS_ACCESS_KEY_ID=your_access_key
-AWS_SECRET_ACCESS_KEY=your_secret_key
-AWS_REGION=us-east-1
-S3_BUCKET_NAME=your-bucket-name
-```
-
-### 3. 后端主文件 (main.py)
 ```python
-from fastapi import FastAPI, File, UploadFile, HTTPException, Query
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-import boto3
-from botocore.exceptions import ClientError
-import os
-from typing import Optional, List
-from pydantic import BaseModel
-import logging
-from datetime import datetime
-import io
-from dotenv import load_dotenv
-
-load_dotenv()
-
-# 配置日志
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-app = FastAPI(title="S3 File Manager", version="1.0.0")
-
-# CORS配置
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:8080"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# S3 配置
-AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
-AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
-AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
-S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME")
-
-# 初始化S3客户端
-s3_client = boto3.client(
-    's3',
-    aws_access_key_id=AWS_ACCESS_KEY_ID,
-    aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-    region_name=AWS_REGION
-)
-
-# 数据模型
-class FileInfo(BaseModel):
-    key: str
-    name: str
-    size: int
-    last_modified: str
-    url: str
-
-class FileListResponse(BaseModel):
-    files: List[FileInfo]
-    total: int
-    page: int
-    page_size: int
-    total_pages: int
-
-class DeleteResponse(BaseModel):
-    success: bool
-    message: str
-
-# API 路由
-@app.get("/")
-async def root():
-    return {"message": "S3 File Manager API"}
-
-@app.get("/api/files", response_model=FileListResponse)
-async def list_files(
-    page: int = Query(1, ge=1, description="页码"),
-    page_size: int = Query(10, ge=1, le=100, description="每页大小"),
-    prefix: Optional[str] = Query(None, description="文件前缀过滤")
-):
-    try:
-        # 构建查询参数
-        list_params = {
-            'Bucket': S3_BUCKET_NAME,
-            'MaxKeys': 1000  # 先获取更多数据用于分页
-        }
-        
-        if prefix:
-            list_params['Prefix'] = prefix
-
-        response = s3_client.list_objects_v2(**list_params)
-        
-        if 'Contents' not in response:
-            return FileListResponse(
-                files=[],
-                total=0,
-                page=page,
-                page_size=page_size,
-                total_pages=0
-            )
-
-        # 处理文件列表
-        all_files = []
-        for obj in response['Contents']:
-            # 生成预签名URL
-            url = s3_client.generate_presigned_url(
-                'get_object',
-                Params={'Bucket': S3_BUCKET_NAME, 'Key': obj['Key']},
-                ExpiresIn=3600
-            )
-            
-            file_info = FileInfo(
-                key=obj['Key'],
-                name=obj['Key'].split('/')[-1],
-                size=obj['Size'],
-                last_modified=obj['LastModified'].isoformat(),
-                url=url
-            )
-            all_files.append(file_info)
-
-        # 分页处理
-        total = len(all_files)
-        total_pages = (total + page_size - 1) // page_size
-        start_idx = (page - 1) * page_size
-        end_idx = start_idx + page_size
-        
-        paginated_files = all_files[start_idx:end_idx]
-
-        return FileListResponse(
-            files=paginated_files,
-            total=total,
-            page=page,
-            page_size=page_size,
-            total_pages=total_pages
-        )
-
-    except ClientError as e:
-        logger.error(f"S3 error: {e}")
-        raise HTTPException(status_code=500, detail=f"S3 error: {str(e)}")
-    except Exception as e:
-        logger.error(f"Unexpected error: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
-
+# 修改现有的上传API
 @app.post("/api/upload")
-async def upload_file(file: UploadFile = File(...)):
+async def upload_file(
+    file: UploadFile = File(...),
+    folder: Optional[str] = Form(None, description="上传文件夹路径"),
+    keep_original_name: bool = Form(False, description="是否保留原文件名")
+):
     try:
         # 读取文件内容
         file_content = await file.read()
         
-        # 生成文件key（可以包含时间戳避免重名）
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        file_key = f"{timestamp}_{file.filename}"
+        # 处理文件名
+        if keep_original_name:
+            filename = file.filename
+        else:
+            # 添加时间戳避免重名
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            file_extension = os.path.splitext(file.filename)[1]
+            base_name = os.path.splitext(file.filename)[0]
+            filename = f"{timestamp}_{base_name}{file_extension}"
+        
+        # 构建完整的文件key
+        if folder and folder.strip():
+            # 清理文件夹路径
+            folder = folder.strip().strip('/')
+            file_key = f"{folder}/{filename}"
+        else:
+            file_key = filename
         
         # 上传到S3
         s3_client.put_object(
@@ -178,8 +48,9 @@ async def upload_file(file: UploadFile = File(...)):
             "success": True,
             "message": "File uploaded successfully",
             "file_key": file_key,
-            "file_name": file.filename,
-            "file_size": len(file_content)
+            "file_name": filename,
+            "file_size": len(file_content),
+            "folder": folder or "根目录"
         }
 
     except ClientError as e:
@@ -189,69 +60,79 @@ async def upload_file(file: UploadFile = File(...)):
         logger.error(f"Upload error: {e}")
         raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
 
-@app.delete("/api/files/{file_key:path}", response_model=DeleteResponse)
-async def delete_file(file_key: str):
+# 新增：批量上传API
+@app.post("/api/upload/batch")
+async def upload_multiple_files(
+    files: List[UploadFile] = File(...),
+    folder: Optional[str] = Form(None, description="上传文件夹路径"),
+    keep_original_name: bool = Form(False, description="是否保留原文件名")
+):
     try:
-        # 删除S3文件
-        s3_client.delete_object(Bucket=S3_BUCKET_NAME, Key=file_key)
+        results = []
+        failed_files = []
         
-        logger.info(f"File deleted successfully: {file_key}")
+        for file in files:
+            try:
+                # 读取文件内容
+                file_content = await file.read()
+                
+                # 处理文件名
+                if keep_original_name:
+                    filename = file.filename
+                else:
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]  # 添加毫秒避免批量上传重名
+                    file_extension = os.path.splitext(file.filename)[1]
+                    base_name = os.path.splitext(file.filename)[0]
+                    filename = f"{timestamp}_{base_name}{file_extension}"
+                
+                # 构建完整的文件key
+                if folder and folder.strip():
+                    folder_clean = folder.strip().strip('/')
+                    file_key = f"{folder_clean}/{filename}"
+                else:
+                    file_key = filename
+                
+                # 上传到S3
+                s3_client.put_object(
+                    Bucket=S3_BUCKET_NAME,
+                    Key=file_key,
+                    Body=file_content,
+                    ContentType=file.content_type or 'application/octet-stream'
+                )
+                
+                results.append({
+                    "file_name": file.filename,
+                    "file_key": file_key,
+                    "file_size": len(file_content),
+                    "success": True
+                })
+                
+            except Exception as e:
+                failed_files.append({
+                    "file_name": file.filename,
+                    "error": str(e),
+                    "success": False
+                })
         
-        return DeleteResponse(
-            success=True,
-            message=f"File '{file_key}' deleted successfully"
-        )
+        logger.info(f"Batch upload completed. Success: {len(results)}, Failed: {len(failed_files)}")
+        
+        return {
+            "success": len(failed_files) == 0,
+            "message": f"上传完成。成功：{len(results)}个，失败：{len(failed_files)}个",
+            "results": results,
+            "failed_files": failed_files,
+            "folder": folder or "根目录"
+        }
 
-    except ClientError as e:
-        logger.error(f"S3 delete error: {e}")
-        raise HTTPException(status_code=500, detail=f"Delete failed: {str(e)}")
     except Exception as e:
-        logger.error(f"Delete error: {e}")
-        raise HTTPException(status_code=500, detail=f"Delete failed: {str(e)}")
-
-@app.get("/api/download/{file_key:path}")
-async def download_file(file_key: str):
-    try:
-        # 从S3获取文件
-        response = s3_client.get_object(Bucket=S3_BUCKET_NAME, Key=file_key)
-        
-        # 创建流式响应
-        def iterfile():
-            yield response['Body'].read()
-
-        filename = file_key.split('/')[-1]
-        
-        return StreamingResponse(
-            iterfile(),
-            media_type='application/octet-stream',
-            headers={"Content-Disposition": f"attachment; filename={filename}"}
-        )
-
-    except ClientError as e:
-        if e.response['Error']['Code'] == 'NoSuchKey':
-            raise HTTPException(status_code=404, detail="File not found")
-        logger.error(f"S3 download error: {e}")
-        raise HTTPException(status_code=500, detail=f"Download failed: {str(e)}")
-    except Exception as e:
-        logger.error(f"Download error: {e}")
-        raise HTTPException(status_code=500, detail=f"Download failed: {str(e)}")
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+        logger.error(f"Batch upload error: {e}")
+        raise HTTPException(status_code=500, detail=f"Batch upload failed: {str(e)}")
 ```
 
-## 前端 (Vue.js)
+## 前端修改 (src/App.vue)
 
-### 1. 创建Vue项目并安装依赖
-```bash
-npm create vue@latest s3-file-manager
-cd s3-file-manager
-npm install
-npm install axios element-plus
-```
+完全替换App.vue中的上传部分和相关逻辑：
 
-### 2. 主组件 (src/App.vue)
 ```vue
 <template>
   <div id="app">
@@ -263,26 +144,163 @@ npm install axios element-plus
       <el-main>
         <!-- 上传区域 -->
         <el-card class="upload-card" style="margin-bottom: 20px;">
+          <template #header>
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+              <span>文件上传</span>
+              <el-button 
+                type="text" 
+                @click="showUploadSettings = !showUploadSettings"
+                :icon="showUploadSettings ? 'ArrowUp' : 'ArrowDown'"
+              >
+                上传设置
+              </el-button>
+            </div>
+          </template>
+          
+          <!-- 上传设置 -->
+          <div v-show="showUploadSettings" style="margin-bottom: 20px; padding: 16px; background-color: #f9f9f9; border-radius: 4px;">
+            <el-row :gutter="20">
+              <el-col :span="12">
+                <el-form-item label="上传到文件夹：">
+                  <el-select
+                    v-model="uploadFolder"
+                    placeholder="选择文件夹或输入新路径"
+                    filterable
+                    allow-create
+                    clearable
+                    style="width: 100%"
+                  >
+                    <el-option label="根目录" value="" />
+                    <el-option
+                      v-for="folder in folders"
+                      :key="folder.name"
+                      :label="folder.name"
+                      :value="folder.name"
+                    />
+                  </el-select>
+                  <div style="margin-top: 4px; font-size: 12px; color: #999;">
+                    可选择现有文件夹或输入新的路径，如：images/2024
+                  </div>
+                </el-form-item>
+              </el-col>
+              <el-col :span="12">
+                <el-form-item label="文件名设置：">
+                  <el-radio-group v-model="keepOriginalName">
+                    <el-radio :label="true">保留原文件名</el-radio>
+                    <el-radio :label="false">添加时间戳</el-radio>
+                  </el-radio-group>
+                  <div style="margin-top: 4px; font-size: 12px; color: #999;">
+                    添加时间戳可避免文件名冲突
+                  </div>
+                </el-form-item>
+              </el-col>
+            </el-row>
+          </div>
+
+          <!-- 上传组件 -->
           <el-upload
+            ref="uploadRef"
             class="upload-demo"
             :action="uploadUrl"
+            :data="uploadData"
             :on-success="handleUploadSuccess"
             :on-error="handleUploadError"
             :before-upload="beforeUpload"
+            :on-change="handleFileChange"
             drag
             multiple
+            :auto-upload="false"
           >
             <el-icon class="el-icon--upload"><Upload /></el-icon>
             <div class="el-upload__text">
-              将文件拖到此处，或<em>点击上传</em>
+              将文件拖到此处，或<em>点击选择文件</em>
             </div>
+            <template #tip>
+              <div class="el-upload__tip">
+                <div>支持多文件上传，单个文件大小限制100MB</div>
+                <div v-if="uploadFolder" style="color: #409EFF;">
+                  将上传到：{{ uploadFolder || '根目录' }}
+                </div>
+              </div>
+            </template>
           </el-upload>
+          
+          <!-- 上传操作按钮 -->
+          <div v-if="fileList.length > 0" style="margin-top: 16px;">
+            <el-button type="primary" @click="submitUpload" :loading="uploading">
+              <el-icon><Upload /></el-icon>
+              上传文件 ({{ fileList.length }}个)
+            </el-button>
+            <el-button @click="clearFiles">清空列表</el-button>
+          </div>
+          
+          <!-- 文件列表 -->
+          <div v-if="fileList.length > 0" style="margin-top: 16px;">
+            <el-divider content-position="left">待上传文件</el-divider>
+            <el-table :data="fileList" size="small">
+              <el-table-column prop="name" label="文件名" />
+              <el-table-column prop="size" label="大小" width="100">
+                <template #default="scope">
+                  {{ formatFileSize(scope.row.size) }}
+                </template>
+              </el-table-column>
+              <el-table-column label="预览路径" min-width="200">
+                <template #default="scope">
+                  <el-text type="info" style="font-size: 12px;">
+                    {{ getUploadPath(scope.row.name) }}
+                  </el-text>
+                </template>
+              </el-table-column>
+              <el-table-column label="操作" width="80">
+                <template #default="scope">
+                  <el-button 
+                    type="danger" 
+                    size="small" 
+                    @click="removeFile(scope.$index)"
+                    text
+                  >
+                    移除
+                  </el-button>
+                </template>
+              </el-table-column>
+            </el-table>
+          </div>
         </el-card>
 
-        <!-- 搜索区域 -->
+        <!-- 搜索和过滤区域 -->
         <el-card style="margin-bottom: 20px;">
           <el-row :gutter="20">
-            <el-col :span="12">
+            <el-col :span="8">
+              <el-select
+                v-model="selectedFolder"
+                placeholder="选择文件夹"
+                clearable
+                @change="handleFolderChange"
+                style="width: 100%"
+              >
+                <el-option
+                  label="全部文件夹"
+                  value=""
+                >
+                  <span style="float: left">全部文件夹</span>
+                  <span style="float: right; color: #8492a6; font-size: 13px">
+                    {{ totalFiles }}
+                  </span>
+                </el-option>
+                <el-option
+                  v-for="folder in folders"
+                  :key="folder.name"
+                  :label="folder.name"
+                  :value="folder.name"
+                >
+                  <span style="float: left">{{ folder.name }}</span>
+                  <span style="float: right; color: #8492a6; font-size: 13px">
+                    {{ folder.count }}
+                  </span>
+                </el-option>
+              </el-select>
+            </el-col>
+            <el-col :span="10">
               <el-input
                 v-model="searchPrefix"
                 placeholder="输入文件名前缀搜索"
@@ -296,12 +314,43 @@ npm install axios element-plus
             </el-col>
             <el-col :span="6">
               <el-button type="primary" @click="loadFiles">刷新</el-button>
+              <el-button @click="clearFilters">清空过滤</el-button>
             </el-col>
           </el-row>
+          
+          <!-- 当前过滤状态显示 -->
+          <div v-if="selectedFolder || searchPrefix" style="margin-top: 10px;">
+            <el-tag
+              v-if="selectedFolder"
+              closable
+              @close="clearFolderFilter"
+              type="info"
+              style="margin-right: 8px;"
+            >
+              文件夹: {{ selectedFolder }}
+            </el-tag>
+            <el-tag
+              v-if="searchPrefix"
+              closable
+              @close="clearSearchFilter"
+              type="success"
+            >
+              搜索: {{ searchPrefix }}
+            </el-tag>
+          </div>
         </el-card>
 
         <!-- 文件列表 -->
         <el-card>
+          <div style="margin-bottom: 16px;">
+            <el-text type="info">
+              共 {{ total }} 个文件
+              <span v-if="selectedFolder || searchPrefix">
+                （已过滤）
+              </span>
+            </el-text>
+          </div>
+          
           <el-table 
             :data="files" 
             v-loading="loading"
@@ -309,9 +358,22 @@ npm install axios element-plus
           >
             <el-table-column prop="name" label="文件名" min-width="200">
               <template #default="scope">
-                <el-link :href="scope.row.url" target="_blank">
+                <el-link 
+                  @click="showFileDetail(scope.row)"
+                  :underline="false"
+                  type="primary"
+                  style="cursor: pointer;"
+                >
                   {{ scope.row.name }}
                 </el-link>
+              </template>
+            </el-table-column>
+            
+            <el-table-column prop="key" label="文件路径" min-width="250">
+              <template #default="scope">
+                <el-text type="info" style="font-size: 12px;">
+                  {{ scope.row.key }}
+                </el-text>
               </template>
             </el-table-column>
             
@@ -362,38 +424,325 @@ npm install axios element-plus
         </el-card>
       </el-main>
     </el-container>
+
+    <!-- 文件详情弹窗（保持不变） -->
+    <el-dialog
+      v-model="fileDetailVisible"
+      :title="'文件详情 - ' + (fileDetail?.name || '')"
+      width="70%"
+      :close-on-click-modal="false"
+    >
+      <!-- 文件详情内容保持不变 -->
+      <div v-if="fileDetail" v-loading="fileDetailLoading">
+        <el-row :gutter="20">
+          <!-- 左侧：文件预览 -->
+          <el-col :span="12">
+            <el-card header="文件预览" style="height: 400px;">
+              <div class="preview-container">
+                <!-- 图片预览 -->
+                <div v-if="isImage(fileDetail.content_type)" class="image-preview">
+                  <el-image
+                    :src="fileDetail.url"
+                    fit="contain"
+                    style="max-width: 100%; max-height: 350px;"
+                    :preview-src-list="[fileDetail.url]"
+                  >
+                    <template #error>
+                      <div class="image-slot">
+                        <el-icon><Picture /></el-icon>
+                        <div>加载失败</div>
+                      </div>
+                    </template>
+                  </el-image>
+                </div>
+                
+                <!-- 文本文件预览 -->
+                <div v-else-if="isText(fileDetail.content_type)" class="text-preview">
+                  <el-input
+                    v-model="fileContent"
+                    type="textarea"
+                    :rows="15"
+                    readonly
+                    placeholder="加载中..."
+                  />
+                </div>
+                
+                <!-- 其他文件类型 -->
+                <div v-else class="file-icon">
+                  <el-icon size="80"><Document /></el-icon>
+                  <div style="margin-top: 10px; color: #999;">
+                    {{ getFileTypeText(fileDetail.content_type) }}
+                  </div>
+                </div>
+              </div>
+            </el-card>
+          </el-col>
+          
+          <!-- 右侧：文件信息 -->
+          <el-col :span="12">
+            <el-card header="文件信息" style="height: 400px; overflow-y: auto;">
+              <el-descriptions :column="1" border>
+                <el-descriptions-item label="文件名">
+                  <el-text>{{ fileDetail.name }}</el-text>
+                </el-descriptions-item>
+                
+                <el-descriptions-item label="文件路径">
+                  <el-text type="info">{{ fileDetail.key }}</el-text>
+                </el-descriptions-item>
+                
+                <el-descriptions-item label="所在文件夹">
+                  <el-tag type="warning">
+                    {{ getFileFolder(fileDetail.key) }}
+                  </el-tag>
+                </el-descriptions-item>
+                
+                <el-descriptions-item label="文件大小">
+                  <el-tag>{{ formatFileSize(fileDetail.size) }}</el-tag>
+                </el-descriptions-item>
+                
+                <el-descriptions-item label="文件类型">
+                  <el-tag type="success">{{ fileDetail.content_type }}</el-tag>
+                </el-descriptions-item>
+                
+                <el-descriptions-item label="最后修改">
+                  <el-text>{{ formatDate(fileDetail.last_modified) }}</el-text>
+                </el-descriptions-item>
+                
+                <el-descriptions-item label="ETag">
+                  <el-text type="info" style="font-family: monospace; font-size: 12px;">
+                    {{ fileDetail.etag }}
+                  </el-text>
+                </el-descriptions-item>
+                
+                <el-descriptions-item label="存储类型">
+                  <el-tag :type="getStorageClassType(fileDetail.storage_class)">
+                    {{ fileDetail.storage_class }}
+                  </el-tag>
+                </el-descriptions-item>
+                
+                <el-descriptions-item 
+                  v-if="fileDetail.server_side_encryption" 
+                  label="加密方式"
+                >
+                  <el-tag type="warning">{{ fileDetail.server_side_encryption }}</el-tag>
+                </el-descriptions-item>
+              </el-descriptions>
+
+              <!-- 元数据 -->
+              <div v-if="Object.keys(fileDetail.metadata).length > 0" style="margin-top: 20px;">
+                <el-divider content-position="left">元数据</el-divider>
+                <el-descriptions :column="1" border size="small">
+                  <el-descriptions-item 
+                    v-for="(value, key) in fileDetail.metadata" 
+                    :key="key" 
+                    :label="key"
+                  >
+                    <el-text>{{ value }}</el-text>
+                  </el-descriptions-item>
+                </el-descriptions>
+              </div>
+            </el-card>
+          </el-col>
+        </el-row>
+      </div>
+      
+      <template #footer>
+        <span class="dialog-footer">
+          <el-button @click="fileDetailVisible = false">关闭</el-button>
+          <el-button type="primary" @click="downloadFileFromDetail">
+            <el-icon><Download /></el-icon>
+            下载文件
+          </el-button>
+          <el-button 
+            type="success" 
+            @click="copyFileUrl"
+            v-if="fileDetail"
+          >
+            <el-icon><CopyDocument /></el-icon>
+            复制链接
+          </el-button>
+        </span>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
 <script>
-import { ref, onMounted, reactive } from 'vue'
+import { ref, onMounted, computed } from 'vue'
 import axios from 'axios'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Upload, Search } from '@element-plus/icons-vue'
+import { 
+  Upload, 
+  Search, 
+  Picture, 
+  Document, 
+  Download, 
+  CopyDocument 
+} from '@element-plus/icons-vue'
 
 export default {
   name: 'App',
   components: {
     Upload,
-    Search
+    Search,
+    Picture,
+    Document,
+    Download,
+    CopyDocument
   },
   setup() {
-    // 响应式数据
+    // 原有的响应式数据
     const files = ref([])
     const loading = ref(false)
     const currentPage = ref(1)
     const pageSize = ref(10)
     const total = ref(0)
     const searchPrefix = ref('')
+    const folders = ref([])
+    const selectedFolder = ref('')
     
-    // API基础URL
+    // 文件详情相关
+    const fileDetailVisible = ref(false)
+    const fileDetail = ref(null)
+    const fileDetailLoading = ref(false)
+    const fileContent = ref('')
+    
+    // 新增：上传相关数据
+    const showUploadSettings = ref(false)
+    const uploadFolder = ref('')
+    const keepOriginalName = ref(false)
+    const fileList = ref([])
+    const uploading = ref(false)
+    const uploadRef = ref(null)
+    
     const baseURL = 'http://localhost:8000'
-    const uploadUrl = `${baseURL}/api/upload`
+    const uploadUrl = `${baseURL}/api/upload/batch`
 
-    // 防抖搜索
     let searchTimeout = null
 
-    // 加载文件列表
+    // 计算属性
+    const totalFiles = computed(() => {
+      return folders.value.reduce((sum, folder) => sum + folder.count, 0)
+    })
+
+    const uploadData = computed(() => ({
+      folder: uploadFolder.value,
+      keep_original_name: keepOriginalName.value
+    }))
+
+    // 获取上传路径预览
+    const getUploadPath = (filename) => {
+      const folder = uploadFolder.value
+      if (folder) {
+        return `${folder}/${filename}`
+      }
+      return filename
+    }
+
+    // 上传相关方法
+    const handleFileChange = (file, fileListData) => {
+      fileList.value = fileListData
+    }
+
+    const beforeUpload = (file) => {
+      const isLt100M = file.size / 1024 / 1024 < 100
+      if (!isLt100M) {
+        ElMessage.error('文件大小不能超过 100MB!')
+        return false
+      }
+      return false // 阻止自动上传
+    }
+
+    const submitUpload = async () => {
+      if (fileList.value.length === 0) {
+        ElMessage.warning('请先选择文件')
+        return
+      }
+
+      uploading.value = true
+      
+      try {
+        const formData = new FormData()
+        
+        // 添加文件
+        fileList.value.forEach(file => {
+          formData.append('files', file.raw)
+        })
+        
+        // 添加参数
+        if (uploadFolder.value) {
+          formData.append('folder', uploadFolder.value)
+        }
+        formData.append('keep_original_name', keepOriginalName.value)
+
+        const response = await axios.post(`${baseURL}/api/upload/batch`, formData, {
+          headers: {
+            'Content-Type': 'multipart/form-data'
+          }
+        })
+
+        if (response.data.success) {
+          ElMessage.success(response.data.message)
+        } else {
+          ElMessage.warning(response.data.message)
+          if (response.data.failed_files.length > 0) {
+            console.error('Failed files:', response.data.failed_files)
+          }
+        }
+
+        // 清空文件列表
+        clearFiles()
+        
+        // 刷新页面数据
+        await loadFolders()
+        await loadFiles()
+        
+        // 如果上传到了新文件夹，自动选择该文件夹
+        if (uploadFolder.value && !selectedFolder.value) {
+          selectedFolder.value = uploadFolder.value.split('/')[0]
+          await loadFiles()
+        }
+
+      } catch (error) {
+        console.error('上传失败:', error)
+        ElMessage.error('文件上传失败')
+      } finally {
+        uploading.value = false
+      }
+    }
+
+    const clearFiles = () => {
+      fileList.value = []
+      if (uploadRef.value) {
+        uploadRef.value.clearFiles()
+      }
+    }
+
+    const removeFile = (index) => {
+      fileList.value.splice(index, 1)
+    }
+
+    // 原有方法保持不变，但是修改上传成功处理
+    const handleUploadSuccess = (response) => {
+      // 这个方法现在不会被调用，因为我们使用手动上传
+    }
+
+    const handleUploadError = (error) => {
+      console.error('上传失败:', error)
+      ElMessage.error('文件上传失败')
+    }
+
+    // 其他原有方法保持不变...
+    const loadFolders = async () => {
+      try {
+        const response = await axios.get(`${baseURL}/api/folders`)
+        folders.value = response.data.folders
+      } catch (error) {
+        console.error('加载文件夹失败:', error)
+        ElMessage.error('加载文件夹失败')
+      }
+    }
+
     const loadFiles = async () => {
       loading.value = true
       try {
@@ -404,6 +753,10 @@ export default {
         
         if (searchPrefix.value) {
           params.prefix = searchPrefix.value
+        }
+        
+        if (selectedFolder.value) {
+          params.folder = selectedFolder.value
         }
 
         const response = await axios.get(`${baseURL}/api/files`, { params })
@@ -419,7 +772,6 @@ export default {
       }
     }
 
-    // 搜索文件
     const searchFiles = () => {
       if (searchTimeout) {
         clearTimeout(searchTimeout)
@@ -431,29 +783,37 @@ export default {
       }, 300)
     }
 
-    // 文件上传成功
-    const handleUploadSuccess = (response) => {
-      ElMessage.success('文件上传成功')
+    const handleFolderChange = () => {
+      currentPage.value = 1
       loadFiles()
     }
 
-    // 文件上传失败
-    const handleUploadError = (error) => {
-      console.error('上传失败:', error)
-      ElMessage.error('文件上传失败')
+    const clearFilters = () => {
+      selectedFolder.value = ''
+      searchPrefix.value = ''
+      currentPage.value = 1
+      loadFiles()
     }
 
-    // 上传前验证
-    const beforeUpload = (file) => {
-      const isLt100M = file.size / 1024 / 1024 < 100
-      if (!isLt100M) {
-        ElMessage.error('文件大小不能超过 100MB!')
-        return false
+    const clearFolderFilter = () => {
+      selectedFolder.value = ''
+      currentPage.value = 1
+      loadFiles()
+    }
+
+    const clearSearchFilter = () => {
+      searchPrefix.value = ''
+      currentPage.value = 1
+      loadFiles()
+    }
+
+    const getFileFolder = (filePath) => {
+      if (filePath.includes('/')) {
+        return filePath.split('/')[0]
       }
-      return true
+      return '根目录'
     }
 
-    // 删除文件
     const deleteFile = async (file) => {
       try {
         await ElMessageBox.confirm(
@@ -469,6 +829,7 @@ export default {
         await axios.delete(`${baseURL}/api/files/${file.key}`)
         ElMessage.success('文件删除成功')
         loadFiles()
+        loadFolders()
         
       } catch (error) {
         if (error !== 'cancel') {
@@ -478,25 +839,21 @@ export default {
       }
     }
 
-    // 下载文件
     const downloadFile = (file) => {
       window.open(`${baseURL}/api/download/${file.key}`, '_blank')
     }
 
-    // 分页大小改变
     const handleSizeChange = (val) => {
       pageSize.value = val
       currentPage.value = 1
       loadFiles()
     }
 
-    // 当前页改变
     const handleCurrentChange = (val) => {
       currentPage.value = val
       loadFiles()
     }
 
-    // 格式化文件大小
     const formatFileSize = (bytes) => {
       if (bytes === 0) return '0 Bytes'
       const k = 1024
@@ -505,35 +862,161 @@ export default {
       return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i]
     }
 
-    // 格式化日期
     const formatDate = (dateString) => {
       return new Date(dateString).toLocaleString('zh-CN')
     }
 
-    // 组件挂载时加载数据
+    const showFileDetail = async (file) => {
+      fileDetailVisible.value = true
+      fileDetailLoading.value = true
+      fileContent.value = ''
+      
+      try {
+        const response = await axios.get(`${baseURL}/api/files/${file.key}/detail`)
+        fileDetail.value = response.data
+        
+        if (isText(response.data.content_type) && response.data.size < 1024 * 1024) {
+          try {
+            const contentResponse = await axios.get(response.data.url)
+            fileContent.value = contentResponse.data
+          } catch (error) {
+            fileContent.value = '无法加载文件内容'
+          }
+        }
+        
+      } catch (error) {
+        console.error('获取文件详情失败:', error)
+        ElMessage.error('获取文件详情失败')
+        fileDetailVisible.value = false
+      } finally {
+        fileDetailLoading.value = false
+      }
+    }
+
+    const isImage = (contentType) => {
+      return contentType && contentType.startsWith('image/')
+    }
+
+    const isText = (contentType) => {
+      return contentType && (
+        contentType.startsWith('text/') ||
+        contentType.includes('json') ||
+        contentType.includes('xml') ||
+        contentType.includes('javascript') ||
+        contentType.includes('css')
+      )
+    }
+
+    const getFileTypeText = (contentType) => {
+      if (contentType.includes('pdf')) return 'PDF 文档'
+      if (contentType.includes('word')) return 'Word 文档'
+      if (contentType.includes('excel')) return 'Excel 表格'
+      if (contentType.includes('powerpoint')) return 'PowerPoint 演示文稿'
+      if (contentType.includes('zip')) return '压缩文件'
+      if (contentType.includes('video')) return '视频文件'
+      if (contentType.includes('audio')) return '音频文件'
+      return '其他文件'
+    }
+
+    const getStorageClassType = (storageClass) => {
+      const typeMap = {
+        'STANDARD': '',
+        'STANDARD_IA': 'info',
+        'ONEZONE_IA': 'warning',
+        'GLACIER': 'success',
+        'DEEP_ARCHIVE': 'danger'
+      }
+      return typeMap[storageClass] || 'info'
+    }
+
+    const downloadFileFromDetail = () => {
+      if (fileDetail.value) {
+        window.open(fileDetail.value.download_url, '_blank')
+      }
+    }
+
+    const copyFileUrl = async () => {
+      if (fileDetail.value) {
+        try {
+          await navigator.clipboard.writeText(fileDetail.value.url)
+          ElMessage.success('链接已复制到剪贴板')
+        } catch (error) {
+          const textArea = document.createElement('textarea')
+          textArea.value = fileDetail.value.url
+          document.body.appendChild(textArea)
+          textArea.select()
+          document.execCommand('copy')
+          document.body.removeChild(textArea)
+          ElMessage.success('链接已复制到剪贴板')
+        }
+      }
+    }
+
     onMounted(() => {
+      loadFolders()
       loadFiles()
     })
 
     return {
+      // 原有数据
       files,
       loading,
       currentPage,
       pageSize,
       total,
       searchPrefix,
+      folders,
+      selectedFolder,
+      totalFiles,
+      
+      // 文件详情
+      fileDetailVisible,
+      fileDetail,
+      fileDetailLoading,
+      fileContent,
+      
+      // 新增上传相关
+      showUploadSettings,
+      uploadFolder,
+      keepOriginalName,
+      fileList,
+      uploading,
+      uploadRef,
       uploadUrl,
+      uploadData,
+      
+      // 方法
+      loadFolders,
       loadFiles,
       searchFiles,
-      handleUploadSuccess,
-      handleUploadError,
-      beforeUpload,
+      handleFolderChange,
+      clearFilters,
+      clearFolderFilter,
+      clearSearchFilter,
+      getFileFolder,
       deleteFile,
       downloadFile,
       handleSizeChange,
       handleCurrentChange,
       formatFileSize,
-      formatDate
+      formatDate,
+      showFileDetail,
+      isImage,
+      isText,
+      getFileTypeText,
+      getStorageClassType,
+      downloadFileFromDetail,
+      copyFileUrl,
+      
+      // 新增上传方法
+      getUploadPath,
+      handleFileChange,
+      beforeUpload,
+      submitUpload,
+      clearFiles,
+      removeFile,
+      handleUploadSuccess,
+      handleUploadError
     }
   }
 }
@@ -560,51 +1043,94 @@ export default {
 .upload-card .el-upload-dragger {
   width: 100%;
 }
+
+.preview-container {
+  height: 350px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+}
+
+.image-preview {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.image-slot {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  color: #999;
+}
+
+.text-preview {
+  width: 100%;
+  height: 100%;
+}
+
+.file-icon {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  color: #999;
+}
+
+.dialog-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
 </style>
 ```
 
-### 3. 入口文件 (src/main.js)
-```javascript
-import { createApp } from 'vue'
-import ElementPlus from 'element-plus'
-import 'element-plus/dist/index.css'
-import App from './App.vue'
+## 主要新增功能
 
-const app = createApp(App)
-app.use(ElementPlus)
-app.mount('#app')
-```
+### 1. 指定上传路径
+- **文件夹选择器**: 可以选择现有文件夹或输入新的路径
+- **路径创建**: 支持创建多级路径，如 `images/2024/january`
+- **根目录上传**: 可以选择上传到根目录
 
-## 运行说明
+### 2. 文件名处理选项
+- **保留原文件名**: 保持上传文件的原始名称
+- **添加时间戳**: 自动添加时间戳避免文件名冲突
 
-### 后端启动
-```bash
-# 确保已配置好 .env 文件
-python main.py
-# 或者
-uvicorn main:app --reload --host 0.0.0.0 --port 8000
-```
+### 3. 增强的上传体验
+- **批量上传**: 支持一次选择多个文件
+- **上传预览**: 显示待上传文件列表和预期路径
+- **手动上传**: 先选择文件和设置，再确认上传
+- **上传设置**: 可折叠的设置面板
 
-### 前端启动
-```bash
-npm run dev
-```
+### 4. 智能交互
+- **自动刷新**: 上传完成后自动刷新文件列表和文件夹列表
+- **自动跳转**: 上传到新文件夹后自动切换到该文件夹查看
+- **路径提示**: 实时显示文件的上传路径
 
-## 主要功能
+## 使用示例
 
-1. **文件上传**: 支持拖拽上传和点击上传，多文件上传
-2. **文件列表**: 分页显示文件，显示文件名、大小、修改时间
-3. **文件搜索**: 支持按文件名前缀搜索
-4. **文件下载**: 点击文件名或下载按钮下载文件
-5. **文件删除**: 删除前确认，防止误删
-6. **响应式设计**: 使用Element Plus组件库
+### 场景1：上传图片到指定文件夹
+1. 在上传设置中选择或输入 "images/photos"
+2. 选择"保留原文件名"
+3. 拖拽多张图片到上传区域
+4. 点击"上传文件"按钮
 
-## 注意事项
+结果：文件会上传到 `images/photos/` 目录下
 
-1. 确保AWS S3配置正确，包括访问密钥、区域和存储桶名称
-2. 存储桶需要适当的权限配置
-3. 生产环境中应该使用环境变量管理敏感信息
-4. 可以根据需要调整文件上传大小限制
-5. 预签名URL的过期时间可以根据需要调整
+### 场景2：批量上传文档
+1. 选择现有的 "documents" 文件夹
+2. 选择"添加时间戳"避免重名
+3. 选择多个文档文件
+4. 上传完成后自动跳转到documents文件夹查看
 
-这个系统提供了完整的S3文件管理功能，可以根据你的具体需求进行进一步定制。
+### 场景3：创建新的文件夹结构
+1. 在文件夹输入框输入 "projects/2024/website"
+2. 上传项目文件
+3. 系统会自动创建这个多级目录结构
+
+这个增强版本提供了完整的路径管理功能，让用户可以更好地组织S3中的文件结构。
