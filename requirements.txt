@@ -1,247 +1,81 @@
-package main
+import os
+import asyncio
+from datetime import datetime, timezone
 
-import (
-	"bytes"
-	"encoding/json"
-	"flag"
-	"fmt"
-	"io"
-	"log"
-	"net"
-	"net/http"
-	"sync"
-	"time"
-)
+import openai
+openai.api_key = os.getenv("OPENAI_API_KEY")
 
-// 配置信息
-type Config struct {
-	ProxyPort       int    `json:"proxyPort"`       // 代理监听的端口
-	ApiPort         int    `json:"apiPort"`         // API服务监听的端口
-	PgmakerEndpoint string `json:"pgmakerEndpoint"` // pgmaker的API端点
-}
+from graphiti_core import Graphiti
+from graphiti_core.nodes import EpisodeType
 
-// 数据库连接信息
-type DBCredentials struct {
-	Host     string `json:"host"`
-	Port     int    `json:"port"`
-	Username string `json:"username"`
-	Password string `json:"password"`
-	DBName   string `json:"dbname"`
-}
+class ChatMemoryAgent:
+    def __init__(self, neo4j_uri=None, user="neo4j", password=None, group_id="default"):
+        self.group_id = group_id
+        self.g = Graphiti(neo4j_uri, user, password)
 
-// 设置数据库凭据
-func (c *DBCredentials) Set(host string, port int, username, password, dbname string) {
-	c.Host = host
-	c.Port = port
-	c.Username = username
-	c.Password = password
-	c.DBName = dbname
-}
+    async def init(self):
+        await self.g.build_indices_and_constraints()
 
-// 获取数据库连接字符串
-func (c *DBCredentials) ConnectionString() string {
-	return fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=require",
-		c.Host, c.Port, c.Username, c.Password, c.DBName)
-}
+    async def process_message(self, query: str) -> str:
+        # 1. 从 Graphiti 检索与 query 相关的 facts（以 edge 形式返回）
+        results = await self.g.search(
+            query=query,
+            num_results=5,
+            group_ids=[self.group_id],
+            search_scope="edges"
+        )
 
-// 全局状态
-var (
-	config      Config
-	dbCreds     DBCredentials
-	dbCredMutex sync.RWMutex
-	isReady     bool = false
-	readyMutex  sync.RWMutex
-)
+        # 2. 构建提炼的 context 文本，注入系统 prompt
+        facts_text = "\n".join(f"- {r.fact}" for r in results if r.fact)
+        system_prompt = f"You are an assistant that remembers user history.\n\nRelevant facts:\n{facts_text or '＊无已知历史＊'}"
 
-func main() {
-	// 解析命令行参数
-	proxyPort := flag.Int("proxy-port", 5432, "Port for PostgreSQL proxy to listen on")
-	apiPort := flag.Int("api-port", 8080, "Port for API server to listen on")
-	pgmakerEndpoint := flag.String("pgmaker-endpoint", "https://nic-infra-router.uat.digital.gbm.cloud.uk.hsbc.9500/pgmaker/aimpg_db", "PGMaker endpoint URL")
-	flag.Parse()
+        # 3. 调用 LLM 生成回答
+        resp = openai.ChatCompletion.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": query}
+            ],
+            temperature=0.0
+        )
+        answer = resp.choices[0].message.content.strip()
 
-	config = Config{
-		ProxyPort:       *proxyPort,
-		ApiPort:         *apiPort,
-		PgmakerEndpoint: *pgmakerEndpoint,
-	}
+        # 4. 把此次对话 turn 添加为新的 memory episode
+        ep = f"User: {query}\nAssistant: {answer}"
+        await self.g.add_episode(
+            name=f"turn_{datetime.now(timezone.utc).timestamp()}",
+            episode_body=ep,
+            source=EpisodeType.message,
+            source_description="chat turn",
+            reference_time=datetime.now(timezone.utc),
+            group_id=self.group_id
+        )
 
-	// 启动API服务器
-	go startAPIServer()
+        return answer
 
-	// 注册到 pgmaker 服务
-	go registerToPGMaker()
+    async def close(self):
+        await self.g.close()
 
-	// 启动代理服务器
-	startProxyServer()
-}
+async def main():
+    ambot = ChatMemoryAgent(
+        neo4j_uri=os.getenv("NEO4J_URI"),
+        user=os.getenv("NEO4J_USER"),
+        password=os.getenv("NEO4J_PASSWORD"),
+        group_id="user_1234"
+    )
+    await ambot.init()
 
-// 启动API服务器，用于接收pgmaker的凭据更新
-func startAPIServer() {
-	// 将API路径更改为 /aimarkets_pgmaker/pg-secretes
-	http.HandleFunc("/aimarkets_pgmaker/pg-secretes", handleCredentialsUpdate)
-	http.HandleFunc("/health", handleHealthCheck)
+    questions = [
+        "我叫 Alice，我最喜欢机器学习。",
+        "请问我的名字是什么？",
+        "我喜欢什么领域？"
+    ]
 
-	log.Printf("API server listening on port %d", config.ApiPort)
-	if err := http.ListenAndServe(fmt.Sprintf(":%d", config.ApiPort), nil); err != nil {
-		log.Fatalf("Failed to start API server: %v", err)
-	}
-}
+    for q in questions:
+        a = await ambot.process_message(q)
+        print("→ Bot:", a, "\n")
 
-// 处理来自pgmaker的凭据更新请求
-func handleCredentialsUpdate(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
+    await ambot.close()
 
-	var newCreds DBCredentials
-	if err := json.NewDecoder(r.Body).Decode(&newCreds); err != nil {
-		http.Error(w, "Invalid request body", http.StatusBadRequest)
-		return
-	}
-
-	// 更新凭据
-	dbCredMutex.Lock()
-	dbCreds.Set(
-		newCreds.Host,
-		newCreds.Port,
-		newCreds.Username,
-		newCreds.Password,
-		newCreds.DBName,
-	)
-	dbCredMutex.Unlock()
-
-	// 标记服务就绪
-	readyMutex.Lock()
-	isReady = true
-	readyMutex.Unlock()
-
-	log.Printf("Credentials updated: host=%s, port=%d, user=%s, db=%s", 
-		newCreds.Host, newCreds.Port, newCreds.Username, newCreds.DBName)
-
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("Credentials updated successfully"))
-}
-
-// 健康检查端点
-func handleHealthCheck(w http.ResponseWriter, r *http.Request) {
-	readyMutex.RLock()
-	ready := isReady
-	readyMutex.RUnlock()
-
-	if ready {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("Service is ready"))
-	} else {
-		w.WriteHeader(http.StatusServiceUnavailable)
-		w.Write([]byte("Service is not ready yet"))
-	}
-}
-
-// 向pgmaker服务注册
-func registerToPGMaker() {
-	// 准备注册数据
-	registerData := map[string]interface{}{
-		// 更新API路径
-		"api_endpoint": fmt.Sprintf("http://localhost:%d/aimarkets_pgmaker/pg-secretes", config.ApiPort),
-	}
-	jsonData, err := json.Marshal(registerData)
-	if err != nil {
-		log.Fatalf("Failed to marshal registration data: %v", err)
-	}
-
-	// 发送注册请求
-	log.Printf("Registering with pgmaker at %s", config.PgmakerEndpoint)
-	resp, err := http.Post(config.PgmakerEndpoint, "application/json", bytes.NewBuffer(jsonData))
-	if err != nil {
-		log.Fatalf("Failed to register with pgmaker: %v", err)
-	}
-	defer resp.Body.Close()
-
-	// 检查响应
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		log.Fatalf("Registration failed with status %d: %s", resp.StatusCode, string(body))
-	}
-
-	log.Println("Successfully registered with pgmaker")
-
-	// 每小时重新注册，确保连接持续有效
-	ticker := time.NewTicker(50 * time.Minute)
-	for range ticker.C {
-		log.Println("Re-registering with pgmaker...")
-		resp, err := http.Post(config.PgmakerEndpoint, "application/json", bytes.NewBuffer(jsonData))
-		if err != nil {
-			log.Printf("Failed to re-register with pgmaker: %v", err)
-			continue
-		}
-		resp.Body.Close()
-		log.Println("Successfully re-registered with pgmaker")
-	}
-}
-
-// 启动代理服务器
-func startProxyServer() {
-	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", config.ProxyPort))
-	if err != nil {
-		log.Fatalf("Failed to start proxy server: %v", err)
-	}
-	defer listener.Close()
-
-	log.Printf("Proxy server listening on port %d", config.ProxyPort)
-
-	for {
-		clientConn, err := listener.Accept()
-		if err != nil {
-			log.Printf("Failed to accept connection: %v", err)
-			continue
-		}
-
-		go handleConnection(clientConn)
-	}
-}
-
-// 处理客户端连接
-func handleConnection(clientConn net.Conn) {
-	defer clientConn.Close()
-
-	// 等待服务就绪
-	readyMutex.RLock()
-	ready := isReady
-	readyMutex.RUnlock()
-
-	if !ready {
-		log.Println("Service not ready yet, rejecting connection")
-		return
-	}
-
-	// 获取当前有效的数据库凭据
-	dbCredMutex.RLock()
-	creds := dbCreds
-	dbCredMutex.RUnlock()
-
-	// 连接到PostgreSQL服务器
-	dbConn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", creds.Host, creds.Port))
-	if err != nil {
-		log.Printf("Failed to connect to PostgreSQL server: %v", err)
-		return
-	}
-	defer dbConn.Close()
-
-	log.Printf("New connection established to PostgreSQL at %s:%d", creds.Host, creds.Port)
-
-	// 在两个连接之间交换数据
-	errCh := make(chan error, 2)
-	go proxy(clientConn, dbConn, errCh)
-	go proxy(dbConn, clientConn, errCh)
-
-	// 等待任一方向出错或关闭
-	<-errCh
-}
-
-// 双向代理数据传输
-func proxy(dst net.Conn, src net.Conn, errCh chan error) {
-	_, err := io.Copy(dst, src)
-	errCh <- err
-}
+if __name__ == "__main__":
+    asyncio.run(main())
