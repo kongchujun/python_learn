@@ -132,3 +132,76 @@ if __name__=="__main__":
     # 用你的 NEO4J 连接详情
     client = Graphiti(os.getenv("NEO4J_URI"), os.getenv("NEO4J_USER"), os.getenv("NEO4J_PASSWORD"))
     asyncio.run(ingest_kb(sample_faqs, client))
+
+
+＃查询：
+import os, json
+import asyncio
+from graphiti_core import Graphiti
+from graphiti_core.nodes import EpisodeType
+from datetime import datetime, timezone
+import openai
+
+openai.api_key = os.getenv("OPENAI_API_KEY")
+
+class KBChatAgent:
+    def __init__(self, neo4j_uri, user, password, kb_group="kb"):
+        self.g = Graphiti(neo4j_uri, user, password)
+        self.kb_group = kb_group
+
+    async def init(self):
+        await self.g.build_indices_and_constraints()
+
+    async def answer_query(self, question: str) -> str:
+        # 1. 从知识库中检索 top‑5 相关 fact（默认 EDGE 混合检索: 向量 + BM25 + BFS）
+        res = await self.g.search(
+            query=question,
+            num_results=5,
+            group_ids=[self.kb_group],
+            search_scope="edges"
+        )
+        facts = [r.fact for r in res if r.fact]
+        facts_md = "\n".join(f"- {f}" for f in facts) or "＊未检索到相关知识＊"
+
+        # 2. 构造系统 prompt
+        prompt = (
+            "你是一个问答助手，查询以下 FAQ 知识：\n\n"
+            f"{facts_md}\n\n用户问题：{question}\n\n"
+            "若上方知识能回答用户问题，则直接回答。若没有覆盖，回答“对不起，我不知道”。"
+        )
+
+        resp = openai.ChatCompletion.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": question}
+            ],
+            temperature=0.0
+        )
+        answer = resp.choices[0].message.content.strip()
+
+        # 3. 可选：将问答对存入 Graphiti 做“对话记忆”
+        await self.g.add_episode(
+            name=f"qa_{datetime.now(timezone.utc).timestamp()}",
+            episode_body=json.dumps({"user": question, "assistant": answer}),
+            source=EpisodeType.message,
+            source_description="user‑kb chat turn",
+            reference_time=datetime.now(timezone.utc),
+            group_id="dialog"
+        )
+        return answer
+
+    async def close(self):
+        await self.g.close()
+
+
+async def run_demo():
+    agent = KBChatAgent(os.getenv("NEO4J_URI"), os.getenv("NEO4J_USER"), os.getenv("NEO4J_PASSWORD"))
+    await agent.init()
+    for qry in ["Graphiti 支持哪些搜索方法？", "如何定义实体类型？", "Graphiti 是否可以做图片识别？"]:
+        ans = await agent.answer_query(qry)
+        print(qry, "→", ans, "\n")
+    await agent.close()
+
+if __name__=="__main__":
+    asyncio.run(run_demo())
