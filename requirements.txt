@@ -79,3 +79,56 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+
+
+
+＝＝＝＝＝＝＝＝＝＝＝＝＝＝
+
+
+
+# knowledge_base_faqs.py
+sample_faqs = [
+  {
+    "id": "faq_001",
+    "question": "Graphiti 是什么？",
+    "answer": "Graphiti 是 Zep 提供的开源时序知识图谱引擎，用于 agent 長期記憶管理。",
+    "updated_at": "2025-07-31"
+  },
+  {
+    "id": "faq_002",
+    "question": "它支持哪些搜索方式？",
+    "answer": "支持混合检索：向量语义（cosine）、BM25、图遍历 BFS。",
+    "updated_at": "2024-12-18"
+  },
+  {
+    "id": "faq_003",
+    "question": "如何定义自定义实体类型？",
+    "answer": "通过 Pydantic model 定义 entity schema，即可让 Graphiti 自动对齐实体。",
+    "updated_at": "2025-03-24"
+  }
+]
+
+import asyncio
+from datetime import datetime, timezone
+from graphiti_core import Graphiti
+from graphiti_core.nodes import EpisodeType
+from knowledge_base_faqs import sample_faqs
+
+async def ingest_kb(kb, client: Graphiti, group_id="kb"):
+    await client.build_indices_and_constraints()
+    for faq in kb:
+        await client.add_episode(
+            name=faq["id"],
+            episode_body=faq,
+            source=EpisodeType.json,
+            source_description="FAQ knowledge source",
+            reference_time=datetime.fromisoformat(faq["updated_at"]).replace(tzinfo=timezone.utc),
+            group_id=group_id
+        )
+    print(f"[✅] Ingested {len(kb)} KB FAQs into group '{group_id}'")
+
+if __name__=="__main__":
+    # 用你的 NEO4J 连接详情
+    client = Graphiti(os.getenv("NEO4J_URI"), os.getenv("NEO4J_USER"), os.getenv("NEO4J_PASSWORD"))
+    asyncio.run(ingest_kb(sample_faqs, client))
