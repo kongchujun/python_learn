@@ -1,63 +1,16 @@
-import time
-import requests
-from multiprocessing import Process, Queue
-
-def run_server(q):
-    from fastapi import FastAPI, Request
-    import uvicorn
-
-    app = FastAPI()
-
-    @app.post("/callback")
-    async def callback(request: Request):
-        body = await request.json()
-        # 这里提取密码信息（假设整个 body 就是需要的内容，您可以修改为 body.get("password") 等）
-        password_info = body
-        q.put(password_info)  # 将提取的信息放入队列
-        return {"status": "ok"}
-
-    # 启动 FastAPI 服务器
-    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
-
-if __name__ == "__main__":
-    # 创建队列用于进程间通信
-    queue = Queue()
-
-    # 在子进程中启动 FastAPI 服务器
-    p = Process(target=run_server, args=(queue,))
-    p.start()
-
-    # 等待服务器启动
-    time.sleep(2)
-
-    # 定义回调 URL（替换为公网可访问的 URL，否则 pgmaker 无法调用）
-    callback_url = "http://localhost:8000/callback"  # TODO: 替换为实际 URL，例如 "https://your-ngrok-url.ngrok.io/callback"
-
-    # 准备注册请求的 payload（替换为实际注册信息）
-    payload = {
-        "register_info": "your_registration_details_here",  # 替换为实际注册信息
-        "api_url": callback_url  # 告诉 pgmaker 要触发的 API URL
-    }
-
-    # 发送注册请求到 pgmaker
-    try:
-        response = requests.post("https://pgmaker/request", json=payload, timeout=10)
-        print(f"注册请求发送成功，状态码: {response.status_code}")
-        print(f"响应内容: {response.text}")
-    except Exception as e:
-        print(f"注册请求失败: {e}")
-        p.terminate()
-        p.join()
-        exit(1)
-
-    # 等待接收 pgmaker 的回调（阻塞直到队列有数据）
-    print("等待 pgmaker 回调...")
-    received_info = queue.get()  # 这会阻塞直到收到数据
-
-    # 打印接收到的密码信息
-    print("接收到密码信息:", received_info)
-
-    # 终止服务器进程并结束脚本
-    p.terminate()
-    p.join()
-    print("脚本执行完成，已结束.")
+<!-- enable-disk-management.xml -->
+<clickhouse>
+    <profiles>
+        <!-- 
+            这里的 'default' 是指默认的用户配置档案。
+            当你用 clickhouse-client 连接而未指定用户时，就使用这个profile。
+        -->
+        <default>
+            <!-- 
+                将这个标志设置为1，表示允许执行实验性的磁盘管理命令。
+                这就是解决 "NOT_IMPLEMENTED" 错误的关键。
+            -->
+            <allow_experimental_disk_management_commands>1</allow_experimental_disk_management_commands>
+        </default>
+    </profiles>
+</clickhouse>
