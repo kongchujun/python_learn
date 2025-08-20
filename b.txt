@@ -1,3 +1,7 @@
+    environment:
+      # 添加这个环境变量
+      - CLICKHOUSE_RUN_AS_ROOT=1
+
 docker-compose run --rm -u root --entrypoint chown clickhouse -R 101:101 /var/lib/clickhouse
 
 - ./enable-disk-management.xml:/etc/clickhouse-server/users.d/enable-disk-management.xml
