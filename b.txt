@@ -1,3 +1,5 @@
+- ./enable-disk-management.xml:/etc/clickhouse-server/users.d/enable-disk-management.xml
+
 <!-- enable-disk-management.xml -->
 <clickhouse>
     <profiles>
