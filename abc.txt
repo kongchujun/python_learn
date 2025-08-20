@@ -1,50 +1,123 @@
-# 在 main.py 中完全替换 list_folders 方法
-@app.get("/api/folders", response_model=FoldersResponse)
-async def list_folders():
-    try:
-        # 使用 Delimiter 参数获取第一层目录结构
-        response = s3_client.list_objects_v2(
-            Bucket=S3_BUCKET_NAME,
-            Delimiter='/',  # 使用分隔符获取文件夹结构
-            MaxKeys=1000
-        )
-        
-        folder_counts = {}
-        
-        # 处理 CommonPrefixes (文件夹)
-        if 'CommonPrefixes' in response:
-            for prefix_info in response['CommonPrefixes']:
-                folder_name = prefix_info['Prefix'].rstrip('/')
-                
-                # 获取该文件夹下的文件数量
-                folder_response = s3_client.list_objects_v2(
-                    Bucket=S3_BUCKET_NAME,
-                    Prefix=f"{folder_name}/",
-                    MaxKeys=1000  # 可以根据需要调整
-                )
-                
-                file_count = len(folder_response.get('Contents', []))
-                if file_count > 0:
-                    folder_counts[folder_name] = file_count
-        
-        # 处理根目录文件
-        if 'Contents' in response:
-            root_files = [obj for obj in response['Contents'] if '/' not in obj['Key']]
-            if root_files:
-                folder_counts['根目录'] = len(root_files)
-        
-        # 转换为列表并排序
-        folders = [
-            FolderInfo(name=name, count=count) 
-            for name, count in sorted(folder_counts.items())
-        ]
+import boto3
+from botocore.exceptions import ClientError
+import re
 
-        logger.info(f"Found {len(folders)} folders using delimiter method")
-        return FoldersResponse(folders=folders)
+# --- 配置区 ---
+# 请在这里填入你的AWS S3配置
+AWS_ACCESS_KEY_ID = 'YOUR_ACCESS_KEY_ID'          # 填入你的 Access Key ID
+AWS_SECRET_ACCESS_KEY = 'YOUR_SECRET_ACCESS_KEY'    # 填入你的 Secret Access Key
+AWS_REGION = 'us-east-1'                          # 填入你的S3存储桶所在的区域
+BUCKET_NAME = 'your-s3-bucket-name'               # 填入你的S3存储桶名称
+
+# --- ClickHouse 配置 ---
+# 这是ClickHouse数据在S3存储桶中的路径前缀，请根据你的配置修改
+# 结构通常是：<s3_disk_path>/data/<database_name>/<table_name>/
+# 例如: 'clickhouse/data/langfuse/observations/'
+TABLE_PATH_PREFIX = 'clickhouse/data/langfuse/observations/'
+
+# 你要操作的数据库名和表名
+DATABASE_NAME = 'langfuse'
+TABLE_NAME = 'observations'
+# --- 配置区结束 ---
+
+
+def find_clickhouse_partitions(
+    access_key, secret_key, region, bucket, prefix
+):
+    """
+    使用boto3查找S3上ClickHouse表的分区目录。
+
+    Args:
+        access_key (str): AWS Access Key ID.
+        secret_key (str): AWS Secret Access Key.
+        region (str): AWS Region.
+        bucket (str): S3存储桶名称.
+        prefix (str): 表数据在S3上的路径前缀.
+
+    Returns:
+        set: 一个包含所有分区ID的集合 (e.g., {'202406', '202407'}).
+    """
+    print(f"[*] 正在连接到 S3 (区域: {region})...")
+    
+    # 确保路径前缀以'/'结尾，以便正确列出目录
+    if not prefix.endswith('/'):
+        prefix += '/'
+        
+    try:
+        s3_client = boto3.client(
+            's3',
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
+            region_name=region
+        )
+
+        print(f"[*] 正在扫描存储桶 '{bucket}' 中的路径: '{prefix}'")
+        
+        partition_ids = set()
+        
+        # 使用分页器处理可能存在大量分区的情况
+        paginator = s3_client.get_paginator('list_objects_v2')
+        pages = paginator.paginate(Bucket=bucket, Prefix=prefix, Delimiter='/')
+
+        for page in pages:
+            # list_objects_v2配合Delimiter='/'使用时，子目录会出现在'CommonPrefixes'中
+            if 'CommonPrefixes' not in page:
+                continue
+                
+            for common_prefix in page.get('CommonPrefixes', []):
+                # 提取完整的子目录路径，例如：'clickhouse/data/langfuse/observations/202407_1_1_0/'
+                dir_path = common_prefix.get('Prefix')
+                
+                # 从路径中提取目录名，例如：'202407_1_1_0'
+                dir_name = dir_path.strip('/').split('/')[-1]
+                
+                # 使用正则表达式匹配ClickHouse的分区格式 (e.g., 202407_1_1_0)
+                # 这能有效过滤掉 'detached' 等非分区目录
+                match = re.match(r'^(\d{6})_\d+_\d+_\d+', dir_name)
+                if match:
+                    # 提取分区ID (YYYYMM格式)，例如：'202407'
+                    partition_id = match.group(1)
+                    partition_ids.add(partition_id)
+
+        return sorted(list(partition_ids))
 
     except ClientError as e:
-        logger.error(f"S3 error: {e}")
-        raise HTTPException(status_code=500, detail=f"S3 error: {str(e)}")
+        error_code = e.response['Error']['Code']
+        if error_code == 'NoSuchBucket':
+            print(f"[!] 错误：存储桶 '{bucket}' 不存在。")
+        elif error_code == 'InvalidAccessKeyId' or error_code == 'SignatureDoesNotMatch':
+            print("[!] 错误：AWS凭证 (Access Key ID 或 Secret Access Key) 无效。")
+        else:
+            print(f"[!] 发生了一个S3客户端错误: {e}")
+        return None
     except Exception as e:
-        logger.error(f"Unexpected error: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        print(f"[!] 发生未知错误: {e}")
+        return None
+
+
+if __name__ == "__main__":
+    # 运行主函数
+    found_partitions = find_clickhouse_partitions(
+        AWS_ACCESS_KEY_ID,
+        AWS_SECRET_ACCESS_KEY,
+        AWS_REGION,
+        BUCKET_NAME,
+        TABLE_PATH_PREFIX
+    )
+    
+    if found_partitions is not None:
+        if found_partitions:
+            print("\n[+] 成功找到以下分区ID：")
+            for pid in found_partitions:
+                print(f"  - {pid}")
+            
+            print("\n[*] 请在ClickHouse客户端中执行以下SQL命令来恢复数据：")
+            print("-" * 50)
+            for pid in found_partitions:
+                # 生成可以直接复制粘贴的SQL语句
+                sql_command = f"ALTER TABLE {DATABASE_NAME}.{TABLE_NAME} ATTACH PARTITION ID '{pid}';"
+                print(sql_command)
+            print("-" * 50)
+        else:
+            print("\n[!] 在指定路径下没有找到符合ClickHouse分区格式的目录。")
+            print("    请检查你的 'BUCKET_NAME' 和 'TABLE_PATH_PREFIX' 配置是否正确。")
