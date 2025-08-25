@@ -1,3 +1,27 @@
+#!/bin/bash
+
+# 入参：端口号
+BACKEND_PORT=$1
+
+if [ -z "$BACKEND_PORT" ]; then
+  echo "用法: $0 <BACKEND_PORT>"
+  exit 1
+fi
+
+# 查找使用该端口的容器ID
+CONTAINER_ID=$(docker ps --filter "publish=$BACKEND_PORT" --format "{{.ID}}")
+
+if [ -z "$CONTAINER_ID" ]; then
+  echo "没有发现使用端口 $BACKEND_PORT 的容器"
+  exit 0
+fi
+
+# 停止并删除容器
+echo "发现容器 $CONTAINER_ID 使用端口 $BACKEND_PORT, 正在删除..."
+docker stop "$CONTAINER_ID"
+docker rm "$CONTAINER_ID"
+
+echo "完成 ✅"
 
 
 # 1) 设定凭据保存位置（纯文本，注意权限）
