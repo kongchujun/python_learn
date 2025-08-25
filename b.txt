@@ -1,4 +1,13 @@
-你的这一段：
+
+
+# 1) 设定凭据保存位置（纯文本，注意权限）
+git config --global credential.helper 'store --file ~/.git-credentials'
+chmod 600 ~/.git-credentials
+
+# 2) 一次性写入（GitHub 示例）
+cat >> ~/.git-credentials <<'EOF'
+https://<你的GitHub用户名>:<你的PAT>@github.com
+EOF你的这一段：
 
 ```
 [tool.uv.dev-dependencies]
