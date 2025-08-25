@@ -1,28 +1,41 @@
-curl -I -s -o /dev/null -w "%{http_version}\n" https://api.tavily.com
-2
+你的这一段：
 
+```
+[tool.uv.dev-dependencies]
+dev = [
+  "pre-commit>=4.3.0",
+  "ruff>=0.12.8",
+  "pre-commit-hooks",
+]
+```
 
-environment:
-      # 添加这个环境变量
-      - CLICKHOUSE_RUN_AS_ROOT=1
+写法不对。**`dev-dependencies` 在 uv 里不是一个表（table）而是一个数组字段**，应放在 `[tool.uv]` 节点下；或者用标准的可选依赖分组。正确示例二选一：
 
-docker-compose run --rm -u root --entrypoint chown clickhouse -R 101:101 /var/lib/clickhouse
+**方式 A（uv 专用）**
 
-- ./enable-disk-management.xml:/etc/clickhouse-server/users.d/enable-disk-management.xml
+```toml
+[tool.uv]
+dev-dependencies = [
+  "pre-commit>=4.3.0",
+  "ruff>=0.12.8",
+  "pre-commit-hooks",
+]
+```
 
-<!-- enable-disk-management.xml -->
-<clickhouse>
-    <profiles>
-        <!-- 
-            这里的 'default' 是指默认的用户配置档案。
-            当你用 clickhouse-client 连接而未指定用户时，就使用这个profile。
-        -->
-        <default>
-            <!-- 
-                将这个标志设置为1，表示允许执行实验性的磁盘管理命令。
-                这就是解决 "NOT_IMPLEMENTED" 错误的关键。
-            -->
-            <allow_experimental_disk_management_commands>1</allow_experimental_disk_management_commands>
-        </default>
-    </profiles>
-</clickhouse>
+**方式 B（推荐、可移植，PEP 735 分组）**
+
+```toml
+[project.optional-dependencies]
+dev = [
+  "pre-commit>=4.3.0",
+  "ruff>=0.12.8",
+  "pre-commit-hooks",
+]
+```
+
+安装命令分别是：
+
+* A：`uv sync --dev`（或 `uv pip install -e . && uv pip install -r dev` 不推荐）
+* B：`uv pip install -e .[dev]` 或 `uv sync --group dev`
+
+顺带一提：你上面常规 `dependencies` 里像 `eunomia-mcp--0.3.8` 这样的写法也有问题，应该是 `eunomia-mcp==0.3.8`（双等号而不是双连字符）。
