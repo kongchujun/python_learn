@@ -1,4 +1,8 @@
-    environment:
+curl -I -s -o /dev/null -w "%{http_version}\n" https://api.tavily.com
+2
+
+
+environment:
       # 添加这个环境变量
       - CLICKHOUSE_RUN_AS_ROOT=1
 
