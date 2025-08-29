@@ -1,3 +1,5 @@
+uvx marimo export html-wasm notebook.py -o docs
+
 #!/bin/bash
 
 # 入参：端口号
