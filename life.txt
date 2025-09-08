@@ -1,3 +1,29 @@
+# HTTPS server {} 里
+location /pantheon/ {
+    # 把 /pantheon/ 前缀替换成 / （带 / 的 proxy_pass 会自动完成）
+    proxy_pass         http://10.98.37.255:9432/;
+
+    # SSE/长连接所需
+    proxy_http_version 1.1;
+    proxy_buffering    off;                 # 关闭响应缓冲，SSE 必须
+    proxy_request_buffering off;
+    chunked_transfer_encoding off;
+    proxy_read_timeout 1d;                  # 视需要调大
+    proxy_send_timeout 1d;
+
+    # 常规转发头
+    proxy_set_header   Host              $host;
+    proxy_set_header   X-Real-IP         $remote_addr;
+    proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header   X-Forwarded-Proto $scheme;
+
+    # 如果上游需要鉴权头（如 Authorization/自定义 token），确保转发
+    proxy_set_header   Authorization     $http_authorization;
+    # 例如自定义：proxy_set_header X-MCP-Proxy-Token $http_x_mcp_proxy_token;
+}
+
+
+
 当然可以！我来为你添加指定上传路径的功能。
 
 ## 后端修改 (main.py)
